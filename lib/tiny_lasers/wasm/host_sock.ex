@@ -5,9 +5,9 @@ defmodule TinyLasers.Wasm.HostSock do
   syscalls; the guest call-site (interpreter OR asm lane) lowers to `call_ext invoke_host`, so one
   impl here serves both lanes.
 
-  ## State model — ONE home: the unified FdTable + a `:washy_sockstate` map
+  ## State model — ONE home: the unified FdTable + a `:tl_sockstate` map
   A socket fd is `FdTable.alloc(%{kind: :socket, ref: id})` where `ref` is an integer id into the
-  process-dict `:washy_sockstate` map. The state lives in the map (not in the desc) because the
+  process-dict `:tl_sockstate` map. The state lives in the map (not in the desc) because the
   transport is a `:gen_tcp`/`:gen_udp` **port** that must be *shared* across `dup`'d fds and only
   torn down on the LAST close — exactly the refcount the FdTable desc already tracks. Keeping the
   port behind a stable id lets several descs alias one transport without copying the port.
@@ -22,7 +22,7 @@ defmodule TinyLasers.Wasm.HostSock do
         backlog: int,
         acceptq: [port]}                # accepted transports peeked by poll, consumed by sock_accept
 
-  FdTable's teardown hook (`:washy_sock`) closes the transport on last close — we install it from
+  FdTable's teardown hook (`:tl_sock`) closes the transport on last close — we install it from
   `TinyLasers.Wasm.HostSock.install/0` so `FdTable.close/1` frees the port without knowing our internals.
 
   ## `__wasi_addr_port_t` memory layout (VERIFIED against wasix-libc — DOCUMENTED)
@@ -37,7 +37,7 @@ defmodule TinyLasers.Wasm.HostSock do
   Round-trip verified by a non-threaded C getsockname probe (bind 0 → getsockname → port>0 ? 42 : 3).
   If a guest disagrees we adjust the offsets/tags in ONE place (`read_addr/2` + `write_addr/3`).
 
-  ## errno values — the WASIX/wasi-libc integers already used across washy.ex
+  ## errno values — the WASIX/wasi-libc integers already used across wasm.ex
       EBADF 8 · EINVAL 28 · EAGAIN/EWOULDBLOCK 6 · ECONNREFUSED 14 · ENOTCONN 53 ·
       EADDRNOTAVAIL 3 · ETIMEDOUT 73 · success 0
   Bounded timeouts ONLY (never an infinite block — project rule): accept/recv cap at @block_ms.
@@ -58,13 +58,13 @@ defmodule TinyLasers.Wasm.HostSock do
   @block_ms 30_000
   @connect_ms 10_000
 
-  @sockstate :washy_sockstate
-  @socknext :washy_socknext
+  @sockstate :tl_sockstate
+  @socknext :tl_socknext
 
   # ── install the FdTable teardown hook so close() frees our transport on last ref ───────────────
-  @doc "Install the `:washy_sock` teardown hook used by FdTable.close/1 (idempotent)."
+  @doc "Install the `:tl_sock` teardown hook used by FdTable.close/1 (idempotent)."
   def install do
-    Process.put(:washy_sock, fn
+    Process.put(:tl_sock, fn
       {:close, id} -> teardown(id)
       _ -> :ok
     end)
@@ -612,12 +612,12 @@ defmodule TinyLasers.Wasm.HostSock do
   # gen_tcp.connect wants a charlist host or an inet ip tuple; pass the tuple straight through.
   defp ip_to_connect_arg(ip) when is_tuple(ip), do: ip
 
-  # ── thin memory helpers (delegate to washy.ex iovec/byte helpers; one home) ───────────────────
+  # ── thin memory helpers (delegate to wasm.ex iovec/byte helpers; one home) ───────────────────
   defp gather(mem, ptr, n), do: gather_iovs(mem, ptr, n)
   defp scatter(mem, ptr, n, data), do: scatter_iovs(mem, ptr, n, data)
   defp iov_capacity(mem, ptr, n), do: Enum.reduce(0..(n - 1)//1, 0, fn i, acc -> acc + load32(mem, ptr + i * 8 + 4) end)
 
-  # iovec gather/scatter mirror washy.ex (kept private there); same 8-byte {buf,len} layout.
+  # iovec gather/scatter mirror wasm.ex (kept private there); same 8-byte {buf,len} layout.
   defp gather_iovs(mem, iovs, n) do
     for(i <- 0..(n - 1)//1, do: read_bytes(mem, load32(mem, iovs + i * 8), load32(mem, iovs + i * 8 + 4)))
     |> IO.iodata_to_binary()
@@ -637,7 +637,7 @@ defmodule TinyLasers.Wasm.HostSock do
     written
   end
 
-  # little-endian load/store over packed :atomics memory (mirror washy.ex load/store).
+  # little-endian load/store over packed :atomics memory (mirror wasm.ex load/store).
   defp load8(mem, addr), do: load(mem, addr, 1)
   defp load16(mem, addr), do: load(mem, addr, 2)
   defp load32(mem, addr), do: load(mem, addr, 4)

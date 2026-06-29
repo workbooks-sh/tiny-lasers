@@ -1,15 +1,15 @@
 defmodule TinyLasers.Wasm.HostIO do
   @moduledoc """
   The **host-import delegation seam** — the Wave-0 mechanism that makes the host side fan-out-shaped, so
-  parallel I/O agents never collide on `washy.ex` *or* the C harness.
+  parallel I/O agents never collide on `wasm.ex` *or* the C harness.
 
   Every Node I/O concern reaches the host through ONE generic bridge (no per-concern C wrapper, no
-  `washy.ex` edit): the guest calls `__host(name, args)` (sync) or `__host_async(name, args)` (async,
+  `wasm.ex` edit): the guest calls `__host(name, args)` (sync) or `__host_async(name, args)` (async,
   returns a Promise). `TinyLasers.Wasm`'s `host_call` / `host_call_async` clauses parse the JSON `name`+`args`
   and hand them here; `dispatch_call/2` / `dispatch_async/3` resolve `<concern>_<op>` to a module **by
   convention** — prefix `fs` → `TinyLasers.Wasm.HostFs`, `net` → `HostNet`, `crypto` → `HostCrypto`, … — and
   invoke `call/2` (sync) or `call_async/3` (async). There is **no central registry**: an agent adds a
-  concern purely by creating `lib/washy/host_<concern>.ex` + its `node/NN_<mod>.js` shim.
+  concern purely by creating `lib/tinylasers/host_<concern>.ex` + its `node/NN_<mod>.js` shim.
 
   ## Writing a concern module
 
@@ -31,7 +31,7 @@ defmodule TinyLasers.Wasm.HostIO do
       end
 
   Raw guest-memory access (`read/2`, `write/2`) is still available for the rare concern that needs
-  pointers instead of JSON, via the same `:washy_mem` slot every import uses.
+  pointers instead of JSON, via the same `:tl_mem` slot every import uses.
   """
 
   @doc "Read `len` bytes of guest linear memory at byte-offset `ptr`."
@@ -44,7 +44,7 @@ defmodule TinyLasers.Wasm.HostIO do
   end
 
   @doc "The guest's current linear memory (the active run/instance), from the process dict."
-  def mem, do: Process.get(:washy_mem)
+  def mem, do: Process.get(:tl_mem)
 
   @doc """
   Synchronous generic bridge: route `<concern>_<op>` to its module's `call/2` and return the (JSON-able)
@@ -52,7 +52,7 @@ defmodule TinyLasers.Wasm.HostIO do
   """
   def dispatch_call(name, args) when is_binary(name) and is_list(args) do
     case concern_module(name, :call, 2) do
-      nil -> raise("washy: no host concern module for sync import '#{name}'")
+      nil -> raise("tinylasers: no host concern module for sync import '#{name}'")
       mod -> mod.call(name, args)
     end
   end
@@ -63,7 +63,7 @@ defmodule TinyLasers.Wasm.HostIO do
   """
   def dispatch_async(name, args, id) when is_binary(name) and is_list(args) do
     case concern_module(name, :call_async, 3) do
-      nil -> raise("washy: no host concern module for async import '#{name}'")
+      nil -> raise("tinylasers: no host concern module for async import '#{name}'")
       mod -> mod.call_async(name, args, id)
     end
 

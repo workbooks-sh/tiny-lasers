@@ -2,7 +2,7 @@ defmodule TinyLasers.Wasm.HostFs do
   @moduledoc """
   The `fs` concern (Node Wave-1, wb-xd13) — the REFERENCE I/O module proving the Wave-0 fan-out seam: a
   whole Node core module added as pure Elixir (`call/2`) + pure JS (`node/55_fs.js`), touching NO shared
-  file (no `harness_run.c`, no `washy.ex`). Reuses the existing `TinyLasers.Wasm.VFS` (string-key → bytes,
+  file (no `harness_run.c`, no `wasm.ex`). Reuses the existing `TinyLasers.Wasm.VFS` (string-key → bytes,
   tenant-safe by construction) — no new filesystem. Bytes cross the bridge base64-encoded (binary-safe
   through the JSON envelope). The guest's path is normalized to a VFS key host-side too (defence in depth).
 

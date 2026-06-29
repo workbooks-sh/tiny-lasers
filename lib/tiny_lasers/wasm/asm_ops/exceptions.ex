@@ -11,7 +11,7 @@ defmodule TinyLasers.Wasm.AsmOps.Exceptions do
   """
   import TinyLasers.Wasm.AsmCtx
 
-  @washy :"Elixir.TinyLasers.Wasm"
+  @tinylasers :"Elixir.TinyLasers.Wasm"
 
   def handle({:throw, tagidx}, s), do: do_throw(tagidx, s)
   def handle({:throw_ref}, s), do: throw_ref(s)
@@ -33,7 +33,7 @@ defmodule TinyLasers.Wasm.AsmOps.Exceptions do
         build ++
           [
             {:move, {:integer, tagidx}, {:x, 0}},
-            {:call_ext, 2, {:extfunc, @washy, :guest_throw, 2}},
+            {:call_ext, 2, {:extfunc, @tinylasers, :guest_throw, 2}},
             {:deallocate, :ph},
             :return
           ]
@@ -48,7 +48,7 @@ defmodule TinyLasers.Wasm.AsmOps.Exceptions do
   defp throw_ref(s) do
     ops = [
       {:move, yd(s, s.d - 1), {:x, 0}},
-      {:call_ext, 1, {:extfunc, @washy, :guest_throw_ref, 1}},
+      {:call_ext, 1, {:extfunc, @tinylasers, :guest_throw_ref, 1}},
       {:deallocate, :ph},
       :return
     ]

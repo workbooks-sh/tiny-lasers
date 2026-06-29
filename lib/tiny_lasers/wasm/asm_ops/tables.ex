@@ -18,7 +18,7 @@ defmodule TinyLasers.Wasm.AsmOps.Tables do
       RUNTIME, call it on the shared run state. We don't know the table contents statically here, so we
       load the popped index + the arg list and `call_ext` `TinyLasers.Wasm.call_indirect_dyn/3`, a thin
       public mirror of the interpreter's `{:call_indirect}` step (same `:undefined_element` /
-      `:indirect_call_type_mismatch` traps, same `call_fn` dispatch on the shared `:washy_rt`). That is
+      `:indirect_call_type_mismatch` traps, same `call_fn` dispatch on the shared `:tl_rt`). That is
       the cleanest bit-identical path — one seam, the interpreter's exact dispatch + trap behaviour.
 
       Scope: i32-only params/results, ≤1 result (matches the direct-`call` step's gate).
@@ -35,7 +35,7 @@ defmodule TinyLasers.Wasm.AsmOps.Tables do
   def handle({:ref_func, i}, s), do: {:ok, push(emit(s, [{:move, {:integer, i}, yd(s, s.d)}]))}
   def handle({:ref_is_null}, s), do: pop1_push1(s, :guest_ref_is_null)
   def handle({:table_get}, s), do: pop1_push1(s, :guest_table_get)
-  def handle({:table_size}, s), do: {:ok, push(emit(s, [{:call_ext, 0, {:extfunc, washy(), :guest_table_size, 0}}, {:move, {:x, 0}, yd(s, s.d)}]))}
+  def handle({:table_size}, s), do: {:ok, push(emit(s, [{:call_ext, 0, {:extfunc, tinylasers(), :guest_table_size, 0}}, {:move, {:x, 0}, yd(s, s.d)}]))}
   def handle({:table_set}, s), do: table_set(s)
   def handle({:table_grow}, s), do: table_grow(s)
   def handle({:table_fill}, s), do: table_fill(s)
@@ -46,7 +46,7 @@ defmodule TinyLasers.Wasm.AsmOps.Tables do
 
   defp pop1_push1(s, fun) do
     top = s.d - 1
-    ops = [{:move, yd(s, top), {:x, 0}}, {:call_ext, 1, {:extfunc, washy(), fun, 1}}, {:move, {:x, 0}, yd(s, top)}]
+    ops = [{:move, yd(s, top), {:x, 0}}, {:call_ext, 1, {:extfunc, tinylasers(), fun, 1}}, {:move, {:x, 0}, yd(s, top)}]
     {:ok, emit(s, ops)}
   end
 
@@ -57,7 +57,7 @@ defmodule TinyLasers.Wasm.AsmOps.Tables do
     ops = [
       {:move, yd(s, s.d - 2), {:x, 0}},
       {:move, yd(s, s.d - 1), {:x, 1}},
-      {:call_ext, 2, {:extfunc, washy(), :guest_table_set, 2}}
+      {:call_ext, 2, {:extfunc, tinylasers(), :guest_table_set, 2}}
     ]
 
     {:ok, emit(%{s | d: s.d - 2}, ops)}
@@ -72,7 +72,7 @@ defmodule TinyLasers.Wasm.AsmOps.Tables do
     ops = [
       {:move, yd(s, s.d - 2), {:x, 0}},
       {:move, yd(s, s.d - 1), {:x, 1}},
-      {:call_ext, 2, {:extfunc, washy(), :guest_table_grow, 2}},
+      {:call_ext, 2, {:extfunc, tinylasers(), :guest_table_grow, 2}},
       {:move, {:x, 0}, yd(s2, s2.d)}
     ]
 
@@ -87,7 +87,7 @@ defmodule TinyLasers.Wasm.AsmOps.Tables do
       {:move, yd(s, s.d - 3), {:x, 0}},
       {:move, yd(s, s.d - 2), {:x, 1}},
       {:move, yd(s, s.d - 1), {:x, 2}},
-      {:call_ext, 3, {:extfunc, washy(), :guest_table_fill, 3}}
+      {:call_ext, 3, {:extfunc, tinylasers(), :guest_table_fill, 3}}
     ]
 
     {:ok, emit(%{s | d: s.d - 3}, ops)}
@@ -191,7 +191,7 @@ defmodule TinyLasers.Wasm.AsmOps.Tables do
       {:move, {:x, 1}, {:x, 2}},
       {:move, yd(s, s.d - 1), {:x, 0}},
       {:move, {:integer, typeidx}, {:x, 1}},
-      {:call_ext, 3, {:extfunc, washy(), :call_indirect_dyn, 3}}
+      {:call_ext, 3, {:extfunc, tinylasers(), :call_indirect_dyn, 3}}
     ]
 
     # pop the index AND the np args

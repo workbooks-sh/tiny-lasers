@@ -112,29 +112,29 @@ defmodule TinyLasers.Wasm.HostNet do
 
   # ── routing helpers used by the owning actor's handle_info ({:tcp,...}) ─────────────────────────────
   @doc "Guest event-channel id bound to `sock`, or nil."
-  def channel_for(sock), do: Map.get(Process.get(:washy_net_chan, %{}), sock)
+  def channel_for(sock), do: Map.get(Process.get(:tl_net_chan, %{}), sock)
 
   @doc "Drop `sock` from the channel map (on close)."
   def forget(sock) do
-    Process.put(:washy_net_chan, Map.delete(Process.get(:washy_net_chan, %{}), sock))
+    Process.put(:tl_net_chan, Map.delete(Process.get(:tl_net_chan, %{}), sock))
     :ok
   end
 
   # ── id ↔ socket ↔ channel maps in the owning actor's process dict ───────────────────────────────────
   defp next_id do
-    n = Process.get(:washy_net_nextid, 1)
-    Process.put(:washy_net_nextid, n + 1)
+    n = Process.get(:tl_net_nextid, 1)
+    Process.put(:tl_net_nextid, n + 1)
     n
   end
 
   defp put_sock(id, sock),
-    do: Process.put(:washy_net_socks, Map.put(Process.get(:washy_net_socks, %{}), id, sock))
+    do: Process.put(:tl_net_socks, Map.put(Process.get(:tl_net_socks, %{}), id, sock))
 
-  defp get_sock(id), do: Map.get(Process.get(:washy_net_socks, %{}), id)
+  defp get_sock(id), do: Map.get(Process.get(:tl_net_socks, %{}), id)
 
   defp del_sock(id),
-    do: Process.put(:washy_net_socks, Map.delete(Process.get(:washy_net_socks, %{}), id))
+    do: Process.put(:tl_net_socks, Map.delete(Process.get(:tl_net_socks, %{}), id))
 
   defp put_channel(sock, ch),
-    do: Process.put(:washy_net_chan, Map.put(Process.get(:washy_net_chan, %{}), sock, ch))
+    do: Process.put(:tl_net_chan, Map.put(Process.get(:tl_net_chan, %{}), sock, ch))
 end

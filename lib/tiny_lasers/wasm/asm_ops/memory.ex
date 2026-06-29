@@ -6,7 +6,7 @@ defmodule TinyLasers.Wasm.AsmOps.Memory do
 
   ## Design — call into the host seams, don't re-derive the byte math in asm
   The forms lane (`TinyLasers.Wasm.Transpile`) and the interpreter share ONE memory model: a packed
-  `:atomics` (`:washy_mem` in the process dict), little-endian byte layout, a bounds-check that traps
+  `:atomics` (`:tl_mem` in the process dict), little-endian byte layout, a bounds-check that traps
   `:out_of_bounds` against `pages*65536`. Rather than hand-emit that read-modify-write + fast-path +
   bounds-case as raw asm tuples (fragile, easy to drift from the oracle), each op lowers to a single
   `call_ext` to a small `TinyLasers.Wasm` host helper that already implements the EXACT interpreter
@@ -29,7 +29,7 @@ defmodule TinyLasers.Wasm.AsmOps.Memory do
   """
   import TinyLasers.Wasm.AsmCtx
 
-  @washy washy()
+  @tinylasers tinylasers()
 
   # width (bytes) and signedness per load opcode
   @loads %{
@@ -57,7 +57,7 @@ defmodule TinyLasers.Wasm.AsmOps.Memory do
       addr_into_x0(s, top, offset) ++
         [
           {:move, {:integer, n}, {:x, 1}},
-          {:call_ext, 2, {:extfunc, @washy, fun, 2}},
+          {:call_ext, 2, {:extfunc, @tinylasers, fun, 2}},
           {:move, {:x, 0}, yd(s, top)}
         ]
 
@@ -77,7 +77,7 @@ defmodule TinyLasers.Wasm.AsmOps.Memory do
         [
           {:move, yd(s, val_pos), {:x, 1}},
           {:move, {:integer, n}, {:x, 2}},
-          {:call_ext, 3, {:extfunc, @washy, :guest_store, 3}}
+          {:call_ext, 3, {:extfunc, @tinylasers, :guest_store, 3}}
         ]
 
     # store pops BOTH addr and val (2 operands, pushes nothing) — `d - 2`, NOT `d - 1`. The interpreter
@@ -96,7 +96,7 @@ defmodule TinyLasers.Wasm.AsmOps.Memory do
       addr_into_x0(s, top, offset) ++
         [
           {:move, {:integer, n}, {:x, 1}},
-          {:call_ext, 2, {:extfunc, @washy, fun, 2}},
+          {:call_ext, 2, {:extfunc, @tinylasers, fun, 2}},
           {:move, {:x, 0}, yd(s, top)}
         ]
 
@@ -114,7 +114,7 @@ defmodule TinyLasers.Wasm.AsmOps.Memory do
         [
           {:move, yd(s, val_pos), {:x, 1}},
           {:move, {:integer, n}, {:x, 2}},
-          {:call_ext, 3, {:extfunc, @washy, :guest_store, 3}}
+          {:call_ext, 3, {:extfunc, @tinylasers, :guest_store, 3}}
         ]
 
     # i64 store also pops BOTH addr and val — `d - 2` (same wb-95w7 fix as the i32 store above).
@@ -123,7 +123,7 @@ defmodule TinyLasers.Wasm.AsmOps.Memory do
 
   # ── memory.size ── push the current page count (no operands consumed).
   def handle({:memory_size}, s) do
-    ops = [{:call_ext, 0, {:extfunc, @washy, :guest_memory_size, 0}}, {:move, {:x, 0}, yd(s, s.d)}]
+    ops = [{:call_ext, 0, {:extfunc, @tinylasers, :guest_memory_size, 0}}, {:move, {:x, 0}, yd(s, s.d)}]
     {:ok, push(emit(s, ops))}
   end
 
@@ -134,7 +134,7 @@ defmodule TinyLasers.Wasm.AsmOps.Memory do
 
     ops = [
       {:move, yd(s, top), {:x, 0}},
-      {:call_ext, 1, {:extfunc, @washy, :guest_memory_grow, 1}},
+      {:call_ext, 1, {:extfunc, @tinylasers, :guest_memory_grow, 1}},
       {:move, {:x, 0}, yd(s, top)}
     ]
 
@@ -152,7 +152,7 @@ defmodule TinyLasers.Wasm.AsmOps.Memory do
       {:move, yd(s, dst), {:x, 0}},
       {:move, yd(s, src), {:x, 1}},
       {:move, yd(s, n), {:x, 2}},
-      {:call_ext, 3, {:extfunc, @washy, :guest_memory_copy, 3}}
+      {:call_ext, 3, {:extfunc, @tinylasers, :guest_memory_copy, 3}}
     ]
 
     {:ok, %{emit(s, ops) | d: s.d - 3}}
@@ -169,7 +169,7 @@ defmodule TinyLasers.Wasm.AsmOps.Memory do
       {:move, yd(s, dst), {:x, 0}},
       {:move, yd(s, val), {:x, 1}},
       {:move, yd(s, n), {:x, 2}},
-      {:call_ext, 3, {:extfunc, @washy, :guest_memory_fill, 3}}
+      {:call_ext, 3, {:extfunc, @tinylasers, :guest_memory_fill, 3}}
     ]
 
     {:ok, %{emit(s, ops) | d: s.d - 3}}
@@ -196,7 +196,7 @@ defmodule TinyLasers.Wasm.AsmOps.Memory do
       {:move, yd(s, dst), {:x, 1}},
       {:move, yd(s, src), {:x, 2}},
       {:move, yd(s, n), {:x, 3}},
-      {:call_ext, 4, {:extfunc, @washy, :guest_memory_init, 4}}
+      {:call_ext, 4, {:extfunc, @tinylasers, :guest_memory_init, 4}}
     ]
 
     {:ok, %{emit(s, ops) | d: s.d - 3}}

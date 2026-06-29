@@ -58,21 +58,21 @@ defmodule TinyLasers.Wasm.Transpile do
       {fname, arity} = Map.fetch!(idx_to_fun, fidx)
 
       fun = fn args ->
-        if length(args) != arity, do: throw({:washy_arity, fidx})
+        if length(args) != arity, do: throw({:tl_arity, fidx})
         # Mirror the interpreter's per-call runtime setup so memory ops compare fairly against the
-        # oracle: a fresh packed `:atomics` linear memory in `:washy_mem`, sized to the module's min
+        # oracle: a fresh packed `:atomics` linear memory in `:tl_mem`, sized to the module's min
         # pages, with active data segments copied in. The generated code reads/writes this SAME memory
         # (identical packed byte access), so transpiled load/store match the interpreter exactly.
-        prev_mem = Process.get(:washy_mem)
-        prev_globals = Process.get(:washy_globals)
+        prev_mem = Process.get(:tl_mem)
+        prev_globals = Process.get(:tl_globals)
         setup_memory(mod)
-        Process.put(:washy_globals, TinyLasers.Wasm.init_globals(mod))
+        Process.put(:tl_globals, TinyLasers.Wasm.init_globals(mod))
 
         try do
           apply(mname, fname, args)
         after
-          if prev_mem == nil, do: Process.delete(:washy_mem), else: Process.put(:washy_mem, prev_mem)
-          if prev_globals == nil, do: Process.delete(:washy_globals), else: Process.put(:washy_globals, prev_globals)
+          if prev_mem == nil, do: Process.delete(:tl_mem), else: Process.put(:tl_mem, prev_mem)
+          if prev_globals == nil, do: Process.delete(:tl_globals), else: Process.put(:tl_globals, prev_globals)
         end
       end
 
@@ -88,7 +88,7 @@ defmodule TinyLasers.Wasm.Transpile do
   reachable function independently: a function that lowers cleanly becomes native BEAM; one that hits
   an unsupported op is simply LEFT to the interpreter. Native functions call transpiled callees
   directly (fast) and trampoline (`TinyLasers.Wasm.call_local`) into the interpreter for the rest — all on
-  the SAME shared `:washy_mem`/`:washy_globals`/fuel state, so the two lanes are seamless and the
+  the SAME shared `:tl_mem`/`:tl_globals`/fuel state, so the two lanes are seamless and the
   result is bit-identical to a pure-interpreter run (oracle-gated).
 
   Returns `{:ok, jit}` where `jit` maps `global_fidx => {beam_module, fname, arity}`. Empty map = no
@@ -496,9 +496,9 @@ defmodule TinyLasers.Wasm.Transpile do
     # PASS 1 — which functions compile? Try each in ISOLATION (all callees trampolined, so the verdict
     # depends only on the function's own ops). A function that throws :unsupported OR fails to compile
     # to valid Erlang is dropped to the interpreter lane.
-    # debug seam: when `:washy_tier_only` holds a MapSet of fidxs, restrict transpilation to it (used to
+    # debug seam: when `:tl_tier_only` holds a MapSet of fidxs, restrict transpilation to it (used to
     # bisect a tiered/interp divergence down to the offending function). Absent ⇒ tier everything possible.
-    only = Process.get(:washy_tier_only)
+    only = Process.get(:tl_tier_only)
     reachable = if only, do: Enum.filter(reachable, &MapSet.member?(only, &1)), else: reachable
 
     ok = Enum.filter(reachable, fn fidx -> compilable?(mod, fidx, ni, names, table) end)
@@ -570,7 +570,7 @@ defmodule TinyLasers.Wasm.Transpile do
       form = gen_fn(mod, fidx, ni, %{}, table)
       # A FIXED probe module name — the probe is compiled but NEVER loaded (we only check it compiles to
       # valid Erlang), so the same atom is safe to reuse for every probe and the atom table never grows.
-      probe = :washy_probe
+      probe = :tl_probe
       forms = [{:attribute, @ln, :module, probe}, {:attribute, @ln, :export, [{fname, fn_arity(mod, ni, fidx)}]}, form]
       match?({:ok, ^probe, _bin}, :compile.forms(forms, @compile_opts))
     rescue
@@ -637,13 +637,13 @@ defmodule TinyLasers.Wasm.Transpile do
 
   # ── linear-memory setup (mirrors TinyLasers.Wasm.new_mem + init_data so the oracle compares fairly) ──
   # A fresh packed `:atomics` (8 bytes/slot, == the interpreter's layout), sized to the module's min
-  # pages, installed in the process dict under `:washy_mem`; active data segments copied in.
-  defp setup_memory(%{mem: nil}), do: Process.delete(:washy_mem)
+  # pages, installed in the process dict under `:tl_mem`; active data segments copied in.
+  defp setup_memory(%{mem: nil}), do: Process.delete(:tl_mem)
 
   defp setup_memory(%{mem: {min, _max}} = mod) do
     pages = max(1, min)
     mem = :atomics.new(pages * @page_words, signed: false)
-    Process.put(:washy_mem, mem)
+    Process.put(:tl_mem, mem)
     for seg <- mod.data, do: init_data_seg(mem, seg)
     :ok
   end
@@ -779,7 +779,7 @@ defmodule TinyLasers.Wasm.Transpile do
         true -> result_list(stack, nresults)
       end
 
-    # A top-level `return` throws {:washy_ret, depth_at_return, ResultList}; wrap the body to catch it
+    # A top-level `return` throws {:tl_ret, depth_at_return, ResultList}; wrap the body to catch it
     # and re-shape the carried list to the same return value shape (bare value vs list vs 0).
     body = wrap_return(prelude ++ stmts ++ [ret], nresults)
     {:function, @ln, fname, arity, [{:clause, @ln, params, [], body}]}
@@ -798,7 +798,7 @@ defmodule TinyLasers.Wasm.Transpile do
     end
   end
 
-  # body that may `throw({:washy_ret, _, ResultList})` → catch it and return the value in the function's
+  # body that may `throw({:tl_ret, _, ResultList})` → catch it and return the value in the function's
   # result shape: void → 0, single → the bare element, MULTI → the carried list as-is (top-first).
   defp wrap_return(body, nresults \\ 1) do
     if nresults > 1 do
@@ -806,7 +806,7 @@ defmodule TinyLasers.Wasm.Transpile do
 
       catch_multi =
         {:clause, @ln,
-         [catch_pat({:tuple, @ln, [{:atom, @ln, :washy_ret}, {:var, @ln, :_}, lv]})],
+         [catch_pat({:tuple, @ln, [{:atom, @ln, :tl_ret}, {:var, @ln, :_}, lv]})],
          [], [lv]}
 
       [{:try, @ln, body, [], [catch_multi], []}]
@@ -815,12 +815,12 @@ defmodule TinyLasers.Wasm.Transpile do
 
       catch_clause =
         {:clause, @ln,
-         [catch_pat({:tuple, @ln, [{:atom, @ln, :washy_ret}, {:var, @ln, :_}, {:cons, @ln, rv, {nil, @ln}}]})],
+         [catch_pat({:tuple, @ln, [{:atom, @ln, :tl_ret}, {:var, @ln, :_}, {:cons, @ln, rv, {nil, @ln}}]})],
          [], [rv]}
 
       catch_void =
         {:clause, @ln,
-         [catch_pat({:tuple, @ln, [{:atom, @ln, :washy_ret}, {:var, @ln, :_}, {nil, @ln}]})],
+         [catch_pat({:tuple, @ln, [{:atom, @ln, :tl_ret}, {:var, @ln, :_}, {nil, @ln}]})],
          [], [{:integer, @ln, 0}]}
 
       [{:try, @ln, body, [], [catch_clause, catch_void], []}]
@@ -837,9 +837,9 @@ defmodule TinyLasers.Wasm.Transpile do
   defp list_ast([]), do: {nil, @ln}
   defp list_ast([h | t]), do: {:cons, @ln, h, list_ast(t)}
 
-  # `erlang:get(washy_globals)` — the mutable globals array, installed by the runner
-  defp globals_ref, do: {:call, @ln, {:remote, @ln, {:atom, @ln, :erlang}, {:atom, @ln, :get}}, [{:atom, @ln, :washy_globals}]}
-  defp mem_pages_ref, do: {:call, @ln, {:remote, @ln, {:atom, @ln, :erlang}, {:atom, @ln, :get}}, [{:atom, @ln, :washy_mem_pages}]}
+  # `erlang:get(tl_globals)` — the mutable globals array, installed by the runner
+  defp globals_ref, do: {:call, @ln, {:remote, @ln, {:atom, @ln, :erlang}, {:atom, @ln, :get}}, [{:atom, @ln, :tl_globals}]}
+  defp mem_pages_ref, do: {:call, @ln, {:remote, @ln, {:atom, @ln, :erlang}, {:atom, @ln, :get}}, [{:atom, @ln, :tl_mem_pages}]}
   defp atomics_remote(f), do: {:remote, @ln, {:atom, @ln, :atomics}, {:atom, @ln, f}}
 
   # ── sequence + straight-line lowering ────────────────────────────────────────────────────────────
@@ -948,14 +948,14 @@ defmodule TinyLasers.Wasm.Transpile do
     {[bind] ++ splice, push, ctx}
   end
 
-  # memory.size → current page count (the 1-slot `:washy_mem_pages` atomics the runner maintains).
+  # memory.size → current page count (the 1-slot `:tl_mem_pages` atomics the runner maintains).
   defp lower({:memory_size}, stack, ctx) do
     expr = {:call, @ln, atomics_remote(:get), [mem_pages_ref(), {:integer, @ln, 1}]}
     {v, ctx} = fresh(ctx, "Msz")
     {[{:match, @ln, v, expr}], [v | stack], ctx}
   end
 
-  # memory.grow(n) → host helper that reallocs `:washy_mem` + bumps the page count (mirrors the
+  # memory.grow(n) → host helper that reallocs `:tl_mem` + bumps the page count (mirrors the
   # interpreter), returning the old page count or -1. Pops n, pushes the result.
   defp lower({:memory_grow}, [n | stack], ctx) do
     call = {:call, @ln, {:remote, @ln, {:atom, @ln, :"Elixir.TinyLasers.Wasm"}, {:atom, @ln, :guest_memory_grow}}, [n]}
@@ -980,7 +980,7 @@ defmodule TinyLasers.Wasm.Transpile do
   # data.drop — frees a passive data segment; our active-segment model has nothing to free → no-op.
   defp lower({:data_drop}, stack, ctx), do: {[], stack, ctx}
 
-  # global.get/set over the module's mutable globals array (installed in `:washy_globals` by the runner).
+  # global.get/set over the module's mutable globals array (installed in `:tl_globals` by the runner).
   defp lower({:global_get, i}, stack, ctx) do
     expr = {:call, @ln, atomics_remote(:get), [globals_ref(), {:integer, @ln, i + 1}]}
     {v, ctx} = fresh(ctx, "Gg")
@@ -1115,7 +1115,7 @@ defmodule TinyLasers.Wasm.Transpile do
 
   # ── br / return: throw a tagged signal caught at the target label ────────────────────────────────
   # Branch target depth: a `br n` exits `n+1` enclosing labels. We compute the absolute label depth it
-  # lands at = ctx.depth - n - 1, and throw {:washy_br, target_depth, ResultList, LocalsTuple}. The
+  # lands at = ctx.depth - n - 1, and throw {:tl_br, target_depth, ResultList, LocalsTuple}. The
   # enclosing block/loop installed at that depth catches it.
 
   defp do_br(n, stack, ctx) do
@@ -1137,12 +1137,12 @@ defmodule TinyLasers.Wasm.Transpile do
       end
 
     {:call, @ln, {:remote, @ln, {:atom, @ln, :erlang}, {:atom, @ln, :throw}},
-     [{:tuple, @ln, [{:atom, @ln, :washy_br}, {:integer, @ln, target}, result_list(stack, arity), locals_tuple(ctx)]}]}
+     [{:tuple, @ln, [{:atom, @ln, :tl_br}, {:integer, @ln, target}, result_list(stack, arity), locals_tuple(ctx)]}]}
   end
 
   defp do_return(stack, ctx) do
     {:call, @ln, {:remote, @ln, {:atom, @ln, :erlang}, {:atom, @ln, :throw}},
-     [{:tuple, @ln, [{:atom, @ln, :washy_ret}, {:integer, @ln, ctx.depth}, result_list(stack, Map.get(ctx, :nresults, 1))]}]}
+     [{:tuple, @ln, [{:atom, @ln, :tl_ret}, {:integer, @ln, ctx.depth}, result_list(stack, Map.get(ctx, :nresults, 1))]}]}
   end
 
   # the values a br/return/region carries = the top `n` of the stack as an n-element list, TOP FIRST
@@ -1236,7 +1236,7 @@ defmodule TinyLasers.Wasm.Transpile do
     inner = %{ctx | depth: ctx.depth + 1, labels: Map.put(ctx.labels, target_depth, {:block, nres})}
 
     # body compiled in a child block: it yields {result, locals} on fallthrough; a `br target_depth`
-    # throws {:washy_br, target_depth, ...} which we catch here and turn into the same shape.
+    # throws {:tl_br, target_depth, ...} which we catch here and turn into the same shape.
     {stmts, bstack, bctx} = lower_seq(body, [], inner)
     fall_arity = region_arity(bstack, nres)
     fall = {:tuple, @ln, [result_list(bstack, fall_arity), locals_tuple(bctx)]}
@@ -1339,7 +1339,7 @@ defmodule TinyLasers.Wasm.Transpile do
         cl = {:var, @ln, :"_LpC#{id}"}
         continue_clause =
           {:clause, @ln,
-           [catch_pat({:tuple, @ln, [{:atom, @ln, :washy_br}, {:integer, @ln, target_depth}, {:var, @ln, :_}, cl]})],
+           [catch_pat({:tuple, @ln, [{:atom, @ln, :tl_br}, {:integer, @ln, target_depth}, {:var, @ln, :_}, cl]})],
            [], [{:call, @ln, {:var, @ln, fun_atom}, [cl]}]}
 
         {:try, @ln, [block_expr(body_seq)], [], [continue_clause], []}
@@ -1359,14 +1359,14 @@ defmodule TinyLasers.Wasm.Transpile do
 
   # ── shared: wrap a region expr to catch a br to `target_depth`, and splice its {result,locals} back ─
 
-  # try the body; if a {:washy_br, target_depth, S, L} escapes it, that's a br OUT of this block → its
+  # try the body; if a {:tl_br, target_depth, S, L} escapes it, that's a br OUT of this block → its
   # carried result+locals become the region's value. Any other signal (outer br / ret) re-propagates.
   defp try_catch_label(body_expr, target_depth, id) do
     sv = {:var, @ln, :"_BrS#{id}"}
     lv = {:var, @ln, :"_BrL#{id}"}
     catch_here =
       {:clause, @ln,
-       [catch_pat({:tuple, @ln, [{:atom, @ln, :washy_br}, {:integer, @ln, target_depth}, sv, lv]})],
+       [catch_pat({:tuple, @ln, [{:atom, @ln, :tl_br}, {:integer, @ln, target_depth}, sv, lv]})],
        [], [{:tuple, @ln, [sv, lv]}]}
 
     {:try, @ln, [body_expr], [], [catch_here], []}
@@ -1447,12 +1447,12 @@ defmodule TinyLasers.Wasm.Transpile do
   defp block_expr(stmts), do: {:block, @ln, stmts}
 
   # ── memory access codegen ────────────────────────────────────────────────────────────────────────
-  # All access goes through the SAME packed `:atomics` (`:washy_mem`) the interpreter uses, with the
+  # All access goes through the SAME packed `:atomics` (`:tl_mem`) the interpreter uses, with the
   # identical little-endian byte layout, so transpiled ⟷ interpreted byte effects are bit-identical.
 
-  # Mem = Process.get(:washy_mem)  (fetch once per op; cheap dict read)
+  # Mem = Process.get(:tl_mem)  (fetch once per op; cheap dict read)
   defp mem_get do
-    {:call, @ln, {:remote, @ln, {:atom, @ln, Process}, {:atom, @ln, :get}}, [{:atom, @ln, :washy_mem}]}
+    {:call, @ln, {:remote, @ln, {:atom, @ln, Process}, {:atom, @ln, :get}}, [{:atom, @ln, :tl_mem}]}
   end
 
   # Erlang for (mget(Mem, Addr)) — read byte at Addr from the packed word. Addr is an Erlang expr.

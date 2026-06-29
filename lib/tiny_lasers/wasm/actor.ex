@@ -107,7 +107,7 @@ defmodule TinyLasers.Wasm.Actor do
   end
 
   @doc "`Beam.self()` — the running guest's handle. Inside an actor it's the actor pid; outside, the caller pid."
-  def beam_self, do: Process.get(:washy_actor_self, self())
+  def beam_self, do: Process.get(:tl_actor_self, self())
 
   @doc """
   `Beam.link(target)` — monitor `target` (pid handle or registered name) from the CALLING actor. When the
@@ -411,8 +411,8 @@ defmodule TinyLasers.Wasm.Actor do
   # `wb_dispatch` so `let count=0` and closures survive across deliveries. Until qjs-run.wasm is rebuilt the
   # module won't export `wb_dispatch`; boot then leaves `instance: nil` and deliver falls back (see below).
   defp boot(%{spec: {:js, script}} = state) do
-    prev = Process.get(:washy_actor_self)
-    Process.put(:washy_actor_self, self())
+    prev = Process.get(:tl_actor_self)
+    Process.put(:tl_actor_self, self())
 
     try do
       case qjs_run_mod() do
@@ -445,7 +445,7 @@ defmodule TinyLasers.Wasm.Actor do
           end
       end
     after
-      if prev, do: Process.put(:washy_actor_self, prev), else: Process.delete(:washy_actor_self)
+      if prev, do: Process.put(:tl_actor_self, prev), else: Process.delete(:tl_actor_self)
       clear_js_ctx()
     end
   end
@@ -486,9 +486,9 @@ defmodule TinyLasers.Wasm.Actor do
   # self handle (so a nested Beam.self/Beam.spawn/Beam.send inside the handler resolves correctly), run
   # the guest's handler, restore. Mirrors call_io's process-dict discipline.
   defp deliver(%{spec: {:fun, fun}} = state, msg, from) do
-    prev = Process.get(:washy_actor_self)
-    Process.put(:washy_actor_self, self())
-    Process.put(:washy_actor_from, from)
+    prev = Process.get(:tl_actor_self)
+    Process.put(:tl_actor_self, self())
+    Process.put(:tl_actor_from, from)
 
     try do
       case apply_handler(fun, msg, state.user) do
@@ -496,8 +496,8 @@ defmodule TinyLasers.Wasm.Actor do
         reply -> {Term.normalize(reply), state}
       end
     after
-      if prev, do: Process.put(:washy_actor_self, prev), else: Process.delete(:washy_actor_self)
-      Process.delete(:washy_actor_from)
+      if prev, do: Process.put(:tl_actor_self, prev), else: Process.delete(:tl_actor_self)
+      Process.delete(:tl_actor_from)
     end
   end
 
@@ -506,13 +506,13 @@ defmodule TinyLasers.Wasm.Actor do
   # re-enter JS → run-to-completion → yield) is identical; only the in-guest callback dispatch awaits the
   # wasm rebuild. We expose the same self handle so a guest's Beam.send host import works today.
   defp deliver(%{spec: {:js, script}} = state, msg, from) do
-    prev = Process.get(:washy_actor_self)
-    Process.put(:washy_actor_self, self())
-    Process.put(:washy_actor_from, from)
+    prev = Process.get(:tl_actor_self)
+    Process.put(:tl_actor_self, self())
+    Process.put(:tl_actor_from, from)
     # the delivered message is stashed where the guest's beam_recv host import reads it, so wb_dispatch()
     # pulls it and invokes the onMessage cb. We run the invoke IN THIS (owner) process, so the dict is read
     # directly (no Sandbox Task copy needed for the persistent path).
-    Process.put(:washy_beam_inbox, Term.to_json(msg))
+    Process.put(:tl_beam_inbox, Term.to_json(msg))
     set_js_ctx(script)
 
     try do
@@ -544,10 +544,10 @@ defmodule TinyLasers.Wasm.Actor do
           {Term.normalize(msg), state}
       end
     after
-      Process.delete(:washy_beam_inbox)
+      Process.delete(:tl_beam_inbox)
       clear_js_ctx()
-      if prev, do: Process.put(:washy_actor_self, prev), else: Process.delete(:washy_actor_self)
-      Process.delete(:washy_actor_from)
+      if prev, do: Process.put(:tl_actor_self, prev), else: Process.delete(:tl_actor_self)
+      Process.delete(:tl_actor_from)
     end
   end
 
@@ -555,8 +555,8 @@ defmodule TinyLasers.Wasm.Actor do
   # discipline as deliver/3's instance path (self handle + js ctx so a callback's Beam.*/setTimeout resolve),
   # threading the (possibly memory-grown) instance forward. No-op if the wasm lacks the wb_timer export.
   defp reenter_timer(%{spec: {:js, script}, instance: %TinyLasers.Wasm.Instance{} = inst} = state, id) do
-    prev = Process.get(:washy_actor_self)
-    Process.put(:washy_actor_self, self())
+    prev = Process.get(:tl_actor_self)
+    Process.put(:tl_actor_self, self())
     set_js_ctx(script)
 
     try do
@@ -567,7 +567,7 @@ defmodule TinyLasers.Wasm.Actor do
       end
     after
       clear_js_ctx()
-      if prev, do: Process.put(:washy_actor_self, prev), else: Process.delete(:washy_actor_self)
+      if prev, do: Process.put(:tl_actor_self, prev), else: Process.delete(:tl_actor_self)
     end
   end
 
@@ -578,9 +578,9 @@ defmodule TinyLasers.Wasm.Actor do
   # reenter_timer). This is the host side of the generic async-completion contract (wb-5q8w).
   defp reenter_complete(%{spec: {:js, script}, instance: %TinyLasers.Wasm.Instance{} = inst} = state, id, ok?, value) do
     envelope = Term.to_json(%{"id" => id, "ok" => ok?, "value" => value})
-    prev = Process.get(:washy_actor_self)
-    Process.put(:washy_actor_self, self())
-    Process.put(:washy_io_inbox, envelope)
+    prev = Process.get(:tl_actor_self)
+    Process.put(:tl_actor_self, self())
+    Process.put(:tl_io_inbox, envelope)
     set_js_ctx(script)
 
     try do
@@ -590,9 +590,9 @@ defmodule TinyLasers.Wasm.Actor do
         {:trap, _reason, inst2} -> %{state | instance: inst2}
       end
     after
-      Process.delete(:washy_io_inbox)
+      Process.delete(:tl_io_inbox)
       clear_js_ctx()
-      if prev, do: Process.put(:washy_actor_self, prev), else: Process.delete(:washy_actor_self)
+      if prev, do: Process.put(:tl_actor_self, prev), else: Process.delete(:tl_actor_self)
     end
   end
 
@@ -602,9 +602,9 @@ defmodule TinyLasers.Wasm.Actor do
   # reenter_complete; the host side of the event-channel contract (wb-5q8w). Net 'data'/'close' use this.
   defp reenter_event(%{spec: {:js, script}, instance: %TinyLasers.Wasm.Instance{} = inst} = state, channel, event, value) do
     envelope = Term.to_json(%{"channel" => channel, "event" => event, "value" => value})
-    prev = Process.get(:washy_actor_self)
-    Process.put(:washy_actor_self, self())
-    Process.put(:washy_io_inbox, envelope)
+    prev = Process.get(:tl_actor_self)
+    Process.put(:tl_actor_self, self())
+    Process.put(:tl_io_inbox, envelope)
     set_js_ctx(script)
 
     try do
@@ -614,9 +614,9 @@ defmodule TinyLasers.Wasm.Actor do
         {:trap, _reason, inst2} -> %{state | instance: inst2}
       end
     after
-      Process.delete(:washy_io_inbox)
+      Process.delete(:tl_io_inbox)
       clear_js_ctx()
-      if prev, do: Process.put(:washy_actor_self, prev), else: Process.delete(:washy_actor_self)
+      if prev, do: Process.put(:tl_actor_self, prev), else: Process.delete(:tl_actor_self)
     end
   end
 
@@ -625,16 +625,16 @@ defmodule TinyLasers.Wasm.Actor do
   # set / clear the per-run guest context a Wasm run needs (argv/stdin/vfs/fds) when we drive the guest
   # IN-PROCESS (instance_start / instance_invoke), not via the Sandbox harness. The script is the program.
   defp set_js_ctx(script) do
-    Process.put(:washy_stdin, "")
-    Process.put(:washy_argv, ["qjs", "/work/main"])
-    Process.put(:washy_vfs, %{"main" => script})
-    Process.put(:washy_backend, :map)
-    Process.put(:washy_fds, %{})
-    Process.put(:washy_nextfd, 4)
+    Process.put(:tl_stdin, "")
+    Process.put(:tl_argv, ["qjs", "/work/main"])
+    Process.put(:tl_vfs, %{"main" => script})
+    Process.put(:tl_backend, :map)
+    Process.put(:tl_fds, %{})
+    Process.put(:tl_nextfd, 4)
   end
 
   defp clear_js_ctx do
-    Enum.each([:washy_stdin, :washy_argv, :washy_vfs, :washy_backend, :washy_fds, :washy_nextfd], &Process.delete/1)
+    Enum.each([:tl_stdin, :tl_argv, :tl_vfs, :tl_backend, :tl_fds, :tl_nextfd], &Process.delete/1)
   end
 
   # the generic QuickJS runner module the JS actor re-enters (decoded); nil if the JS lane isn't provisioned.

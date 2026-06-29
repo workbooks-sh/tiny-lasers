@@ -23,7 +23,7 @@ defmodule TinyLasers.Wasm.TranspileAsm do
   import TinyLasers.Wasm.AsmCtx
 
   @mask32 0xFFFFFFFF
-  @washy :"Elixir.TinyLasers.Wasm"
+  @tinylasers :"Elixir.TinyLasers.Wasm"
 
   # Pluggable op-group handlers (the parallel-built AsmOps.* modules). Each exposes `handle(instr, s) ->
   # {:ok, s} | :unsupported`. step/2 tries them in order for any op the built-in i32 core doesn't cover.
@@ -163,15 +163,15 @@ defmodule TinyLasers.Wasm.TranspileAsm do
   # The `:compile.forms/2` options the asm lane uses (exposed for the wb-bv4e regression test, which
   # asserts a back-edge-loop shape that crashes `beam_jump` compiles cleanly under these opts).
   def compile_opts, do: @compile_opts
-  # Output-side x-ray (gated by `Process.put(:washy_asm_dump, true)`): the counterpart to `wasm-tools print`
+  # Output-side x-ray (gated by `Process.put(:tl_asm_dump, true)`): the counterpart to `wasm-tools print`
   # on the input. Captures, per loaded module, BOTH what we EMITTED (the `:from_asm` BEAM-assembly forms) and
   # what actually LOADED (`:beam_disasm.disasm/1` of the compiled `.beam` binary — these dynamically-loaded
   # pool modules don't retain object code, so `erts_debug:df`/`:code.get_object_code` can't reach them; the
-  # binary at compile time is the only handle). Accumulates into `:washy_asm_dumps` for the caller to inspect
+  # binary at compile time is the only handle). Accumulates into `:tl_asm_dumps` for the caller to inspect
   # — so we can confirm our generated BEAM instructions are what we intended, and diff them against what the
   # OTP compiler emits for equivalent Elixir.
   defp maybe_dump_asm(mname, asm, bin) do
-    if Process.get(:washy_asm_dump) do
+    if Process.get(:tl_asm_dump) do
       disasm =
         try do
           {:beam_file, _m, _exp, _attr, _ci, code} = :beam_disasm.file(bin)
@@ -183,7 +183,7 @@ defmodule TinyLasers.Wasm.TranspileAsm do
         end
 
       {_name, _exports, _attrs, funcs, _lc} = asm
-      Process.put(:washy_asm_dumps, [{mname, funcs, disasm} | Process.get(:washy_asm_dumps, [])])
+      Process.put(:tl_asm_dumps, [{mname, funcs, disasm} | Process.get(:tl_asm_dumps, [])])
     end
   end
 
@@ -395,7 +395,7 @@ defmodule TinyLasers.Wasm.TranspileAsm do
         {:move, {:x, 0}, stk},
         {:move, cls, {:x, 0}},
         {:move, rsn, {:x, 1}},
-        {:call_ext, 2, {:extfunc, @washy, :guest_catch_match, 2}}
+        {:call_ext, 2, {:extfunc, @tinylasers, :guest_catch_match, 2}}
       ])
 
     # guest_catch_match returns {:exc,tag,vals} (a wasm exception we may catch) or :rethrow (not ours / not
@@ -431,7 +431,7 @@ defmodule TinyLasers.Wasm.TranspileAsm do
         {:move, cls, {:x, 0}},
         {:move, rsn, {:x, 1}},
         {:move, stk, {:x, 2}},
-        {:call_ext, 3, {:extfunc, @washy, :guest_reraise, 3}},
+        {:call_ext, 3, {:extfunc, @tinylasers, :guest_reraise, 3}},
         {:deallocate, :ph},
         :return
       ])
@@ -485,7 +485,7 @@ defmodule TinyLasers.Wasm.TranspileAsm do
           emit(s, [
             {:move, tag, {:x, 0}},
             {:move, vals, {:x, 1}},
-            {:call_ext, 2, {:extfunc, @washy, :guest_mk_exnref, 2}},
+            {:call_ext, 2, {:extfunc, @tinylasers, :guest_mk_exnref, 2}},
             {:move, {:x, 0}, ydn(s, depth)}
           ])
 
@@ -558,7 +558,7 @@ defmodule TinyLasers.Wasm.TranspileAsm do
   defp step({:loop, nres, body}, s) do
     {lstart, s} = new_label(s)
     # charge fuel on each iteration (entry) so a transpiled loop traps :out_of_fuel like the interpreter.
-    s = emit(s, [{:label, lstart}, {:call_ext, 0, {:extfunc, @washy, :charge_fuel, 0}}])
+    s = emit(s, [{:label, lstart}, {:call_ext, 0, {:extfunc, @tinylasers, :charge_fuel, 0}}])
     frame = %{label: lstart, entry: s.d, loop?: true, nres: nres}
     s1 = lower_seq(body, %{s | ctrl: [frame | s.ctrl]})
     end_d = if s1.reachable, do: s1.d, else: frame.entry
@@ -720,9 +720,9 @@ defmodule TinyLasers.Wasm.TranspileAsm do
 
     selector =
       if fidx < s.ni do
-        [{:move, {:literal, Enum.at(s.mod.imports, fidx)}, {:x, 0}}, {:call_ext, 2, {:extfunc, @washy, :invoke_host, 2}}]
+        [{:move, {:literal, Enum.at(s.mod.imports, fidx)}, {:x, 0}}, {:call_ext, 2, {:extfunc, @tinylasers, :invoke_host, 2}}]
       else
-        [{:move, {:integer, fidx}, {:x, 0}}, {:call_ext, 2, {:extfunc, @washy, :call_local, 2}}]
+        [{:move, {:integer, fidx}, {:x, 0}}, {:call_ext, 2, {:extfunc, @tinylasers, :call_local, 2}}]
       end
 
     s1 = %{s | d: s.d - np}

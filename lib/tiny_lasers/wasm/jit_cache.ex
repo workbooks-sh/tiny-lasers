@@ -14,7 +14,7 @@ defmodule TinyLasers.Wasm.JitCache do
   """
   use GenServer
 
-  @table :washy_jit_cache
+  @table :tl_jit_cache
 
   def child_spec(_), do: %{id: __MODULE__, start: {__MODULE__, :start_link, [[]]}}
   def start_link(_), do: GenServer.start_link(__MODULE__, nil, name: __MODULE__)

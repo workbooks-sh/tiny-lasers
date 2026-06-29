@@ -171,7 +171,7 @@ defmodule TinyLasers.WasmAsmTablesTest do
       m = reftable_mod(instrs)
 
       # try_emit {:ok} ⇒ the asm lane lowered EVERY op (no interp fallback). transpile:true then runs the
-      # function through that asm lane WITH the run context (:washy_rt/:washy_table) — vs the interpreter.
+      # function through that asm lane WITH the run context (:tl_rt/:tl_table) — vs the interpreter.
       assert {:ok, _} = TranspileAsm.try_emit(m, 0),
              "#{name}: the asm lane must lower every op (no interp fallback)"
 

@@ -1,7 +1,7 @@
 defmodule TinyLasers.Wasm.HostCrypto do
   @moduledoc """
   The `crypto` concern (Node Wave-1, wb-5i2i) — a whole Node core module added as pure Elixir (`call/2`) +
-  pure JS (`node/56_crypto.js`), touching NO shared file (no `harness_run.c`, no `washy.ex`). Mirrors the
+  pure JS (`node/56_crypto.js`), touching NO shared file (no `harness_run.c`, no `wasm.ex`). Mirrors the
   shape of the reference `TinyLasers.Wasm.HostFs`. Backed by Erlang's `:crypto` (BoringSSL/OpenSSL), so there is
   no hand-rolled hashing. Binary data crosses the bridge base64-encoded (JSON-safe), exactly like host_fs.ex.
 

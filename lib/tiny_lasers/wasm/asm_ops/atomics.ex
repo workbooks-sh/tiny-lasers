@@ -13,7 +13,7 @@ defmodule TinyLasers.Wasm.AsmOps.Atomics do
   """
   import TinyLasers.Wasm.AsmCtx
 
-  @washy washy()
+  @tinylasers tinylasers()
   @rmw_code %{add: 0, sub: 1, and: 2, or: 3, xor: 4, xchg: 5}
 
   @doc "Lower one atomic instr. `{:ok, s}` if handled, `:unsupported` otherwise."
@@ -28,7 +28,7 @@ defmodule TinyLasers.Wasm.AsmOps.Atomics do
       addr_into_x0(s, top, offset) ++
         [
           {:move, {:integer, n}, {:x, 1}},
-          {:call_ext, 2, {:extfunc, @washy, :guest_load, 2}},
+          {:call_ext, 2, {:extfunc, @tinylasers, :guest_load, 2}},
           {:move, {:x, 0}, yd(s, top)}
         ]
 
@@ -46,7 +46,7 @@ defmodule TinyLasers.Wasm.AsmOps.Atomics do
         [
           {:move, yd(s, val_pos), {:x, 1}},
           {:move, {:integer, n}, {:x, 2}},
-          {:call_ext, 3, {:extfunc, @washy, :guest_store, 3}}
+          {:call_ext, 3, {:extfunc, @tinylasers, :guest_store, 3}}
         ]
 
     {:ok, %{emit(s, ops) | d: s.d - 2}}
@@ -68,7 +68,7 @@ defmodule TinyLasers.Wasm.AsmOps.Atomics do
           {:move, yd(s, exp_pos), {:x, 1}},
           {:move, yd(s, repl_pos), {:x, 2}},
           {:move, {:integer, n}, {:x, 3}},
-          {:call_ext, 4, {:extfunc, @washy, :guest_atomic_cmpxchg, 4}},
+          {:call_ext, 4, {:extfunc, @tinylasers, :guest_atomic_cmpxchg, 4}},
           {:move, {:x, 0}, yd(s, addr_pos)}
         ]
 
@@ -87,7 +87,7 @@ defmodule TinyLasers.Wasm.AsmOps.Atomics do
           {:move, yd(s, val_pos), {:x, 1}},
           {:move, {:integer, n}, {:x, 2}},
           {:move, {:integer, @rmw_code[opname]}, {:x, 3}},
-          {:call_ext, 4, {:extfunc, @washy, :guest_atomic_rmw, 4}},
+          {:call_ext, 4, {:extfunc, @tinylasers, :guest_atomic_rmw, 4}},
           {:move, {:x, 0}, yd(s, addr_pos)}
         ]
 
@@ -108,7 +108,7 @@ defmodule TinyLasers.Wasm.AsmOps.Atomics do
           {:move, yd(s, exp_pos), {:x, 1}},
           {:move, {:integer, n}, {:x, 2}},
           {:move, yd(s, timeout_pos), {:x, 3}},
-          {:call_ext, 4, {:extfunc, @washy, :guest_atomic_wait, 4}},
+          {:call_ext, 4, {:extfunc, @tinylasers, :guest_atomic_wait, 4}},
           {:move, {:x, 0}, yd(s, addr_pos)}
         ]
 
@@ -125,7 +125,7 @@ defmodule TinyLasers.Wasm.AsmOps.Atomics do
       addr_into_x0(s, addr_pos, offset) ++
         [
           {:move, yd(s, count_pos), {:x, 1}},
-          {:call_ext, 2, {:extfunc, @washy, :guest_atomic_notify, 2}},
+          {:call_ext, 2, {:extfunc, @tinylasers, :guest_atomic_notify, 2}},
           {:move, {:x, 0}, yd(s, addr_pos)}
         ]
 

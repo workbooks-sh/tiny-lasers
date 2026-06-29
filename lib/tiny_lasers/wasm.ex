@@ -45,7 +45,7 @@ defmodule TinyLasers.Wasm do
   """
   def decode_cached(bytes) when is_binary(bytes) do
     hash = :crypto.hash(:sha256, bytes)
-    key = {:washy_mod_cache, hash}
+    key = {:tl_mod_cache, hash}
 
     case :persistent_term.get(key, nil) do
       nil ->
@@ -99,9 +99,9 @@ defmodule TinyLasers.Wasm do
   defp section(10, content, mod) do
     # stash the parsed types so `blocktype` can resolve a multi-value typeidx blocktype to its real
     # result arity (needed by the block/loop/if exit truncation — a wrong arity drops live results).
-    Process.put(:washy_parse_types, mod.types)
+    Process.put(:tl_parse_types, mod.types)
     {code, _} = vec(content, &code_entry/1)
-    Process.delete(:washy_parse_types)
+    Process.delete(:tl_parse_types)
     %{mod | code: code}
   end
 
@@ -420,7 +420,7 @@ defmodule TinyLasers.Wasm do
       15 -> {_t, r} = uleb(rest); {{:table_grow}, r}
       16 -> {_t, r} = uleb(rest); {{:table_size}, r}
       17 -> {_t, r} = uleb(rest); {{:table_fill}, r}
-      _ -> raise("washy: unimplemented 0xFC sub-op #{sub}")
+      _ -> raise("tinylasers: unimplemented 0xFC sub-op #{sub}")
     end
   end
 
@@ -455,7 +455,7 @@ defmodule TinyLasers.Wasm do
       sub in 0x10..0x16 -> ({o, r} = memarg(rest); {{:atomic_load, o, atomic_load_width(sub)}, r})
       sub in 0x17..0x1D -> ({o, r} = memarg(rest); {{:atomic_store, o, atomic_store_width(sub)}, r})
       sub in 0x1E..0x4E -> ({o, r} = memarg(rest); {opname, n} = atomic_rmw_shape(sub); {{:atomic_rmw, opname, o, n}, r})
-      true -> raise("washy: unimplemented 0xFE sub-op #{sub}")
+      true -> raise("tinylasers: unimplemented 0xFE sub-op #{sub}")
     end
   end
 
@@ -484,7 +484,7 @@ defmodule TinyLasers.Wasm do
   # the pure numeric/compare/convert ops (no immediate) — a contiguous range; dispatch by opcode
   defp parse_op(op, rest) when op == 0x1B or (op >= 0x45 and op <= 0xC4), do: {{:op, op}, rest}
   # anything else carries an immediate we haven't taught the parser — fail LOUDLY with the exact opcode
-  defp parse_op(op, _rest), do: raise("washy parser: unhandled opcode 0x#{Integer.to_string(op, 16)} (needs an immediate-aware clause)")
+  defp parse_op(op, _rest), do: raise("tinylasers parser: unhandled opcode 0x#{Integer.to_string(op, 16)} (needs an immediate-aware clause)")
 
   # blocktype → the block's RESULT ARITY (how many values it leaves on the stack). 0x40 = empty (0
   # results); a single valtype byte = 1 result; otherwise a signed-LEB type index (multi-value blocks —
@@ -501,7 +501,7 @@ defmodule TinyLasers.Wasm do
   # value blocks, used by real Rust/wasix output). Resolve the arity from the stashed types.
   defp blocktype(bin) do
     {idx, r} = sleb(bin)
-    {_params, results} = Enum.at(Process.get(:washy_parse_types, []), idx, {[], [0]})
+    {_params, results} = Enum.at(Process.get(:tl_parse_types, []), idx, {[], [0]})
     {length(results), r}
   end
 
@@ -578,14 +578,14 @@ defmodule TinyLasers.Wasm do
     # TRANSPILED code reads these from the dict — without restore, an outer transpiled function running
     # after a host_exec would see the INNER program's globals/table/mem_pages/fuel (the wb-6c2y bug:
     # shell strspn read coreutils' stack pointer against the shell's smaller memory → OOB trap).
-    prev = Process.get(:washy_out)
-    prev_mem = Process.get(:washy_mem)
-    prev_globals = Process.get(:washy_globals)
-    prev_table = Process.get(:washy_table)
-    prev_mem_pages = Process.get(:washy_mem_pages)
-    prev_max_pages = Process.get(:washy_max_pages)
-    prev_fuel = Process.get(:washy_last_fuel)
-    Process.put(:washy_out, [])
+    prev = Process.get(:tl_out)
+    prev_mem = Process.get(:tl_mem)
+    prev_globals = Process.get(:tl_globals)
+    prev_table = Process.get(:tl_table)
+    prev_mem_pages = Process.get(:tl_mem_pages)
+    prev_max_pages = Process.get(:tl_max_pages)
+    prev_fuel = Process.get(:tl_last_fuel)
+    Process.put(:tl_out, [])
     globals = new_globals(mod.globals)
     mem_pages = new_mem(mod.mem)
     init_data(globals, mod.data)
@@ -593,28 +593,28 @@ defmodule TinyLasers.Wasm do
     budget = Keyword.get(opts, :fuel, @default_fuel)
     :atomics.put(fuel, 1, budget)
     # expose the fuel counter so the caller can compute consumed = budget - remaining (metrics)
-    Process.put(:washy_last_fuel, {budget, fuel})
+    Process.put(:tl_last_fuel, {budget, fuel})
     depth = :atomics.new(1, signed: true)
     max_depth = Keyword.get(opts, :max_depth, @default_max_depth)
     max_pages = Keyword.get(opts, :max_pages, @default_max_pages)
     table = new_table(mod.elements, globals)
-    # Expose the runtime context via the process dict (alongside :washy_mem) so TRANSPILED standalone
+    # Expose the runtime context via the process dict (alongside :tl_mem) so TRANSPILED standalone
     # BEAM code can reach the same globals/table/mem_pages/fuel the interpreter holds in `rt` — what the
     # transpiler needs for global.get/set, call_indirect, memory.grow/bounds, and fuel-charging.
-    Process.put(:washy_globals, globals)
-    Process.put(:washy_table, table)
-    Process.delete(:washy_table_size)
-    Process.put(:washy_mem_pages, mem_pages)
-    Process.put(:washy_max_pages, max_pages)
+    Process.put(:tl_globals, globals)
+    Process.put(:tl_table, table)
+    Process.delete(:tl_table_size)
+    Process.put(:tl_mem_pages, mem_pages)
+    Process.put(:tl_max_pages, max_pages)
     # TIERED lane (opt-in), LAZY hot-path model: start fully interpreted (zero upfront cost), count
     # calls, and compile ONLY functions that get hot (threshold crossings) — so even a 5000-function
     # module pays nothing at startup and compiles just its working set. The growing native registry lives
-    # in the mutable `:washy_jit` dict; call counts in a per-run `:counters`.
-    prev_jit = Process.get(:washy_jit)
+    # in the mutable `:tl_jit` dict; call counts in a per-run `:counters`.
+    prev_jit = Process.get(:tl_jit)
 
     lazy =
       if Keyword.get(opts, :transpile, false) do
-        Process.put(:washy_jit, %{})
+        Process.put(:tl_jit, %{})
         counts = :counters.new(max(1, length(mod.code)), [:write_concurrency])
         # :async (default) compiles hot functions in the BACKGROUND so a run never stalls on a compile
         # storm; :sync compiles inline (deterministic — tests, and where blocking is acceptable).
@@ -632,8 +632,8 @@ defmodule TinyLasers.Wasm do
 
     rt = %{mod: mod, mem_pages: mem_pages, globals: globals, table: table, fuel: fuel, depth: depth, max_depth: max_depth, max_pages: max_pages, lazy: lazy, ni: length(mod.imports), cps: cps, gtypes: global_types(mod)}
     # stash rt so a transpiled function can trampoline back into the interpreter (`call_local`)
-    prev_rt = Process.get(:washy_rt)
-    Process.put(:washy_rt, rt)
+    prev_rt = Process.get(:tl_rt)
+    Process.put(:tl_rt, rt)
     # Install a FRESH unified fd table for this instance (stdio 0/1/2 + the /work preopen at fd 3,
     # next-fd 4) — the ONE source of truth for every fd kind. Only at the OUTERMOST call_io: a nested
     # host_exec run snapshots+restores the table itself (so it gets its own fresh table mid-flight),
@@ -647,25 +647,25 @@ defmodule TinyLasers.Wasm do
 
     try do
       result = call_fn(rt, Map.fetch!(mod.exports, name), args)
-      out = Process.get(:washy_out, []) |> Enum.reverse() |> IO.iodata_to_binary()
-      # :washy_out/:washy_mem are restored only on the NORMAL return: when the guest throws (proc_exit /
+      out = Process.get(:tl_out, []) |> Enum.reverse() |> IO.iodata_to_binary()
+      # :tl_out/:tl_mem are restored only on the NORMAL return: when the guest throws (proc_exit /
       # trap) the immediate caller (host_exec) still reads the partial output + the guest's memory before
       # IT restores them, so we must leave those in place on the throw path.
-      restore(:washy_out, prev)
-      restore(:washy_mem, prev_mem)
+      restore(:tl_out, prev)
+      restore(:tl_mem, prev_mem)
       {result, out}
     after
       # The EXECUTION CONTEXT (globals/table/mem_pages/fuel/rt) must be restored on EVERY exit — normal OR
       # throw — or an outer TRANSPILED function resuming after a host_exec would read the inner program's
       # context from the dict (the wb-6c2y OOB: shell read coreutils' SP/page-count). No caller reads
       # these post-throw, so restoring them in `after` is safe.
-      restore(:washy_globals, prev_globals)
-      restore(:washy_table, prev_table)
-      restore(:washy_mem_pages, prev_mem_pages)
-      restore(:washy_max_pages, prev_max_pages)
-      restore(:washy_last_fuel, prev_fuel)
-      restore(:washy_rt, prev_rt)
-      restore(:washy_jit, prev_jit)
+      restore(:tl_globals, prev_globals)
+      restore(:tl_table, prev_table)
+      restore(:tl_mem_pages, prev_mem_pages)
+      restore(:tl_max_pages, prev_max_pages)
+      restore(:tl_last_fuel, prev_fuel)
+      restore(:tl_rt, prev_rt)
+      restore(:tl_jit, prev_jit)
       # When the OUTERMOST run ends, tear down any worker threads it spawned — a guest's main exiting
       # must kill its threads (POSIX), not leave them parked in futex_wait for the 60s cap (rayon leaves
       # idle pool workers blocked on a futex after the parallel region).
@@ -675,8 +675,8 @@ defmodule TinyLasers.Wasm do
 
   # Kill every worker thread spawned during this run + clear the tid→pid registry. Bounded, idempotent.
   defp kill_run_threads do
-    for pid <- Process.get(:washy_thread_pids, []), is_pid(pid), do: Process.exit(pid, :kill)
-    Process.delete(:washy_thread_pids)
+    for pid <- Process.get(:tl_thread_pids, []), is_pid(pid), do: Process.exit(pid, :kill)
+    Process.delete(:tl_thread_pids)
     try do
       :ets.delete_all_objects(threads_table())
     rescue
@@ -688,7 +688,7 @@ defmodule TinyLasers.Wasm do
 
   # ── PERSISTENT INSTANCES (wb: JS guest-actor state across messages) ─────────────────────────────
   #
-  # `call_io` is one-shot: set up the process-dict run context (`:washy_mem`/globals/table/fuel/`:washy_rt`),
+  # `call_io` is one-shot: set up the process-dict run context (`:tl_mem`/globals/table/fuel/`:tl_rt`),
   # invoke ONE function, restore on exit. A persistent guest needs the OPPOSITE of the restore: instantiate
   # + run a setup function (`_start`) but KEEP the linear memory + runtime state, then re-enter a named
   # export per message with that SAME memory/globals alive — so QuickJS's heap (its `let count=0`, closures)
@@ -706,8 +706,8 @@ defmodule TinyLasers.Wasm do
   # its own heap; a trap is a caught exception). Wall-clock bounding for a delivery is the GenServer's
   # concern (it can run the invoke under its own timeout); fuel is bounded per-call here.
   #
-  # `memory.grow` REALLOCATES `:washy_mem` (atomics can't grow in place) and stores the new backing in the
-  # dict. So after an invoke we SNAPSHOT the (possibly swapped) `:washy_mem` back into the returned handle.
+  # `memory.grow` REALLOCATES `:tl_mem` (atomics can't grow in place) and stores the new backing in the
+  # dict. So after an invoke we SNAPSHOT the (possibly swapped) `:tl_mem` back into the returned handle.
   # `mem_pages`/globals/table/fuel are stable atomics refs (mutated in place), so they never need re-capture
   # — but we re-read them defensively. Hence `instance_invoke/4` returns `{result, out, new_instance}`: the
   # owner threads the updated handle forward (it differs from the input only if memory grew).
@@ -752,25 +752,25 @@ defmodule TinyLasers.Wasm do
     init_data(globals, mod.data)
     fuel = :atomics.new(1, signed: true)
     :atomics.put(fuel, 1, Keyword.get(opts, :fuel, @default_fuel))
-    Process.put(:washy_last_fuel, {Keyword.get(opts, :fuel, @default_fuel), fuel})
+    Process.put(:tl_last_fuel, {Keyword.get(opts, :fuel, @default_fuel), fuel})
     depth = :atomics.new(1, signed: true)
     max_depth = Keyword.get(opts, :max_depth, @default_max_depth)
     max_pages = Keyword.get(opts, :max_pages, @default_max_pages)
     table = new_table(mod.elements, globals)
-    Process.put(:washy_out, [])
-    Process.put(:washy_globals, globals)
-    Process.put(:washy_table, table)
-    Process.delete(:washy_table_size)
-    Process.put(:washy_mem_pages, mem_pages)
-    Process.put(:washy_max_pages, max_pages)
+    Process.put(:tl_out, [])
+    Process.put(:tl_globals, globals)
+    Process.put(:tl_table, table)
+    Process.delete(:tl_table_size)
+    Process.put(:tl_mem_pages, mem_pages)
+    Process.put(:tl_max_pages, max_pages)
 
     # A persistent instance may opt into the TRANSPILER (asm lane) just like `call_io` — hot exported
     # functions JIT to BEAM assembly and stay compiled across `instance_invoke` re-entries (the
-    # `:washy_jit` dict + the mod.id-keyed persistent cache both survive `capture_run_ctx`). This is what
+    # `:tl_jit` dict + the mod.id-keyed persistent cache both survive `capture_run_ctx`). This is what
     # makes a long-lived guest (e.g. the Rollup parser serving many `parse` calls) run at asm speed.
     lazy =
       if Keyword.get(opts, :transpile, false) do
-        Process.put(:washy_jit, %{})
+        Process.put(:tl_jit, %{})
         counts = :counters.new(max(1, length(mod.code)), [:write_concurrency])
         {counts, Keyword.get(opts, :tier_threshold, 20), Keyword.get(opts, :tier_async, true)}
       else
@@ -778,25 +778,25 @@ defmodule TinyLasers.Wasm do
       end
 
     rt = %{mod: mod, mem_pages: mem_pages, globals: globals, table: table, fuel: fuel, depth: depth, max_depth: max_depth, max_pages: max_pages, lazy: lazy, ni: length(mod.imports), gtypes: global_types(mod)}
-    Process.put(:washy_rt, rt)
+    Process.put(:tl_rt, rt)
 
     # START function (section 8): instantiate-time init (e.g. __wasm_init_memory) before the export.
     if mod.start != nil, do: call_fn(rt, mod.start, [])
 
     try do
       _ = call_fn(rt, Map.fetch!(mod.exports, name), args)
-      out = Process.get(:washy_out, []) |> Enum.reverse() |> IO.iodata_to_binary()
+      out = Process.get(:tl_out, []) |> Enum.reverse() |> IO.iodata_to_binary()
       # capture the (possibly grown) memory backing into the handle
       inst = %Instance{
-        mod: mod, mem: Process.get(:washy_mem), mem_pages: mem_pages, max_pages: max_pages,
-        globals: globals, table: Process.get(:washy_table, table), rt: rt,
+        mod: mod, mem: Process.get(:tl_mem), mem_pages: mem_pages, max_pages: max_pages,
+        globals: globals, table: Process.get(:tl_table, table), rt: rt,
         # carry the guest VFS (:map backend) so files written during one re-entry persist into the next
-        vfs: Process.get(:washy_vfs, %{})
+        vfs: Process.get(:tl_vfs, %{})
       }
       {:ok, inst, out}
     catch
-      :throw, {:washy_exit, code} ->
-        out = Process.get(:washy_out, []) |> Enum.reverse() |> IO.iodata_to_binary()
+      :throw, {:tl_exit, code} ->
+        out = Process.get(:tl_out, []) |> Enum.reverse() |> IO.iodata_to_binary()
         {:exit, code, out}
     rescue
       e in TinyLasers.Wasm.Trap -> {:trap, e.reason}
@@ -811,7 +811,7 @@ defmodule TinyLasers.Wasm do
   Each call runs to completion with its OWN fresh fuel budget (`:fuel` opt). Returns
   `{:ok, result, out, new_instance}` / `{:exit, code, out, new_instance}` / `{:trap, reason, new_instance}`.
 
-  Always thread `new_instance` forward: if the guest grew memory, its `:washy_mem` backing was swapped and
+  Always thread `new_instance` forward: if the guest grew memory, its `:tl_mem` backing was swapped and
   the new backing is captured into `new_instance.mem` (the input handle's `mem` is now stale).
 
   Run this IN THE OWNER PROCESS (the GenServer). It installs the held context into the process dict,
@@ -827,25 +827,25 @@ defmodule TinyLasers.Wasm do
     depth = :atomics.new(1, signed: true)
     rt = %{inst.rt | fuel: fuel, depth: depth}
 
-    Process.put(:washy_out, [])
-    Process.put(:washy_mem, inst.mem)
-    Process.put(:washy_globals, inst.globals)
-    Process.put(:washy_table, inst.table)
-    Process.delete(:washy_table_size)
-    Process.put(:washy_mem_pages, inst.mem_pages)
-    Process.put(:washy_max_pages, inst.max_pages)
+    Process.put(:tl_out, [])
+    Process.put(:tl_mem, inst.mem)
+    Process.put(:tl_globals, inst.globals)
+    Process.put(:tl_table, inst.table)
+    Process.delete(:tl_table_size)
+    Process.put(:tl_mem_pages, inst.mem_pages)
+    Process.put(:tl_max_pages, inst.max_pages)
     # restore the guest VFS so reads see files written by earlier messages (overrides any per-run reset)
-    Process.put(:washy_vfs, inst.vfs || %{})
-    Process.put(:washy_last_fuel, {Keyword.get(opts, :fuel, @default_fuel), fuel})
-    Process.put(:washy_rt, rt)
+    Process.put(:tl_vfs, inst.vfs || %{})
+    Process.put(:tl_last_fuel, {Keyword.get(opts, :fuel, @default_fuel), fuel})
+    Process.put(:tl_rt, rt)
 
     try do
       result = call_fn(rt, Map.fetch!(inst.mod.exports, name), args)
-      out = Process.get(:washy_out, []) |> Enum.reverse() |> IO.iodata_to_binary()
+      out = Process.get(:tl_out, []) |> Enum.reverse() |> IO.iodata_to_binary()
       {:ok, result, out, snapshot(inst, rt)}
     catch
-      :throw, {:washy_exit, code} ->
-        out = Process.get(:washy_out, []) |> Enum.reverse() |> IO.iodata_to_binary()
+      :throw, {:tl_exit, code} ->
+        out = Process.get(:tl_out, []) |> Enum.reverse() |> IO.iodata_to_binary()
         {:exit, code, out, snapshot(inst, rt)}
     rescue
       e in TinyLasers.Wasm.Trap -> {:trap, e.reason, snapshot(inst, rt)}
@@ -892,43 +892,43 @@ defmodule TinyLasers.Wasm do
     ng
   end
 
-  # snapshot mutated run state back into the handle. Only `:washy_mem` (reallocated by memory.grow) and the
+  # snapshot mutated run state back into the handle. Only `:tl_mem` (reallocated by memory.grow) and the
   # table can change identity per invoke; globals/mem_pages are atomics mutated in place (same ref).
   defp snapshot(%Instance{} = inst, rt) do
     %{
       inst
-      | mem: Process.get(:washy_mem),
-        table: Process.get(:washy_table, inst.table),
-        vfs: Process.get(:washy_vfs, inst.vfs),
+      | mem: Process.get(:tl_mem),
+        table: Process.get(:tl_table, inst.table),
+        vfs: Process.get(:tl_vfs, inst.vfs),
         rt: %{rt | fuel: nil, depth: nil}
     }
   end
 
   # capture / restore the full per-run process-dict context (same keys call_io guards) so instance ops are
-  # nesting-safe — a setup/invoke that runs inside another washy run leaves the outer run's dict intact.
+  # nesting-safe — a setup/invoke that runs inside another tinylasers run leaves the outer run's dict intact.
   defp capture_run_ctx do
     %{
-      out: Process.get(:washy_out), mem: Process.get(:washy_mem), globals: Process.get(:washy_globals),
-      table: Process.get(:washy_table), mem_pages: Process.get(:washy_mem_pages),
-      max_pages: Process.get(:washy_max_pages), last_fuel: Process.get(:washy_last_fuel),
-      rt: Process.get(:washy_rt)
+      out: Process.get(:tl_out), mem: Process.get(:tl_mem), globals: Process.get(:tl_globals),
+      table: Process.get(:tl_table), mem_pages: Process.get(:tl_mem_pages),
+      max_pages: Process.get(:tl_max_pages), last_fuel: Process.get(:tl_last_fuel),
+      rt: Process.get(:tl_rt)
     }
   end
 
   defp restore_run_ctx(c) do
-    restore(:washy_out, c.out)
-    restore(:washy_mem, c.mem)
-    restore(:washy_globals, c.globals)
-    restore(:washy_table, c.table)
-    restore(:washy_mem_pages, c.mem_pages)
-    restore(:washy_max_pages, c.max_pages)
-    restore(:washy_last_fuel, c.last_fuel)
-    restore(:washy_rt, c.rt)
+    restore(:tl_out, c.out)
+    restore(:tl_mem, c.mem)
+    restore(:tl_globals, c.globals)
+    restore(:tl_table, c.table)
+    restore(:tl_mem_pages, c.mem_pages)
+    restore(:tl_max_pages, c.max_pages)
+    restore(:tl_last_fuel, c.last_fuel)
+    restore(:tl_rt, c.rt)
   end
 
   @doc """
   **Host-mediated invocation — the thesis's fork/exec emulation.** A running guest (e.g. a shell)
-  invokes another program: `argv[0]` resolves to a wasm module (via the `:washy_programs` registry,
+  invokes another program: `argv[0]` resolves to a wasm module (via the `:tl_programs` registry,
   with a multicall `:default` fallback like coreutils), which Wasm runs NESTED with the given
   `stdin` and `argv`, returning `{stdout, exit_code}`. Cooperative + buffered — no real concurrency,
   no real fork; the guest only needs to BELIEVE it spawned a process.
@@ -947,21 +947,21 @@ defmodule TinyLasers.Wasm do
         # Snapshot the parent's full fd table (every unified key) so the child gets a FRESH table and
         # the parent's is restored on return — fork/exec emulation, nesting-safe.
         saved =
-          {Process.get(:washy_out), Process.get(:washy_mem), Process.get(:washy_argv),
-           Process.get(:washy_stdin),
-           {Process.get(:washy_fdmap), Process.get(:washy_descs), Process.get(:washy_nextfd),
-            Process.get(:washy_nextdesc), Process.get(:washy_pipes)}}
+          {Process.get(:tl_out), Process.get(:tl_mem), Process.get(:tl_argv),
+           Process.get(:tl_stdin),
+           {Process.get(:tl_fdmap), Process.get(:tl_descs), Process.get(:tl_nextfd),
+            Process.get(:tl_nextdesc), Process.get(:tl_pipes)}}
 
-        Process.put(:washy_out, [])
-        Process.put(:washy_argv, argv)
-        Process.put(:washy_stdin, stdin)
+        Process.put(:tl_out, [])
+        Process.put(:tl_argv, argv)
+        Process.put(:tl_stdin, stdin)
         TinyLasers.Wasm.FdTable.reset()
 
         # If the PARENT run is tiering, the nested program tiers too — so a pipeline's actual compute
         # (the grep/sort/sha256 in coreutils) runs native, not just the shell. Hot functions compile in
         # the background + cache across invocations, so repeated/heavy commands get fast.
         child_opts =
-          case Process.get(:washy_rt) do
+          case Process.get(:tl_rt) do
             %{lazy: {_, _, _}} -> Keyword.put_new(opts, :transpile, true)
             _ -> opts
           end
@@ -973,22 +973,22 @@ defmodule TinyLasers.Wasm do
           rescue
             # a child that TRAPS (e.g. a Rust panic → unreachable when it touches outside its sandbox)
             # must not crash the parent — return its partial output + a non-zero exit code.
-            _ -> {Process.get(:washy_out, []) |> Enum.reverse() |> IO.iodata_to_binary(), 134}
+            _ -> {Process.get(:tl_out, []) |> Enum.reverse() |> IO.iodata_to_binary(), 134}
           catch
-            :throw, {:washy_exit, code} ->
-              {Process.get(:washy_out, []) |> Enum.reverse() |> IO.iodata_to_binary(), code}
+            :throw, {:tl_exit, code} ->
+              {Process.get(:tl_out, []) |> Enum.reverse() |> IO.iodata_to_binary(), code}
           end
         after
           {o, m, a, s, {fdmap, descs, nfd, ndesc, pipes}} = saved
-          restore(:washy_out, o)
-          restore(:washy_mem, m)
-          restore(:washy_argv, a)
-          restore(:washy_stdin, s)
-          restore(:washy_fdmap, fdmap)
-          restore(:washy_descs, descs)
-          restore(:washy_nextfd, nfd)
-          restore(:washy_nextdesc, ndesc)
-          restore(:washy_pipes, pipes)
+          restore(:tl_out, o)
+          restore(:tl_mem, m)
+          restore(:tl_argv, a)
+          restore(:tl_stdin, s)
+          restore(:tl_fdmap, fdmap)
+          restore(:tl_descs, descs)
+          restore(:tl_nextfd, nfd)
+          restore(:tl_nextdesc, ndesc)
+          restore(:tl_pipes, pipes)
         end
     end
   end
@@ -1000,8 +1000,8 @@ defmodule TinyLasers.Wasm do
   Invoke a HOST IMPORT by its decoded spec (`{module, name, type_idx}`) with `args` — the seam the
   **transpiler** uses to perform WASI/host I/O from compiled BEAM code. It dispatches to the exact same
   `call_host` the interpreter uses, so a transpiled guest and an interpreted guest do identical I/O.
-  Host functions read/write guest memory via the process-dict `:washy_mem` (set up by the run), not
-  `rt` — so a `nil` runtime is fine here. proc_exit still throws `{:washy_exit, code}`; the caller catches.
+  Host functions read/write guest memory via the process-dict `:tl_mem` (set up by the run), not
+  `rt` — so a `nil` runtime is fine here. proc_exit still throws `{:tl_exit, code}`; the caller catches.
   """
   def invoke_host({_module, _name, _type} = spec, args) when is_list(args), do: call_host(nil, spec, args)
 
@@ -1009,11 +1009,11 @@ defmodule TinyLasers.Wasm do
   **Trampoline from transpiled code back into the interpreter.** A native (transpiled) function calls
   this for a callee that was NOT transpiled (interpreted lane), passing the global func index + arg
   list. It dispatches through the same `call_fn` the interpreter uses (host import → `call_host`, local
-  → `invoke`, which may itself re-dispatch to native), all on the shared run state held in `:washy_rt`.
+  → `invoke`, which may itself re-dispatch to native), all on the shared run state held in `:tl_rt`.
   """
   def call_local(fidx, args) when is_integer(fidx) and is_list(args) do
-    case Process.get(:washy_rt) do
-      nil -> raise "call_local/2 outside a washy run (no :washy_rt)"
+    case Process.get(:tl_rt) do
+      nil -> raise "call_local/2 outside a tinylasers run (no :tl_rt)"
       rt -> call_fn(rt, fidx, args)
     end
   end
@@ -1023,13 +1023,13 @@ defmodule TinyLasers.Wasm do
   `{:call_indirect, typeidx}` step EXACTLY: resolve the table index → global func index (trap
   `:undefined_element` if absent), check the resolved func's type against the expected signature at
   `typeidx` (trap `:indirect_call_type_mismatch` on mismatch), then dispatch through the same `call_fn`
-  on the shared `:washy_rt`. Returns the callee result (or `nil` for a void target).
+  on the shared `:tl_rt`. Returns the callee result (or `nil` for a void target).
   """
   def call_indirect_dyn(table_idx, typeidx, args)
       when is_integer(table_idx) and is_integer(typeidx) and is_list(args) do
-    case Process.get(:washy_rt) do
+    case Process.get(:tl_rt) do
       nil ->
-        raise "call_indirect_dyn/3 outside a washy run (no :washy_rt)"
+        raise "call_indirect_dyn/3 outside a tinylasers run (no :tl_rt)"
 
       rt ->
         f = Map.get(rt.table, table_idx)
@@ -1047,7 +1047,7 @@ defmodule TinyLasers.Wasm do
   yielded values it writes land in the shared heap the parent reads.
 
   Returns a snapshot map the fiber passes to `gen_adopt_context/1`. The fiber SHARES (same atomics ref) the
-  parent's memory, table, `:washy_last_fuel` (isolation invariant 4 — a generator charges the ONE per-run
+  parent's memory, table, `:tl_last_fuel` (isolation invariant 4 — a generator charges the ONE per-run
   fuel budget, so a guest can't shard compute across fibers to dodge it), AND the globals. Sharing globals
   is both safe and necessary: Porffor keeps no shadow stack pointer (operands/locals live on the wasm value
   stack, preserved by the parked fiber's frozen BEAM call stack) — the only mutable internal globals are the
@@ -1060,23 +1060,23 @@ defmodule TinyLasers.Wasm do
   @spec gen_capture_context() :: map
   def gen_capture_context do
     %{
-      mem: Process.get(:washy_mem),
-      mem_pages: Process.get(:washy_mem_pages),
-      max_pages: Process.get(:washy_max_pages),
-      mem_shared: Process.get(:washy_mem_shared),
-      table: Process.get(:washy_table),
-      table_size: Process.get(:washy_table_size),
+      mem: Process.get(:tl_mem),
+      mem_pages: Process.get(:tl_mem_pages),
+      max_pages: Process.get(:tl_max_pages),
+      mem_shared: Process.get(:tl_mem_shared),
+      table: Process.get(:tl_table),
+      table_size: Process.get(:tl_table_size),
       # SHARED (not copied) — the one per-run fuel atomics. Invariant 4.
-      last_fuel: Process.get(:washy_last_fuel),
-      programs: Process.get(:washy_programs),
-      vfs: Process.get(:washy_vfs),
-      jit: Process.get(:washy_jit),
+      last_fuel: Process.get(:tl_last_fuel),
+      programs: Process.get(:tl_programs),
+      vfs: Process.get(:tl_vfs),
+      jit: Process.get(:tl_jit),
       # the host-import table the fiber needs to resolve its OWN __porffor_gen_yield call (and any other
       # host import the generator body reaches) — call_host's registrable seam reads this from the dict.
-      imports: Process.get(:washy_imports),
-      rt: Process.get(:washy_rt),
+      imports: Process.get(:tl_imports),
+      rt: Process.get(:tl_rt),
       # SHARED (same atomics ref) — coherent malloc + value globals across the park (see moduledoc).
-      globals: Process.get(:washy_globals)
+      globals: Process.get(:tl_globals)
     }
   end
 
@@ -1089,25 +1089,25 @@ defmodule TinyLasers.Wasm do
   """
   @spec gen_adopt_context(map) :: :ok
   def gen_adopt_context(ctx) do
-    Process.put(:washy_mem, ctx.mem)
-    if ctx.mem_pages, do: Process.put(:washy_mem_pages, ctx.mem_pages)
-    if ctx.max_pages, do: Process.put(:washy_max_pages, ctx.max_pages)
-    if ctx.mem_shared, do: Process.put(:washy_mem_shared, ctx.mem_shared)
-    Process.put(:washy_table, ctx.table)
-    if ctx.table_size, do: Process.put(:washy_table_size, ctx.table_size)
-    Process.put(:washy_last_fuel, ctx.last_fuel)
-    Process.put(:washy_globals, ctx.globals)
-    if ctx.programs, do: Process.put(:washy_programs, ctx.programs)
-    if ctx.vfs, do: Process.put(:washy_vfs, ctx.vfs)
-    if ctx.jit, do: Process.put(:washy_jit, ctx.jit)
-    if ctx.imports, do: Process.put(:washy_imports, ctx.imports)
-    Process.put(:washy_out, [])
+    Process.put(:tl_mem, ctx.mem)
+    if ctx.mem_pages, do: Process.put(:tl_mem_pages, ctx.mem_pages)
+    if ctx.max_pages, do: Process.put(:tl_max_pages, ctx.max_pages)
+    if ctx.mem_shared, do: Process.put(:tl_mem_shared, ctx.mem_shared)
+    Process.put(:tl_table, ctx.table)
+    if ctx.table_size, do: Process.put(:tl_table_size, ctx.table_size)
+    Process.put(:tl_last_fuel, ctx.last_fuel)
+    Process.put(:tl_globals, ctx.globals)
+    if ctx.programs, do: Process.put(:tl_programs, ctx.programs)
+    if ctx.vfs, do: Process.put(:tl_vfs, ctx.vfs)
+    if ctx.jit, do: Process.put(:tl_jit, ctx.jit)
+    if ctx.imports, do: Process.put(:tl_imports, ctx.imports)
+    Process.put(:tl_out, [])
     # the fiber's rt shares the parent's mem/table/fuel refs but points at the fiber's own globals.
-    if ctx.rt, do: Process.put(:washy_rt, %{ctx.rt | globals: ctx.globals})
+    if ctx.rt, do: Process.put(:tl_rt, %{ctx.rt | globals: ctx.globals})
     :ok
   end
 
-  @doc "Build a module's mutable globals array (the transpiler installs this in `:washy_globals`)."
+  @doc "Build a module's mutable globals array (the transpiler installs this in `:tl_globals`)."
   def init_globals(%__MODULE__{} = mod), do: new_globals(mod.globals)
 
   @doc """
@@ -1116,7 +1116,7 @@ defmodule TinyLasers.Wasm do
   Coarser than the interpreter's per-instruction charge (per-iteration here), but it bounds runaway loops.
   """
   def charge_fuel do
-    case Process.get(:washy_last_fuel) do
+    case Process.get(:tl_last_fuel) do
       {_budget, fuel} -> if :atomics.sub_get(fuel, 1, 1) < 0, do: trap!(:out_of_fuel)
       _ -> :ok
     end
@@ -1125,33 +1125,33 @@ defmodule TinyLasers.Wasm do
   # argv[0] → a wasm module: an explicit program, else a multicall `:default` (e.g. coreutils) that
   # dispatches on argv[0]. nil = command not found.
   defp resolve_program(name) do
-    progs = Process.get(:washy_programs, %{})
+    progs = Process.get(:tl_programs, %{})
     Map.get(progs, name) || Map.get(progs, :default)
   end
 
   # Linear memory is PACKED + RIGHT-SIZED for density: the backing `:atomics` is sized to the module's
-  # `min` pages (NOT a 64-page cap) with 8 bytes per slot, and lives in the process dict (`:washy_mem`)
+  # `min` pages (NOT a 64-page cap) with 8 bytes per slot, and lives in the process dict (`:tl_mem`)
   # so `memory.grow` can REALLOCATE it (atomics can't grow in place) and every reader sees the new
   # backing. One guest = one process, so the dict is the right mutable cell. `mem_pages` (logical page
   # count) is a stable 1-slot atomics. `wmem/0` is the current backing.
   @page_words 8192
-  defp wmem, do: Process.get(:washy_mem)
+  defp wmem, do: Process.get(:tl_mem)
 
   # bool → u8 (for WASIX struct fields)
   defp b(true), do: 1
   defp b(_), do: 0
 
-  defp new_mem(nil), do: (Process.delete(:washy_mem); nil)
+  defp new_mem(nil), do: (Process.delete(:tl_mem); nil)
 
   # SHARED memory (threads, §2): PRE-ALLOCATE the backing at the declared max up front. `memory.grow`
-  # then only bumps the page-count counter (`:washy_mem_pages`) and NEVER reallocates the `:atomics`
+  # then only bumps the page-count counter (`:tl_mem_pages`) and NEVER reallocates the `:atomics`
   # ref — so every spawned thread keeps reading/writing the SAME backing (true shared memory). A shared
   # memory always declares a max (WASM threads spec); if somehow absent, fall back to min (single-thread).
   defp new_mem({min, max, :shared}) when is_integer(max) do
     pages = max(1, min)
-    Process.put(:washy_mem, :atomics.new(max * @page_words, signed: false))
+    Process.put(:tl_mem, :atomics.new(max * @page_words, signed: false))
     # mark the run as shared-memory: grow must NOT realloc (would desync spawned threads).
-    Process.put(:washy_mem_shared, true)
+    Process.put(:tl_mem_shared, true)
     pref = :atomics.new(1, signed: false)
     :atomics.put(pref, 1, pages)
     pref
@@ -1161,31 +1161,31 @@ defmodule TinyLasers.Wasm do
 
   defp new_mem({min, _max, _share}) do
     pages = max(1, min)
-    Process.put(:washy_mem, :atomics.new(pages * @page_words, signed: false))
-    Process.delete(:washy_mem_shared)
+    Process.put(:tl_mem, :atomics.new(pages * @page_words, signed: false))
+    Process.delete(:tl_mem_shared)
     pref = :atomics.new(1, signed: false)
     :atomics.put(pref, 1, pages)
     pref
   end
 
   @doc """
-  `memory.grow(n)` for TRANSPILED code — mirrors the interpreter's grow exactly: realloc `:washy_mem`
-  to `old+n` pages (copying live words), bump the `:washy_mem_pages` count, return the OLD page count;
-  or `-1` (masked to i32) when `n<0` or the new size exceeds the run's `:washy_max_pages` ceiling. Reads
+  `memory.grow(n)` for TRANSPILED code — mirrors the interpreter's grow exactly: realloc `:tl_mem`
+  to `old+n` pages (copying live words), bump the `:tl_mem_pages` count, return the OLD page count;
+  or `-1` (masked to i32) when `n<0` or the new size exceeds the run's `:tl_max_pages` ceiling. Reads
   all state from the process dict (the shared run context), so a transpiled and an interpreted grow are
-  identical. Transpiled load/store re-read `:washy_mem` per access, so they see the grown backing.
+  identical. Transpiled load/store re-read `:tl_mem` per access, so they see the grown backing.
   """
   def guest_memory_grow(n) do
-    mem_pages = Process.get(:washy_mem_pages)
+    mem_pages = Process.get(:tl_mem_pages)
     old = :atomics.get(mem_pages, 1)
     new = old + n
 
     cond do
-      n < 0 or new > Process.get(:washy_max_pages, @default_max_pages) ->
+      n < 0 or new > Process.get(:tl_max_pages, @default_max_pages) ->
         -1 &&& @mask32
 
       # shared memory: counter bump only (backing pre-allocated at max) — see step({:memory_grow}).
-      Process.get(:washy_mem_shared) ->
+      Process.get(:tl_mem_shared) ->
         :atomics.put(mem_pages, 1, new)
         old
 
@@ -1193,7 +1193,7 @@ defmodule TinyLasers.Wasm do
         oldmem = wmem()
         newmem = :atomics.new(new * @page_words, signed: false)
         for i <- 1..(old * @page_words)//1, do: :atomics.put(newmem, i, :atomics.get(oldmem, i))
-        Process.put(:washy_mem, newmem)
+        Process.put(:tl_mem, newmem)
         :atomics.put(mem_pages, 1, new)
         old
     end
@@ -1256,7 +1256,7 @@ defmodule TinyLasers.Wasm do
   def guest_mk_exnref(tag, vals), do: {:exnref, tag, vals}
 
   # ── reftypes / table ops for TRANSPILED code (WASIX §0) — bit-identical mirrors of the interpreter's
-  # step({:ref_*}/{:table_*}) handlers, reading the shared run state (:washy_rt / :washy_table). The asm
+  # step({:ref_*}/{:table_*}) handlers, reading the shared run state (:tl_rt / :tl_table). The asm
   # lane call_exts these so table/ref ops run NATIVE instead of falling back to the interpreter. ──
   @doc "`ref.is_null` for transpiled code — 1 if the popped ref is the null sentinel, else 0."
   def guest_ref_is_null(:null), do: 1
@@ -1264,23 +1264,23 @@ defmodule TinyLasers.Wasm do
 
   @doc "`table.get(i)` — the table entry at `i` (global func index / ref), or the null sentinel."
   def guest_table_get(i) do
-    rt = Process.get(:washy_rt)
-    Map.get(Process.get(:washy_table, rt.table), i, :null)
+    rt = Process.get(:tl_rt)
+    Map.get(Process.get(:tl_table, rt.table), i, :null)
   end
 
   @doc "`table.set(i, v)` — store ref `v` at index `i` in the mutable table. Returns :ok."
   def guest_table_set(i, v) do
-    rt = Process.get(:washy_rt)
-    Process.put(:washy_table, Map.put(Process.get(:washy_table, rt.table), i, v))
+    rt = Process.get(:tl_rt)
+    Process.put(:tl_table, Map.put(Process.get(:tl_table, rt.table), i, v))
     :ok
   end
 
   @doc "`table.size` — current table length."
-  def guest_table_size, do: table_size(Process.get(:washy_rt))
+  def guest_table_size, do: table_size(Process.get(:tl_rt))
 
   @doc "`table.grow(init, n)` — append `n` slots of `init`; returns old size, or -1 (u32) past the max."
   def guest_table_grow(init, n) do
-    rt = Process.get(:washy_rt)
+    rt = Process.get(:tl_rt)
     old = table_size(rt)
     new = old + n
     max = case rt.mod.table_type do {_, m} -> m; _ -> nil end
@@ -1288,19 +1288,19 @@ defmodule TinyLasers.Wasm do
     if max != nil and new > max do
       -1 &&& @mask32
     else
-      table = Enum.reduce(grow_range(old, new), Process.get(:washy_table, rt.table), fn idx, t -> Map.put(t, idx, init) end)
-      Process.put(:washy_table, table)
-      Process.put(:washy_table_size, new)
+      table = Enum.reduce(grow_range(old, new), Process.get(:tl_table, rt.table), fn idx, t -> Map.put(t, idx, init) end)
+      Process.put(:tl_table, table)
+      Process.put(:tl_table_size, new)
       old
     end
   end
 
   @doc "`table.fill(i, val, n)` — set `n` slots from `i` to ref `val`. Returns :ok."
   def guest_table_fill(i, val, n) do
-    rt = Process.get(:washy_rt)
-    table = Enum.reduce(grow_range(i, i + n), Process.get(:washy_table, rt.table), fn idx, t -> Map.put(t, idx, val) end)
-    Process.put(:washy_table, table)
-    Process.delete(:washy_table_size)
+    rt = Process.get(:tl_rt)
+    table = Enum.reduce(grow_range(i, i + n), Process.get(:tl_table, rt.table), fn idx, t -> Map.put(t, idx, val) end)
+    Process.put(:tl_table, table)
+    Process.delete(:tl_table_size)
     :ok
   end
 
@@ -1344,16 +1344,16 @@ defmodule TinyLasers.Wasm do
   end
 
   @doc """
-  `memory.size` for TRANSPILED code — current page count read from the shared `:washy_mem_pages`
+  `memory.size` for TRANSPILED code — current page count read from the shared `:tl_mem_pages`
   atomics (mirrors the interpreter, which reads `rt.mem_pages`; same backing).
   """
   def guest_memory_size do
-    :atomics.get(Process.get(:washy_mem_pages), 1)
+    :atomics.get(Process.get(:tl_mem_pages), 1)
   end
 
   @doc """
   Bounds-checked little-endian UNSIGNED integer load of `n` bytes at `addr` for TRANSPILED code.
-  Reads `:washy_mem` from the process dict per access (so a grown backing is seen), traps
+  Reads `:tl_mem` from the process dict per access (so a grown backing is seen), traps
   `:out_of_bounds` against the logical memory size — byte-identical to the interpreter's `gload/3`.
   """
   def guest_load(addr, n) do
@@ -1440,42 +1440,42 @@ defmodule TinyLasers.Wasm do
 
   # ── FUTEX + THREADS (WASIX §2) ──────────────────────────────────────────────────────────────────
   #
-  # ARCHITECTURE. Wasm linear memory is `:washy_mem`, an `:atomics` ref — and `:atomics` are SHAREABLE
+  # ARCHITECTURE. Wasm linear memory is `:tl_mem`, an `:atomics` ref — and `:atomics` are SHAREABLE
   # across BEAM processes (off-heap, mutated in place). So a thread spawned by `thread_spawn` runs in
   # its OWN BEAM process yet reads/writes the SAME atomics-backed memory + table as its parent: true
   # shared memory, no copy. What's SHARED vs COPIED per thread:
-  #   • SHARED (same ref in every thread): `:washy_mem` (memory), `:washy_table`, `:washy_mem_pages`,
-  #     `:washy_max_pages`, `:washy_mem_shared`, `:washy_rt` (carries the same mem/table/fuel refs).
-  #   • COPIED (per-thread): the `:washy_globals` atomics array — wasi-libc keeps `__stack_pointer` in a
+  #   • SHARED (same ref in every thread): `:tl_mem` (memory), `:tl_table`, `:tl_mem_pages`,
+  #     `:tl_max_pages`, `:tl_mem_shared`, `:tl_rt` (carries the same mem/table/fuel refs).
+  #   • COPIED (per-thread): the `:tl_globals` atomics array — wasi-libc keeps `__stack_pointer` in a
   #     mutable global, so each thread needs its OWN stack pointer (and thus its own globals array) or
   #     two threads would smash one stack. We deep-copy the parent's globals into a fresh atomics ref.
-  #   • `:washy_out` is fresh per thread (a thread's stdout is its own; it shares memory, not the buffer).
+  #   • `:tl_out` is fresh per thread (a thread's stdout is its own; it shares memory, not the buffer).
   # Memory MUST be `shared` (pre-allocated at max — see new_mem) so grow never reallocates the backing
   # out from under a running thread.
   #
-  # FUTEX REGISTRY. A named public ETS bag `:washy_futex` keyed `{mem_id, byte_addr}` → waiter pid.
-  # `mem_id` identifies the shared memory: we use the `:washy_mem` atomics ref itself (a stable term
+  # FUTEX REGISTRY. A named public ETS bag `:tl_futex` keyed `{mem_id, byte_addr}` → waiter pid.
+  # `mem_id` identifies the shared memory: we use the `:tl_mem` atomics ref itself (a stable term
   # for the lifetime of the run; shared threads hold the same ref ⇒ same key). Lazily created.
 
   @futex_max_wait_ms 60_000
 
   # Lazily ensure the public futex ETS bag exists (survives concurrent creation by losing the race).
   defp futex_table do
-    case :ets.whereis(:washy_futex) do
+    case :ets.whereis(:tl_futex) do
       :undefined ->
         try do
-          :ets.new(:washy_futex, [:named_table, :public, :bag])
+          :ets.new(:tl_futex, [:named_table, :public, :bag])
         rescue
-          ArgumentError -> :washy_futex
+          ArgumentError -> :tl_futex
         end
 
       _ ->
-        :washy_futex
+        :tl_futex
     end
   end
 
-  # The shared-memory id used to key futex waiters: the `:washy_mem` atomics ref (stable, shared).
-  defp futex_mem_id, do: Process.get(:washy_mem)
+  # The shared-memory id used to key futex waiters: the `:tl_mem` atomics ref (stable, shared).
+  defp futex_mem_id, do: Process.get(:tl_mem)
 
   @doc """
   **`memory.atomic.wait(addr, expected, timeout_ns)` — real futex wait (WASIX §2).** ONE impl shared
@@ -1483,7 +1483,7 @@ defmodule TinyLasers.Wasm do
   `1` not-equal / `2` timed-out.
 
   Atomically reads `mem[addr]` (width `n` = 4 or 8); if it `!= expected`, returns 1 immediately (no
-  block). Otherwise registers `self()` in `:washy_futex` under `{mem_id, addr}` and blocks in a
+  block). Otherwise registers `self()` in `:tl_futex` under `{mem_id, addr}` and blocks in a
   SELECTIVE receive on the exact `{:wb_wake, addr}` (so it never swallows unrelated mailbox messages),
   BOUNDED by `after timeout_ms`. `timeout_ns < 0` ("infinite") is still capped at `@futex_max_wait_ms`
   — never an unbounded block. Always deregisters self from the bag on exit (woken OR timed out).
@@ -1553,7 +1553,7 @@ defmodule TinyLasers.Wasm do
 
   @doc false
   def guest_thread_spawn(start_arg) do
-    rt = Process.get(:washy_rt) || raise "thread_spawn outside a washy run (no :washy_rt)"
+    rt = Process.get(:tl_rt) || raise "thread_spawn outside a tinylasers run (no :tl_rt)"
 
     # allocate a tid (per-run counter in the rt's atomics-backed slot; tids start at 1).
     tid = next_tid()
@@ -1562,77 +1562,77 @@ defmodule TinyLasers.Wasm do
 
   # Shared spawn body for both `thread_spawn` (start_arg returned as tid) and `thread_spawn_v2`
   # (config_ptr passed through, tid written to a ret ptr). Registers tid→worker-pid in the public
-  # `:washy_threads` table so `thread_join(tid)` can BOUNDED-wait on it, and stamps the child's own
-  # `:washy_thread_id` so `thread_id` reports it. Returns the tid.
+  # `:tl_threads` table so `thread_join(tid)` can BOUNDED-wait on it, and stamps the child's own
+  # `:tl_thread_id` so `thread_id` reports it. Returns the tid.
   defp do_guest_thread_spawn(rt, tid, start_arg) do
 
     # capture the SHARED refs the child must adopt (same atomics, not copies).
     parent = %{
-      mem: Process.get(:washy_mem),
-      mem_pages: Process.get(:washy_mem_pages),
-      max_pages: Process.get(:washy_max_pages),
-      mem_shared: Process.get(:washy_mem_shared),
-      table: Process.get(:washy_table),
-      table_size: Process.get(:washy_table_size),
-      last_fuel: Process.get(:washy_last_fuel),
+      mem: Process.get(:tl_mem),
+      mem_pages: Process.get(:tl_mem_pages),
+      max_pages: Process.get(:tl_max_pages),
+      mem_shared: Process.get(:tl_mem_shared),
+      table: Process.get(:tl_table),
+      table_size: Process.get(:tl_table_size),
+      last_fuel: Process.get(:tl_last_fuel),
       rt: rt,
-      programs: Process.get(:washy_programs),
-      vfs: Process.get(:washy_vfs),
-      tid_counter: Process.get(:washy_tid_counter),
+      programs: Process.get(:tl_programs),
+      vfs: Process.get(:tl_vfs),
+      tid_counter: Process.get(:tl_tid_counter),
       # POSIX threads SHARE the fd table. We SNAPSHOT the parent's fd maps into the child at spawn so
       # fds that existed AT SPAWN TIME are visible in the child (covers the common server-thread-
       # accepts-on-main's-listen-fd pattern). These are plain term maps in the dict — a shallow copy
       # is the snapshot. (An fd opened in one thread AFTER spawn being visible in another is the rarer
       # case → true shared fd table via ETS is a follow-up, wb-followup.) The fd/desc/sock id counters
       # are copied too so the child allocates non-colliding ids for its own new fds.
-      fdmap: Process.get(:washy_fdmap),
-      descs: Process.get(:washy_descs),
-      nextfd: Process.get(:washy_nextfd),
-      nextdesc: Process.get(:washy_nextdesc),
-      pipes: Process.get(:washy_pipes),
-      sockstate: Process.get(:washy_sockstate),
-      socknext: Process.get(:washy_socknext)
+      fdmap: Process.get(:tl_fdmap),
+      descs: Process.get(:tl_descs),
+      nextfd: Process.get(:tl_nextfd),
+      nextdesc: Process.get(:tl_nextdesc),
+      pipes: Process.get(:tl_pipes),
+      sockstate: Process.get(:tl_sockstate),
+      socknext: Process.get(:tl_socknext)
     }
 
     # fresh per-thread globals (own stack pointer) — deep-copy the parent's globals atomics.
-    child_globals = copy_globals(Process.get(:washy_globals))
+    child_globals = copy_globals(Process.get(:tl_globals))
 
     {pid, _ref} =
       spawn_monitor(fn ->
         # install the child's run context: SHARED mem/table/pages/rt, COPIED globals, fresh stdout.
-        Process.put(:washy_mem, parent.mem)
-        Process.put(:washy_mem_pages, parent.mem_pages)
-        Process.put(:washy_max_pages, parent.max_pages)
-        if parent.mem_shared, do: Process.put(:washy_mem_shared, parent.mem_shared)
-        Process.put(:washy_table, parent.table)
-        if parent.table_size, do: Process.put(:washy_table_size, parent.table_size)
-        Process.put(:washy_last_fuel, parent.last_fuel)
-        Process.put(:washy_globals, child_globals)
-        Process.put(:washy_out, [])
-        if parent.programs, do: Process.put(:washy_programs, parent.programs)
-        if parent.vfs, do: Process.put(:washy_vfs, parent.vfs)
-        if parent.tid_counter, do: Process.put(:washy_tid_counter, parent.tid_counter)
+        Process.put(:tl_mem, parent.mem)
+        Process.put(:tl_mem_pages, parent.mem_pages)
+        Process.put(:tl_max_pages, parent.max_pages)
+        if parent.mem_shared, do: Process.put(:tl_mem_shared, parent.mem_shared)
+        Process.put(:tl_table, parent.table)
+        if parent.table_size, do: Process.put(:tl_table_size, parent.table_size)
+        Process.put(:tl_last_fuel, parent.last_fuel)
+        Process.put(:tl_globals, child_globals)
+        Process.put(:tl_out, [])
+        if parent.programs, do: Process.put(:tl_programs, parent.programs)
+        if parent.vfs, do: Process.put(:tl_vfs, parent.vfs)
+        if parent.tid_counter, do: Process.put(:tl_tid_counter, parent.tid_counter)
         # adopt the parent's fd table snapshot (see `parent` capture for the model). gen_tcp/gen_udp
-        # transports in :washy_sockstate are BEAM ports owned by the parent process; gen_tcp.accept/recv
+        # transports in :tl_sockstate are BEAM ports owned by the parent process; gen_tcp.accept/recv
         # from a non-controlling process fails, so we re-home each live transport's controlling_process
         # to this child. (Single-server-thread is the dominant pattern; multi-thread-shared-socket is
-        # the same follow-up as the post-spawn fd-visibility gap.) HostSock's :washy_sock teardown hook
+        # the same follow-up as the post-spawn fd-visibility gap.) HostSock's :tl_sock teardown hook
         # is reinstalled below so the child's FdTable.close frees ports correctly.
-        if parent.fdmap, do: Process.put(:washy_fdmap, parent.fdmap)
-        if parent.descs, do: Process.put(:washy_descs, parent.descs)
-        if parent.nextfd, do: Process.put(:washy_nextfd, parent.nextfd)
-        if parent.nextdesc, do: Process.put(:washy_nextdesc, parent.nextdesc)
-        if parent.pipes, do: Process.put(:washy_pipes, parent.pipes)
+        if parent.fdmap, do: Process.put(:tl_fdmap, parent.fdmap)
+        if parent.descs, do: Process.put(:tl_descs, parent.descs)
+        if parent.nextfd, do: Process.put(:tl_nextfd, parent.nextfd)
+        if parent.nextdesc, do: Process.put(:tl_nextdesc, parent.nextdesc)
+        if parent.pipes, do: Process.put(:tl_pipes, parent.pipes)
 
         if parent.sockstate do
-          Process.put(:washy_sockstate, parent.sockstate)
-          if parent.socknext, do: Process.put(:washy_socknext, parent.socknext)
+          Process.put(:tl_sockstate, parent.sockstate)
+          if parent.socknext, do: Process.put(:tl_socknext, parent.socknext)
           TinyLasers.Wasm.HostSock.install()
         end
         # the child knows its own thread id (so `thread_id` reports the tid, not 1).
-        Process.put(:washy_thread_id, tid)
+        Process.put(:tl_thread_id, tid)
         # the child's rt shares the same mem/table/fuel refs, but points at the child's globals.
-        Process.put(:washy_rt, %{rt | globals: child_globals})
+        Process.put(:tl_rt, %{rt | globals: child_globals})
 
         export = Map.get(rt.mod.exports, "wasi_thread_start")
 
@@ -1640,7 +1640,7 @@ defmodule TinyLasers.Wasm do
           try do
             call_fn(%{rt | globals: child_globals}, export, [tid, start_arg])
           catch
-            :throw, {:washy_exit, _code} -> :ok
+            :throw, {:tl_exit, _code} -> :ok
           end
         end
       end)
@@ -1668,7 +1668,7 @@ defmodule TinyLasers.Wasm do
     # (proc_exit) must kill its threads, not leave them parked in futex_wait for the 60s cap (rayon's
     # pool leaves idle workers blocked on a futex after the parallel region; without teardown the run
     # lingers). Mirrors POSIX: process exit terminates all threads.
-    Process.put(:washy_thread_pids, [pid | Process.get(:washy_thread_pids, [])])
+    Process.put(:tl_thread_pids, [pid | Process.get(:tl_thread_pids, [])])
 
     # reap the monitor message so the parent's mailbox stays clean; log a crash, never propagate it.
     parent_self = self()
@@ -1680,7 +1680,7 @@ defmodule TinyLasers.Wasm do
         {:DOWN, ^ref2, :process, ^pid, reason} when reason in [:normal, :noproc] -> :ok
         {:DOWN, ^ref2, :process, ^pid, reason} ->
           require Logger
-          Logger.warning("washy thread #{tid} (#{inspect(pid)}) crashed: #{inspect(reason)} (parent #{inspect(parent_self)})")
+          Logger.warning("tinylasers thread #{tid} (#{inspect(pid)}) crashed: #{inspect(reason)} (parent #{inspect(parent_self)})")
       after
         @futex_max_wait_ms -> :ok
       end
@@ -1695,16 +1695,16 @@ defmodule TinyLasers.Wasm do
   # Public ETS map tid → worker BEAM pid for spawned threads (WASIX §2 thread_join). Lazily created;
   # survives a concurrent-creation race by catching the ArgumentError and re-reading the name.
   defp threads_table do
-    case :ets.whereis(:washy_threads) do
+    case :ets.whereis(:tl_threads) do
       :undefined ->
         try do
-          :ets.new(:washy_threads, [:named_table, :public, :set])
+          :ets.new(:tl_threads, [:named_table, :public, :set])
         rescue
-          ArgumentError -> :washy_threads
+          ArgumentError -> :tl_threads
         end
 
       _ ->
-        :washy_threads
+        :tl_threads
     end
   end
 
@@ -1712,10 +1712,10 @@ defmodule TinyLasers.Wasm do
   # run share ONE monotonically increasing counter (each spawn gets a unique tid).
   defp next_tid do
     ctr =
-      case Process.get(:washy_tid_counter) do
+      case Process.get(:tl_tid_counter) do
         nil ->
           c = :atomics.new(1, signed: true)
-          Process.put(:washy_tid_counter, c)
+          Process.put(:tl_tid_counter, c)
           c
 
         c ->
@@ -1747,9 +1747,9 @@ defmodule TinyLasers.Wasm do
   end
 
   # bounds check for the bulk-memory host helpers — same limit the interpreter's bounds!/3 uses, read
-  # from the shared :washy_mem_pages dict (so transpiled + interpreted bulk ops trap identically).
+  # from the shared :tl_mem_pages dict (so transpiled + interpreted bulk ops trap identically).
   defp bounds_g!(addr, n) do
-    limit = :atomics.get(Process.get(:washy_mem_pages), 1) * 65536
+    limit = :atomics.get(Process.get(:tl_mem_pages), 1) * 65536
     if addr < 0 or addr + n > limit, do: trap!(:out_of_bounds)
   end
 
@@ -1800,7 +1800,7 @@ defmodule TinyLasers.Wasm do
   defp new_table([], _globals), do: %{}
 
   # Current logical table size: the runtime counter (after grows) or the module's declared min.
-  defp table_size(rt), do: Process.get(:washy_table_size) || table_min(rt)
+  defp table_size(rt), do: Process.get(:tl_table_size) || table_min(rt)
   defp table_min(rt), do: (case rt.mod.table_type do {min, _} -> min; _ -> 0 end)
   # An ascending index range [lo, hi) that's empty when hi <= lo (//1 step avoids a descending range).
   defp grow_range(lo, hi), do: lo..(hi - 1)//1
@@ -1900,7 +1900,7 @@ defmodule TinyLasers.Wasm do
     # the asm lane — everything else interprets. Lets a differential harness binary-search WHICH asm
     # function makes a transpiled run diverge from the (oracle) interpreter. nil in normal operation (one
     # process-dict read; never an allow-set in production).
-    case Process.get(:washy_jit_only) do
+    case Process.get(:tl_jit_only) do
       nil -> lazy_invoke_dispatch(rt, local_idx, args, counts, threshold, async?, gfidx)
       allow -> if MapSet.member?(allow, gfidx),
                  do: lazy_invoke_dispatch(rt, local_idx, args, counts, threshold, async?, gfidx),
@@ -1909,11 +1909,11 @@ defmodule TinyLasers.Wasm do
   end
 
   defp lazy_invoke_dispatch(rt, local_idx, args, counts, threshold, async?, gfidx) do
-    jit = Process.get(:washy_jit, %{})
+    jit = Process.get(:tl_jit, %{})
 
     case Map.get(jit, gfidx) do
       {m, f, _ar, tok} ->
-        # The per-process `:washy_jit` fast path pins the ModulePool generation token the MFA was compiled
+        # The per-process `:tl_jit` fast path pins the ModulePool generation token the MFA was compiled
         # under. The global pool may recycle slot `m` for ANOTHER guest mid-run (soft_purge succeeds while
         # we're between calls), reloading the same atom with a DIFFERENT chunk — still `module_loaded`, but
         # `wf_<gfidx>` now points at the wrong function (silent corruption) or is absent (undefined). A
@@ -1924,7 +1924,7 @@ defmodule TinyLasers.Wasm do
           cov_tick(1)
           apply(m, f, args)
         else
-          Process.put(:washy_jit, Map.delete(jit, gfidx))
+          Process.put(:tl_jit, Map.delete(jit, gfidx))
           lazy_invoke(rt, local_idx, args, counts, threshold, async?)
         end
 
@@ -1936,12 +1936,12 @@ defmodule TinyLasers.Wasm do
         # cache); until then keep interpreting — the run never stalls on the compile.
         case TinyLasers.Wasm.Transpile.cached_one(rt.mod.id, gfidx) do
           {:ok, {m, f, _} = native} ->
-            Process.put(:washy_jit, Map.put(jit, gfidx, jit_pin(native)))
+            Process.put(:tl_jit, Map.put(jit, gfidx, jit_pin(native)))
             cov_tick(1)
             apply(m, f, args)
 
           :error ->
-            Process.put(:washy_jit, Map.put(jit, gfidx, :failed))
+            Process.put(:tl_jit, Map.put(jit, gfidx, :failed))
             interp_invoke(rt, local_idx, args)
 
           _ ->
@@ -1954,12 +1954,12 @@ defmodule TinyLasers.Wasm do
         # already decided not to compile it (unsupported op / too expensive) — don't re-attempt.
         case TinyLasers.Wasm.Transpile.cached_one(rt.mod.id, gfidx) do
           {:ok, {m, f, _} = native} ->
-            Process.put(:washy_jit, Map.put(jit, gfidx, jit_pin(native)))
+            Process.put(:tl_jit, Map.put(jit, gfidx, jit_pin(native)))
             cov_tick(1)
             apply(m, f, args)
 
           :error ->
-            Process.put(:washy_jit, Map.put(jit, gfidx, :failed))
+            Process.put(:tl_jit, Map.put(jit, gfidx, :failed))
             interp_invoke(rt, local_idx, args)
 
           _ ->
@@ -1979,7 +1979,7 @@ defmodule TinyLasers.Wasm do
   # now and dispatch native (deterministic — used by tests and where blocking is fine).
   defp tier_hot(rt, local_idx, args, gfidx, jit, true) do
     TinyLasers.Wasm.Transpile.compile_one_async(rt.mod, gfidx)
-    Process.put(:washy_jit, Map.put(jit, gfidx, :pending))
+    Process.put(:tl_jit, Map.put(jit, gfidx, :pending))
     interp_invoke(rt, local_idx, args)
   end
 
@@ -1990,7 +1990,7 @@ defmodule TinyLasers.Wasm do
         :error -> :failed
       end
 
-    Process.put(:washy_jit, Map.put(jit, gfidx, entry))
+    Process.put(:tl_jit, Map.put(jit, gfidx, entry))
 
     case entry do
       {m, f, _ar, _tok} -> cov_tick(1); apply(m, f, args)
@@ -1999,18 +1999,18 @@ defmodule TinyLasers.Wasm do
   end
 
   # Pin a freshly-resolved native MFA with the ModulePool generation token it was compiled under, so the
-  # per-process `:washy_jit` dispatch can detect (via `ModulePool.valid?/2`) when the pool later recycles
+  # per-process `:tl_jit` dispatch can detect (via `ModulePool.valid?/2`) when the pool later recycles
   # that slot for a different guest and re-resolve instead of calling stale/wrong code (wb-7jwh).
   defp jit_pin({m, f, ar}), do: {m, f, ar, TinyLasers.Wasm.ModulePool.token(m)}
 
-  # ASM-native coverage accounting (gated; zero-overhead when off). When :washy_cov holds a 2-slot atomics
+  # ASM-native coverage accounting (gated; zero-overhead when off). When :tl_cov holds a 2-slot atomics
   # ref, every dispatched call ticks slot 1 (ASM-native) or slot 2 (interp fallback) so a run can report
   # what fraction executed ASM-native vs bailed to interp — the "no silent downgrade" gate. Call-weighted at
   # the dispatch boundary; native sub-calls that stay inside compiled code aren't re-dispatched (a known
   # under-count of native, i.e. the reported ASM% is a conservative lower bound).
   @compile {:inline, cov_tick: 1}
   defp cov_tick(slot) do
-    case Process.get(:washy_cov) do
+    case Process.get(:tl_cov) do
       nil -> :ok
       ref -> :atomics.add(ref, slot, 1)
     end
@@ -2019,7 +2019,7 @@ defmodule TinyLasers.Wasm do
   @doc "Run `fun` with ASM-native coverage accounting on; returns `{result, %{asm:, interp:, asm_pct:}}`."
   def with_coverage(fun) when is_function(fun, 0) do
     ref = :atomics.new(2, signed: false)
-    prev = Process.put(:washy_cov, ref)
+    prev = Process.put(:tl_cov, ref)
     try do
       result = fun.()
       asm = :atomics.get(ref, 1)
@@ -2028,7 +2028,7 @@ defmodule TinyLasers.Wasm do
       pct = if total > 0, do: Float.round(asm * 100 / total, 2), else: 0.0
       {result, %{asm: asm, interp: interp, asm_pct: pct}}
     after
-      if prev, do: Process.put(:washy_cov, prev), else: Process.delete(:washy_cov)
+      if prev, do: Process.put(:tl_cov, prev), else: Process.delete(:tl_cov)
     end
   end
 
@@ -2037,30 +2037,30 @@ defmodule TinyLasers.Wasm do
     if :atomics.add_get(rt.depth, 1, 1) > rt.max_depth, do: trap!(:stack_exhausted)
     {nlocals, instrs} = Enum.at(rt.mod.code, local_idx)
     locals = (args ++ List.duplicate(0, nlocals)) |> List.to_tuple()
-    # Gated throw-localization (counterpart to :washy_oob_debug): on a guest exception, print the innermost
+    # Gated throw-localization (counterpart to :tl_oob_debug): on a guest exception, print the innermost
     # function's index+name (from the `-d` name section) as the stack unwinds, then re-raise. Off by default
     # (one process-dict read per call when off). Names a Porffor `-d` build's boxed fns as `b$<hint>$<N>`.
     {_sig, stack, _l} =
       cond do
-        Process.get(:washy_trace_throw) ->
+        Process.get(:tl_trace_throw) ->
           try do
             run(instrs, [], locals, rt)
           catch
             :throw, {:wasm_exc, _, _} = e ->
               gf = local_idx + length(rt.mod.imports)
-              IO.puts(:stderr, "WASHY_THROW_FN gfidx=#{gf} #{inspect(Map.get(rt.mod.func_names || %{}, gf))}")
+              IO.puts(:stderr, "TL_THROW_FN gfidx=#{gf} #{inspect(Map.get(rt.mod.func_names || %{}, gf))}")
               :erlang.throw(e)
           end
 
         # Gated TRAP-localization: print the innermost function index+name as a TinyLasers.Wasm.Trap
-        # (out_of_bounds etc.) unwinds, then re-raise. Mirrors :washy_trace_throw for non-catchable traps.
-        Process.get(:washy_trap_trace) ->
+        # (out_of_bounds etc.) unwinds, then re-raise. Mirrors :tl_trace_throw for non-catchable traps.
+        Process.get(:tl_trap_trace) ->
           try do
             run(instrs, [], locals, rt)
           rescue
             e in TinyLasers.Wasm.Trap ->
               gf = local_idx + length(rt.mod.imports)
-              IO.puts(:stderr, "WASHY_TRAP_FN gfidx=#{gf} #{inspect(Map.get(rt.mod.func_names || %{}, gf))} reason=#{inspect(e.reason)}")
+              IO.puts(:stderr, "TL_TRAP_FN gfidx=#{gf} #{inspect(Map.get(rt.mod.func_names || %{}, gf))} reason=#{inspect(e.reason)}")
               reraise(e, __STACKTRACE__)
           end
 
@@ -2086,7 +2086,7 @@ defmodule TinyLasers.Wasm do
   defp call_host(rt, {_m, "fd_write", _t}, [fd, iovs, iovs_len, nwritten]) do
     data = gather_iovs(wmem(), iovs, iovs_len)
     cond do
-      fd in [1, 2] -> Process.put(:washy_out, [data | Process.get(:washy_out, [])])
+      fd in [1, 2] -> Process.put(:tl_out, [data | Process.get(:tl_out, [])])
       true ->
         case TinyLasers.Wasm.FdTable.get(fd) do
           %{kind: :pipe, ref: {pid, _}} -> TinyLasers.Wasm.FdTable.Pipe.write(pid, data)
@@ -2102,19 +2102,19 @@ defmodule TinyLasers.Wasm do
     0
   end
 
-  defp call_host(_rt, {_m, "proc_exit", _t}, [code]), do: throw({:washy_exit, code})
+  defp call_host(_rt, {_m, "proc_exit", _t}, [code]), do: throw({:tl_exit, code})
 
   # ── WASIX `wasix_32v1` host imports ── native unix binaries (wasix-libc / target_family=unix) call these
   # directly instead of the wasm `memory.atomic.*` instructions. They route to the SAME §2 futex / §6 signal
   # machinery the instruction lane uses (DRY) — proven by running a real wasix-libc-compiled binary (§8).
 
   # proc_exit2(code) — WASIX exit (the '2' variant carries the code; same effect as proc_exit).
-  defp call_host(_rt, {_m, "proc_exit2", _t}, [code | _]), do: throw({:washy_exit, code})
+  defp call_host(_rt, {_m, "proc_exit2", _t}, [code | _]), do: throw({:tl_exit, code})
 
   # callback_signal(name_ptr, name_len) — wasi-libc registers the export name of its signal-dispatch
   # trampoline so a delivered signal can re-enter the guest there (async invocation = wb-rgkq). Stash; void.
   defp call_host(_rt, {_m, "callback_signal", _t}, [name_ptr, name_len]) do
-    Process.put(:washy_signal_callback, read_bytes(wmem(), name_ptr, name_len))
+    Process.put(:tl_signal_callback, read_bytes(wmem(), name_ptr, name_len))
     0
   end
 
@@ -2225,21 +2225,21 @@ defmodule TinyLasers.Wasm do
 
   # an optional per-run exec policy (set by the caller): `(argv) -> :ok | {:deny, reason}`.
   defp exec_policy_hook(argv) do
-    case Process.get(:washy_exec_policy) do
+    case Process.get(:tl_exec_policy) do
       f when is_function(f, 1) -> f.(argv)
       _ -> :ok
     end
   end
 
   defp stash_exec(out, code) do
-    Process.put(:washy_exec_out, out)
-    Process.put(:washy_exec_code, code)
+    Process.put(:tl_exec_out, out)
+    Process.put(:tl_exec_code, code)
     byte_size(out)
   end
 
   # an optional host-cap dispatcher (set by the agent shell): `(argv, stdin) -> {out, code} | :not_host`
   defp host_dispatch_hook(argv, stdin) do
-    case Process.get(:washy_host_dispatch) do
+    case Process.get(:tl_host_dispatch) do
       f when is_function(f, 2) -> f.(argv, stdin)
       _ -> :not_host
     end
@@ -2248,22 +2248,22 @@ defmodule TinyLasers.Wasm do
   # host_exec_read(buf_ptr) — copy the stashed child output into guest memory; return the child's exit
   # code. Pairs with host_exec (the guest sizes its buffer from host_exec's return, then reads).
   defp call_host(rt, {_m, "host_exec_read", _t}, [buf_ptr]) do
-    write_bytes(wmem(), buf_ptr, Process.get(:washy_exec_out, ""))
-    Process.get(:washy_exec_code, 0)
+    write_bytes(wmem(), buf_ptr, Process.get(:tl_exec_out, ""))
+    Process.get(:tl_exec_code, 0)
   end
 
   # host_http — the thesis's network emulation: wasm has no sockets, so a guest's HTTP call is handed to
   # the host, which performs it (TLS + egress, SSRF-guarded) and STASHES the response. Same pipe-friendly
   # ABI as host_exec: returns the response BODY length (or -1 if no transport is wired); host_http_read
   # copies the body into the guest's buffer and returns the HTTP status. The request bytes are opaque to
-  # the runtime — a caller-set `:washy_http` hook interprets them (so washy carries no HTTP policy).
+  # the runtime — a caller-set `:tl_http` hook interprets them (so tinylasers carries no HTTP policy).
   defp call_host(rt, {_m, "host_http", _t}, [req_ptr, req_len]) do
     req = read_bytes(wmem(), req_ptr, req_len)
 
     case http_hook(req) do
       {body, status} when is_binary(body) ->
-        Process.put(:washy_http_out, body)
-        Process.put(:washy_http_status, status)
+        Process.put(:tl_http_out, body)
+        Process.put(:tl_http_status, status)
         byte_size(body)
 
       _ ->
@@ -2272,8 +2272,8 @@ defmodule TinyLasers.Wasm do
   end
 
   defp call_host(rt, {_m, "host_http_read", _t}, [buf_ptr]) do
-    write_bytes(wmem(), buf_ptr, Process.get(:washy_http_out, ""))
-    Process.get(:washy_http_status, 0)
+    write_bytes(wmem(), buf_ptr, Process.get(:tl_http_out, ""))
+    Process.get(:tl_http_status, 0)
   end
 
   # ── Beam.* JS↔OTP interop host seam (wb-wzgu/north-star) ──────────────────────────────────────────
@@ -2337,7 +2337,7 @@ defmodule TinyLasers.Wasm do
 
   # beam_recv(out_ptr) -> len : write the message the Actor stashed for this re-entry (JSON) into out.
   defp call_host(_rt, {_m, "beam_recv", _t}, [out_ptr]) do
-    json = Process.get(:washy_beam_inbox, "null")
+    json = Process.get(:tl_beam_inbox, "null")
     write_bytes(wmem(), out_ptr, json)
     byte_size(json)
   end
@@ -2380,7 +2380,7 @@ defmodule TinyLasers.Wasm do
   # io_recv(out_ptr) -> len : write the {id,ok,value} completion envelope the actor stashed for this
   # wb_complete re-entry (JSON) into guest memory. Mirrors beam_recv; the generic async-completion read.
   defp call_host(_rt, {_m, "io_recv", _t}, [out_ptr]) do
-    json = Process.get(:washy_io_inbox, "null")
+    json = Process.get(:tl_io_inbox, "null")
     write_bytes(wmem(), out_ptr, json)
     byte_size(json)
   end
@@ -2399,7 +2399,7 @@ defmodule TinyLasers.Wasm do
 
   # an optional host HTTP transport (set by the caller): `(request_bytes) -> {body, status} | :none`.
   defp http_hook(req) do
-    case Process.get(:washy_http) do
+    case Process.get(:tl_http) do
       f when is_function(f, 1) -> f.(req)
       _ -> :none
     end
@@ -2408,7 +2408,7 @@ defmodule TinyLasers.Wasm do
   # ── host-brokered TCP (Layer 2) — wasm32-wasip1 has no sockets, so a guest's connect/send/recv is
   # performed by the host (real sockets, SSRF-guarded) and the bytes shuttle across the membrane. This
   # is the general path for raw std::net / socket-aware tokio that Layer 1's HTTP shim doesn't cover.
-  # Generic: a caller-set `:washy_sock` hook owns the transport; washy only maps a guest fd → its ref.
+  # Generic: a caller-set `:tl_sock` hook owns the transport; tinylasers only maps a guest fd → its ref.
   defp call_host(rt, {_m, "host_tcp_connect", _t}, [host_ptr, host_len, port]) do
     host = read_bytes(wmem(), host_ptr, host_len)
 
@@ -2462,14 +2462,14 @@ defmodule TinyLasers.Wasm do
         -1
 
       _ref ->
-        # FdTable.close runs the transport teardown ({:close, ref} via :washy_sock) on the last ref.
+        # FdTable.close runs the transport teardown ({:close, ref} via :tl_sock) on the last ref.
         TinyLasers.Wasm.FdTable.close(fd)
         0
     end
   end
 
   # ── WASIX §3 BSD-socket ABI (wb-j9op) — thin clauses: parse args, delegate to HostSock ──────────
-  # Socket state lives in HostSock's :washy_sockstate map (transport ports shared across dup'd fds),
+  # Socket state lives in HostSock's :tl_sockstate map (transport ports shared across dup'd fds),
   # the fd lives in the unified FdTable (kind: :socket, ref = state id). See TinyLasers.Wasm.HostSock.
   defp call_host(_rt, {_m, "sock_open", _t}, [af, socktype, protocol, fd_out]),
     do: TinyLasers.Wasm.HostSock.open(wmem(), af, socktype, protocol, fd_out)
@@ -2515,22 +2515,22 @@ defmodule TinyLasers.Wasm do
   # consistent set/get round-trip — without changing transport behaviour. opt ids are the wasix
   # __wasi_sock_option_t enum; treated uniformly (store-and-echo) which satisfies std::net.
   defp call_host(_rt, {_m, "sock_set_opt_flag", _t}, [fd, opt, flag]) do
-    Process.put(:washy_sockopts, Map.put(Process.get(:washy_sockopts, %{}), {fd, opt, :flag}, flag &&& 1))
+    Process.put(:tl_sockopts, Map.put(Process.get(:tl_sockopts, %{}), {fd, opt, :flag}, flag &&& 1))
     0
   end
 
   defp call_host(_rt, {_m, "sock_get_opt_flag", _t}, [fd, opt, ret_ptr]) do
-    store(wmem(), ret_ptr, Map.get(Process.get(:washy_sockopts, %{}), {fd, opt, :flag}, 0), 1)
+    store(wmem(), ret_ptr, Map.get(Process.get(:tl_sockopts, %{}), {fd, opt, :flag}, 0), 1)
     0
   end
 
   defp call_host(_rt, {_m, "sock_set_opt_size", _t}, [fd, opt, size]) do
-    Process.put(:washy_sockopts, Map.put(Process.get(:washy_sockopts, %{}), {fd, opt, :size}, size))
+    Process.put(:tl_sockopts, Map.put(Process.get(:tl_sockopts, %{}), {fd, opt, :size}, size))
     0
   end
 
   defp call_host(_rt, {_m, "sock_get_opt_size", _t}, [fd, opt, ret_ptr]) do
-    store(wmem(), ret_ptr, Map.get(Process.get(:washy_sockopts, %{}), {fd, opt, :size}, 0), 8)
+    store(wmem(), ret_ptr, Map.get(Process.get(:tl_sockopts, %{}), {fd, opt, :size}, 0), 8)
     0
   end
 
@@ -2538,12 +2538,12 @@ defmodule TinyLasers.Wasm do
   defp call_host(_rt, {_m, "sock_set_opt_time", _t}, [fd, opt, time_ptr]) do
     tag = load(wmem(), time_ptr, 1)
     val = if tag == 0, do: :none, else: load(wmem(), time_ptr + 8, 8)
-    Process.put(:washy_sockopts, Map.put(Process.get(:washy_sockopts, %{}), {fd, opt, :time}, val))
+    Process.put(:tl_sockopts, Map.put(Process.get(:tl_sockopts, %{}), {fd, opt, :time}, val))
     0
   end
 
   defp call_host(_rt, {_m, "sock_get_opt_time", _t}, [fd, opt, ret_ptr]) do
-    case Map.get(Process.get(:washy_sockopts, %{}), {fd, opt, :time}, :none) do
+    case Map.get(Process.get(:tl_sockopts, %{}), {fd, opt, :time}, :none) do
       :none -> store(wmem(), ret_ptr, 0, 1)
       v -> (store(wmem(), ret_ptr, 1, 1); store(wmem(), ret_ptr + 8, v, 8))
     end
@@ -2602,7 +2602,7 @@ defmodule TinyLasers.Wasm do
   # `{:connect, host, port}` → `{:ok, ref} | {:error, _}`, `{:send, ref, data}` → bytes_sent,
   # `{:recv, ref, max}` → `{:data, bin} | :eof | {:error, _}`, `{:close, ref}` → :ok.
   defp sock_hook(op) do
-    case Process.get(:washy_sock) do
+    case Process.get(:tl_sock) do
       f when is_function(f, 1) -> f.(op)
       _ -> {:error, :no_transport}
     end
@@ -2610,14 +2610,14 @@ defmodule TinyLasers.Wasm do
 
   # WASI args (argv): argc < 2 so the shell reads its command line from stdin.
   defp call_host(rt, {_m, "args_sizes_get", _t}, [argc_ptr, bufsize_ptr]) do
-    argv = Process.get(:washy_argv, ["sh"])
+    argv = Process.get(:tl_argv, ["sh"])
     store(wmem(), argc_ptr, length(argv), 4)
     store(wmem(), bufsize_ptr, Enum.reduce(argv, 0, fn a, acc -> acc + byte_size(a) + 1 end), 4)
     0
   end
 
   defp call_host(rt, {_m, "args_get", _t}, [argv_ptr, buf_ptr]) do
-    Process.get(:washy_argv, ["sh"])
+    Process.get(:tl_argv, ["sh"])
     |> Enum.reduce({argv_ptr, buf_ptr}, fn a, {pp, bp} ->
       store(wmem(), pp, bp, 4)
       write_bytes(wmem(), bp, a)
@@ -2818,19 +2818,19 @@ defmodule TinyLasers.Wasm do
     end
   end
 
-  # WASI environment — served from the run-scoped `:washy_env` (a list of "KEY=VALUE" strings, set by
+  # WASI environment — served from the run-scoped `:tl_env` (a list of "KEY=VALUE" strings, set by
   # the caller; empty by default). Same NUL-terminated, pointer-table encoding as args_get. This is the
   # generic seam credential-injection rides on: the app builds the env (e.g. a CLI connection's token)
-  # and sets `:washy_env`; the runtime knows nothing about what the vars mean.
+  # and sets `:tl_env`; the runtime knows nothing about what the vars mean.
   defp call_host(rt, {_m, "environ_sizes_get", _t}, [c_ptr, b_ptr]) do
-    env = Process.get(:washy_env, [])
+    env = Process.get(:tl_env, [])
     store(wmem(), c_ptr, length(env), 4)
     store(wmem(), b_ptr, Enum.reduce(env, 0, fn e, acc -> acc + byte_size(e) + 1 end), 4)
     0
   end
 
   defp call_host(rt, {_m, "environ_get", _t}, [environ_ptr, buf_ptr]) do
-    Process.get(:washy_env, [])
+    Process.get(:tl_env, [])
     |> Enum.reduce({environ_ptr, buf_ptr}, fn e, {pp, bp} ->
       store(wmem(), pp, bp, 4)
       write_bytes(wmem(), bp, e)
@@ -2841,18 +2841,18 @@ defmodule TinyLasers.Wasm do
     0
   end
   # REAL time: clock id 0 = realtime (wall, since epoch), 1 = monotonic — both in nanoseconds. A fixed
-  # `:washy_clock` override (tests/determinism) still wins when set. Previously returned 0 always, which
+  # `:tl_clock` override (tests/determinism) still wins when set. Previously returned 0 always, which
   # silently broke every Date.now()/timestamp/timeout in a guest.
   defp call_host(rt, {_m, "clock_time_get", _t}, [id, _prec, time_ptr]) do
-    t = Process.get(:washy_clock) || clock_now(id)
+    t = Process.get(:tl_clock) || clock_now(id)
     store(wmem(), time_ptr, t, 8)
     0
   end
 
   # REAL randomness from the host CSPRNG. Previously wrote ZEROS, which silently made crypto/UUIDs/
-  # hashing/Math.random deterministic-and-wrong. A `:washy_random` override (tests) still wins.
+  # hashing/Math.random deterministic-and-wrong. A `:tl_random` override (tests) still wins.
   defp call_host(rt, {_m, "random_get", _t}, [buf, len]) do
-    bytes = Process.get(:washy_random) || :crypto.strong_rand_bytes(len)
+    bytes = Process.get(:tl_random) || :crypto.strong_rand_bytes(len)
     write_bytes(wmem(), buf, binary_part(bytes, 0, min(len, byte_size(bytes))) |> pad_to(len))
     0
   end
@@ -2864,7 +2864,7 @@ defmodule TinyLasers.Wasm do
   # calling thread's process (a normal exit). See guest_thread_spawn for the full shared-vs-copied model.
   defp call_host(_rt, {_m, "thread_spawn", _t}, [start_arg]), do: guest_thread_spawn(start_arg)
   defp call_host(_rt, {_m, "thread-spawn", _t}, [start_arg]), do: guest_thread_spawn(start_arg)
-  defp call_host(_rt, {_m, "thread_exit", _t}, _args), do: throw({:washy_exit, 0})
+  defp call_host(_rt, {_m, "thread_exit", _t}, _args), do: throw({:tl_exit, 0})
 
   # thread_parallelism(ret_ptr) -> errno: hardware-concurrency hint rayon/std use to size their pool.
   # We report a small FIXED count (keeps the emulated pool bounded + the test fast); errno 0.
@@ -2884,10 +2884,10 @@ defmodule TinyLasers.Wasm do
     0
   end
 
-  # thread_id(ret_ptr) -> errno: write the CURRENT thread's id. The main run has no :washy_thread_id,
+  # thread_id(ret_ptr) -> errno: write the CURRENT thread's id. The main run has no :tl_thread_id,
   # so it reports 1; a spawned thread reports its tid (stamped at spawn). errno 0.
   defp call_host(_rt, {_m, "thread_id", _t}, [ret_ptr]) do
-    store(wmem(), ret_ptr, Process.get(:washy_thread_id, 1), 8)
+    store(wmem(), ret_ptr, Process.get(:tl_thread_id, 1), 8)
     0
   end
 
@@ -2932,7 +2932,7 @@ defmodule TinyLasers.Wasm do
   # without a real asyncify unwind (wb-nsrp); if a guest ever hits it, fail LOUDLY rather than silently
   # corrupt — rayon's parallel-sum path never restores, so this stays unhit.
   defp call_host(_rt, {_m, "stack_restore", _t}, [_buf_ptr, _val]) do
-    raise "washy: stack_restore (asyncify longjmp) unimplemented — needs true asyncify unwind (wb-nsrp)"
+    raise "tinylasers: stack_restore (asyncify longjmp) unimplemented — needs true asyncify unwind (wb-nsrp)"
   end
   defp call_host(_rt, {_m, "fd_sync", _t}, _args), do: 0
   defp call_host(_rt, {_m, "fd_datasync", _t}, _args), do: 0
@@ -2989,16 +2989,16 @@ defmodule TinyLasers.Wasm do
   # a path that names a DIRECTORY: the /work root (".", "", "/") or an implied subdir (a prefix of a key)
   defp dir_path?(rel) do
     rel in ["", ".", "/", "/work", "/work/", "./"] or
-      MapSet.member?(washy_dirs(), rel) or
+      MapSet.member?(tl_dirs(), rel) or
       Enum.any?(TinyLasers.Wasm.VFS.list(), &String.starts_with?(&1, rel <> "/"))
   end
 
   # ── explicit-directory tracking ─────────────────────────────────────────────────────────────────
   # The flat VFS has no native dir concept, so empty dirs created by `path_create_directory` would be
-  # invisible (no key has them as a prefix). We track them in a per-run `:washy_dirs` MapSet so mkdir →
+  # invisible (no key has them as a prefix). We track them in a per-run `:tl_dirs` MapSet so mkdir →
   # stat → rmdir behaves like POSIX. Implicit dirs (a prefix of an existing file key) stay handled above.
-  defp washy_dirs, do: Process.get(:washy_dirs, MapSet.new())
-  defp put_washy_dirs(set), do: Process.put(:washy_dirs, set)
+  defp tl_dirs, do: Process.get(:tl_dirs, MapSet.new())
+  defp put_tl_dirs(set), do: Process.put(:tl_dirs, set)
 
   defp call_host(rt, {_m, "fd_tell", _t}, [fd, ptr]) do
     off = case TinyLasers.Wasm.FdTable.get(fd) do
@@ -3107,8 +3107,8 @@ defmodule TinyLasers.Wasm do
     rel = read_bytes(wmem(), path_ptr, path_len)
 
     cond do
-      TinyLasers.Wasm.VFS.has?(rel) or MapSet.member?(washy_dirs(), rel) -> 20
-      true -> (put_washy_dirs(MapSet.put(washy_dirs(), rel)); 0)
+      TinyLasers.Wasm.VFS.has?(rel) or MapSet.member?(tl_dirs(), rel) -> 20
+      true -> (put_tl_dirs(MapSet.put(tl_dirs(), rel)); 0)
     end
   end
 
@@ -3119,11 +3119,11 @@ defmodule TinyLasers.Wasm do
     prefix = rel <> "/"
     nonempty =
       Enum.any?(TinyLasers.Wasm.VFS.list(), &String.starts_with?(&1, prefix)) or
-        Enum.any?(washy_dirs(), &String.starts_with?(&1, prefix))
+        Enum.any?(tl_dirs(), &String.starts_with?(&1, prefix))
 
     cond do
       nonempty -> 55
-      MapSet.member?(washy_dirs(), rel) -> (put_washy_dirs(MapSet.delete(washy_dirs(), rel)); 0)
+      MapSet.member?(tl_dirs(), rel) -> (put_tl_dirs(MapSet.delete(tl_dirs(), rel)); 0)
       true -> 44
     end
   end
@@ -3166,7 +3166,7 @@ defmodule TinyLasers.Wasm do
   defp call_host(_rt, {_m, "path_link", _t}, _args), do: 0
 
   # path_symlink(old_path, dirfd, new_path): create a symlink at `new_path` pointing at `old_path`.
-  # Stored in the per-run `:washy_symlinks` map (relpath → target string), a sibling to the VFS — the flat
+  # Stored in the per-run `:tl_symlinks` map (relpath → target string), a sibling to the VFS — the flat
   # VFS holds bytes, so links live alongside it rather than encoding a tagged value into content. → 0.
   defp call_host(rt, {_m, "path_symlink", _t}, [old_ptr, old_len, _dirfd, new_ptr, new_len]) do
     target = read_bytes(wmem(), old_ptr, old_len)
@@ -3193,13 +3193,13 @@ defmodule TinyLasers.Wasm do
   end
 
   # ── symlink model ───────────────────────────────────────────────────────────────────────────────
-  # A per-run `:washy_symlinks` map (relpath → target relpath string), held in the process dict beside the
+  # A per-run `:tl_symlinks` map (relpath → target relpath string), held in the process dict beside the
   # VFS. The VFS values are plain content bytes, so links can't ride inside them — this sibling map is the
   # cleanest home and threads through the same process the VFS does.
-  defp washy_symlinks, do: Process.get(:washy_symlinks, %{})
-  defp symlink_target(rel), do: Map.get(washy_symlinks(), rel)
-  defp put_symlink(rel, target), do: Process.put(:washy_symlinks, Map.put(washy_symlinks(), rel, target))
-  defp del_symlink(rel), do: Process.put(:washy_symlinks, Map.delete(washy_symlinks(), rel))
+  defp tl_symlinks, do: Process.get(:tl_symlinks, %{})
+  defp symlink_target(rel), do: Map.get(tl_symlinks(), rel)
+  defp put_symlink(rel, target), do: Process.put(:tl_symlinks, Map.put(tl_symlinks(), rel, target))
+  defp del_symlink(rel), do: Process.put(:tl_symlinks, Map.delete(tl_symlinks(), rel))
 
   # Follow a symlink chain to the concrete target path, bounded to `depth` hops to defeat loops (a→b→a).
   # → {:ok, final_relpath} when the path is not a link, or resolves to one; {:error, :loop} past the bound.
@@ -3233,15 +3233,15 @@ defmodule TinyLasers.Wasm do
   # Registrable host-import table — the general seam for running an ARBITRARY wasm module that needs
   # host-provided imports (the thesis's host-mediated multi-module invocation: e.g. QuickJS calling out
   # to Rollup's wasm parser running as a sibling Wasm module). A consumer installs
-  # `Process.put(:washy_imports, %{{mod, name} => fun/1, name => fun/1})`; the fun gets the arg list and
+  # `Process.put(:tl_imports, %{{mod, name} => fun/1, name => fun/1})`; the fun gets the arg list and
   # returns the result int (or nil). Checked only AFTER all built-in WASI/WASIX clauses, so it never
   # shadows the core ABI. Falls through to the hard error when nothing matches.
   defp call_host(_rt, {m, name, _t}, args) do
-    tbl = Process.get(:washy_imports, %{})
+    tbl = Process.get(:tl_imports, %{})
 
     case Map.get(tbl, {m, name}) || Map.get(tbl, name) do
       fun when is_function(fun, 1) -> fun.(args)
-      _ -> raise("washy: unimplemented host import '#{m}'.'#{name}'")
+      _ -> raise("tinylasers: unimplemented host import '#{m}'.'#{name}'")
     end
   end
 
@@ -3362,10 +3362,10 @@ defmodule TinyLasers.Wasm do
   end
 
   defp stdin_take(n) do
-    buf = Process.get(:washy_stdin, "")
+    buf = Process.get(:tl_stdin, "")
     take = min(n, byte_size(buf))
     <<chunk::binary-size(take), rest::binary>> = buf
-    Process.put(:washy_stdin, rest)
+    Process.put(:tl_stdin, rest)
     chunk
   end
 
@@ -3647,26 +3647,26 @@ defmodule TinyLasers.Wasm do
 
     # snapshot the parent run context the child must adopt — same keys as a thread spawn, but memory
     # and page-counter are DEEP COPIES (fork isolation), not shared refs.
-    parent_mem = Process.get(:washy_mem)
+    parent_mem = Process.get(:tl_mem)
     child_mem = copy_mem(parent_mem)
     child_globals = copy_globals(rt.globals)
-    child_mem_pages = copy_globals(Process.get(:washy_mem_pages))
+    child_mem_pages = copy_globals(Process.get(:tl_mem_pages))
 
     ctx = %{
       mem_pages: child_mem_pages,
-      max_pages: Process.get(:washy_max_pages),
-      table: Process.get(:washy_table),
-      table_size: Process.get(:washy_table_size),
-      last_fuel: Process.get(:washy_last_fuel),
-      programs: Process.get(:washy_programs),
-      vfs: Process.get(:washy_vfs),
-      fdmap: Process.get(:washy_fdmap),
-      descs: Process.get(:washy_descs),
-      nextfd: Process.get(:washy_nextfd),
-      nextdesc: Process.get(:washy_nextdesc),
-      pipes: Process.get(:washy_pipes),
-      sockstate: Process.get(:washy_sockstate),
-      socknext: Process.get(:washy_socknext)
+      max_pages: Process.get(:tl_max_pages),
+      table: Process.get(:tl_table),
+      table_size: Process.get(:tl_table_size),
+      last_fuel: Process.get(:tl_last_fuel),
+      programs: Process.get(:tl_programs),
+      vfs: Process.get(:tl_vfs),
+      fdmap: Process.get(:tl_fdmap),
+      descs: Process.get(:tl_descs),
+      nextfd: Process.get(:tl_nextfd),
+      nextdesc: Process.get(:tl_nextdesc),
+      pipes: Process.get(:tl_pipes),
+      sockstate: Process.get(:tl_sockstate),
+      socknext: Process.get(:tl_socknext)
     }
 
     # the child gets its OWN fuel + depth counters (the parent's are :atomics it keeps mutating; a
@@ -3679,29 +3679,29 @@ defmodule TinyLasers.Wasm do
 
     spawn(fn ->
       # install the child's PRIVATE run context (copied mem/globals/pages, fresh stdout).
-      Process.put(:washy_mem, child_mem)
-      Process.put(:washy_globals, child_globals)
-      if child_mem_pages, do: Process.put(:washy_mem_pages, child_mem_pages)
-      if ctx.max_pages, do: Process.put(:washy_max_pages, ctx.max_pages)
-      if ctx.table, do: Process.put(:washy_table, ctx.table)
-      if ctx.table_size, do: Process.put(:washy_table_size, ctx.table_size)
-      if ctx.last_fuel, do: Process.put(:washy_last_fuel, ctx.last_fuel)
-      Process.put(:washy_out, [])
-      if ctx.programs, do: Process.put(:washy_programs, ctx.programs)
-      if ctx.vfs, do: Process.put(:washy_vfs, ctx.vfs)
-      if ctx.fdmap, do: Process.put(:washy_fdmap, ctx.fdmap)
-      if ctx.descs, do: Process.put(:washy_descs, ctx.descs)
-      if ctx.nextfd, do: Process.put(:washy_nextfd, ctx.nextfd)
-      if ctx.nextdesc, do: Process.put(:washy_nextdesc, ctx.nextdesc)
-      if ctx.pipes, do: Process.put(:washy_pipes, ctx.pipes)
+      Process.put(:tl_mem, child_mem)
+      Process.put(:tl_globals, child_globals)
+      if child_mem_pages, do: Process.put(:tl_mem_pages, child_mem_pages)
+      if ctx.max_pages, do: Process.put(:tl_max_pages, ctx.max_pages)
+      if ctx.table, do: Process.put(:tl_table, ctx.table)
+      if ctx.table_size, do: Process.put(:tl_table_size, ctx.table_size)
+      if ctx.last_fuel, do: Process.put(:tl_last_fuel, ctx.last_fuel)
+      Process.put(:tl_out, [])
+      if ctx.programs, do: Process.put(:tl_programs, ctx.programs)
+      if ctx.vfs, do: Process.put(:tl_vfs, ctx.vfs)
+      if ctx.fdmap, do: Process.put(:tl_fdmap, ctx.fdmap)
+      if ctx.descs, do: Process.put(:tl_descs, ctx.descs)
+      if ctx.nextfd, do: Process.put(:tl_nextfd, ctx.nextfd)
+      if ctx.nextdesc, do: Process.put(:tl_nextdesc, ctx.nextdesc)
+      if ctx.pipes, do: Process.put(:tl_pipes, ctx.pipes)
 
       if ctx.sockstate do
-        Process.put(:washy_sockstate, ctx.sockstate)
-        if ctx.socknext, do: Process.put(:washy_socknext, ctx.socknext)
+        Process.put(:tl_sockstate, ctx.sockstate)
+        if ctx.socknext, do: Process.put(:tl_socknext, ctx.socknext)
         TinyLasers.Wasm.HostSock.install()
       end
 
-      Process.put(:washy_rt, child_rt)
+      Process.put(:tl_rt, child_rt)
 
       # child sees fork()==0: write 0 to the pid-out-ptr in the CHILD's own memory, then resume.
       store(child_mem, ret_pid_ptr, 0, 4)
@@ -3712,7 +3712,7 @@ defmodule TinyLasers.Wasm do
           # ran off the end without an explicit exit → status 0
           {0, child_out()}
         catch
-          :throw, {:washy_exit, c} -> {c, child_out()}
+          :throw, {:tl_exit, c} -> {c, child_out()}
         end
 
       send(parent, {:proc_exited, child_pid, code, output})
@@ -3723,7 +3723,7 @@ defmodule TinyLasers.Wasm do
     tramp(rest, push_res(0, vs2), l, frames, rt)
   end
 
-  defp child_out, do: Process.get(:washy_out, []) |> Enum.reverse() |> IO.iodata_to_binary()
+  defp child_out, do: Process.get(:tl_out, []) |> Enum.reverse() |> IO.iodata_to_binary()
 
   # block: a `br 0` exits to AFTER the block; deeper br decrements and propagates.
   # block: a `br 0` exits to AFTER the block. On exit (br 0 OR fall-through) the stack must be exactly
@@ -3839,13 +3839,13 @@ defmodule TinyLasers.Wasm do
           res
 
         {:caught, c, cstack, exc} ->
-          prev = Process.get(:washy_caught, [])
-          Process.put(:washy_caught, [exc | prev])
+          prev = Process.get(:tl_caught, [])
+          Process.put(:tl_caught, [exc | prev])
 
           try do
             run(c, cstack, l, rt)
           after
-            Process.put(:washy_caught, prev)
+            Process.put(:tl_caught, prev)
           end
       end
 
@@ -3858,7 +3858,7 @@ defmodule TinyLasers.Wasm do
   end
 
   defp step({:rethrow, lbl}, _stack, _l, _rt) do
-    case Enum.at(Process.get(:washy_caught, []), lbl) do
+    case Enum.at(Process.get(:tl_caught, []), lbl) do
       nil -> trap!(:rethrow_no_exception)
       exc -> throw(exc)
     end
@@ -3894,9 +3894,9 @@ defmodule TinyLasers.Wasm do
   defp step({:local_tee, i}, [v | _] = stack, l, _rt), do: {:next, stack, put_elem(l, i, v)}
 
   defp step({:call, f}, stack, l, rt) do
-    if Process.get(:washy_callcount_on) do
-      c = Process.get(:washy_callcount, %{})
-      Process.put(:washy_callcount, Map.update(c, f, 1, &(&1 + 1)))
+    if Process.get(:tl_callcount_on) do
+      c = Process.get(:tl_callcount, %{})
+      Process.put(:tl_callcount, Map.update(c, f, 1, &(&1 + 1)))
     end
     {args, stack} = Enum.split(stack, func_arity(rt.mod, f))
     result = call_fn(rt, f, Enum.reverse(args))
@@ -3913,17 +3913,17 @@ defmodule TinyLasers.Wasm do
   defp push_results(_n, vals, stack) when is_list(vals), do: vals ++ stack
 
   # ── Reference types + table get/set (WASIX §0). funcref = func index; null = `:null`. The table is
-  # mutable, held in `:washy_table` (seeded at run start), so table.set is visible to call_indirect. ──
+  # mutable, held in `:tl_table` (seeded at run start), so table.set is visible to call_indirect. ──
   defp step({:ref_null}, stack, l, _rt), do: {:next, [:null | stack], l}
   defp step({:ref_is_null}, [r | s], l, _rt), do: {:next, [if(r == :null, do: 1, else: 0) | s], l}
   defp step({:ref_func, i}, stack, l, _rt), do: {:next, [i | stack], l}
 
   defp step({:table_get}, [i | s], l, rt) do
-    {:next, [Map.get(Process.get(:washy_table, rt.table), i, :null) | s], l}
+    {:next, [Map.get(Process.get(:tl_table, rt.table), i, :null) | s], l}
   end
 
   defp step({:table_set}, [v, i | s], l, rt) do
-    Process.put(:washy_table, Map.put(Process.get(:washy_table, rt.table), i, v))
+    Process.put(:tl_table, Map.put(Process.get(:tl_table, rt.table), i, v))
     {:next, s, l}
   end
 
@@ -3938,27 +3938,27 @@ defmodule TinyLasers.Wasm do
     if max != nil and new > max do
       {:next, [(-1 &&& @mask32) | s], l}
     else
-      table = Enum.reduce(grow_range(old, new), Process.get(:washy_table, rt.table), fn idx, t -> Map.put(t, idx, init) end)
-      Process.put(:washy_table, table)
-    Process.delete(:washy_table_size)
-      Process.put(:washy_table_size, new)
+      table = Enum.reduce(grow_range(old, new), Process.get(:tl_table, rt.table), fn idx, t -> Map.put(t, idx, init) end)
+      Process.put(:tl_table, table)
+    Process.delete(:tl_table_size)
+      Process.put(:tl_table_size, new)
       {:next, [old | s], l}
     end
   end
 
   defp step({:table_fill}, [n, val, i | s], l, rt) do
-    table = Enum.reduce(grow_range(i, i + n), Process.get(:washy_table, rt.table), fn idx, t -> Map.put(t, idx, val) end)
-    Process.put(:washy_table, table)
-    Process.delete(:washy_table_size)
+    table = Enum.reduce(grow_range(i, i + n), Process.get(:tl_table, rt.table), fn idx, t -> Map.put(t, idx, val) end)
+    Process.put(:tl_table, table)
+    Process.delete(:tl_table_size)
     {:next, s, l}
   end
 
   defp step({:table_copy}, [n, src, dst | s], l, rt) do
-    table = Process.get(:washy_table, rt.table)
+    table = Process.get(:tl_table, rt.table)
     vals = Enum.map(grow_range(0, n), fn k -> Map.get(table, src + k, :null) end)
     table = vals |> Enum.with_index() |> Enum.reduce(table, fn {v, k}, t -> Map.put(t, dst + k, v) end)
-    Process.put(:washy_table, table)
-    Process.delete(:washy_table_size)
+    Process.put(:tl_table, table)
+    Process.delete(:tl_table_size)
     {:next, s, l}
   end
 
@@ -3969,14 +3969,14 @@ defmodule TinyLasers.Wasm do
 
   defp step({:call_indirect, typeidx}, [i | stack], l, rt) do
     # spec traps: no/null table entry → :undefined_element; entry's type ≠ the expected type → mismatch.
-    f = Map.get(Process.get(:washy_table, rt.table), i)
+    f = Map.get(Process.get(:tl_table, rt.table), i)
     if f == :null, do: trap!(:undefined_element)
     if f == nil, do: trap!(:undefined_element)
     expected = Enum.at(rt.mod.types, typeidx)
     if func_type(rt.mod, f) != expected, do: trap!(:indirect_call_type_mismatch)
-    if Process.get(:washy_callcount_on) do
-      c = Process.get(:washy_callcount, %{})
-      Process.put(:washy_callcount, Map.update(c, {:ind, f}, 1, &(&1 + 1)))
+    if Process.get(:tl_callcount_on) do
+      c = Process.get(:tl_callcount, %{})
+      Process.put(:tl_callcount, Map.update(c, {:ind, f}, 1, &(&1 + 1)))
     end
     {args, stack} = Enum.split(stack, length(elem(expected, 0)))
     result = call_fn(rt, f, Enum.reverse(args))
@@ -4038,7 +4038,7 @@ defmodule TinyLasers.Wasm do
 
         # SHARED memory (threads): backing was pre-allocated at max — only bump the page counter so the
         # `:atomics` ref stays stable + shareable across spawned threads. No realloc, no copy.
-        Process.get(:washy_mem_shared) ->
+        Process.get(:tl_mem_shared) ->
           :atomics.put(rt.mem_pages, 1, new)
           old
 
@@ -4046,7 +4046,7 @@ defmodule TinyLasers.Wasm do
           oldmem = wmem()
           newmem = :atomics.new(new * @page_words, signed: false)
           for i <- 1..(old * @page_words)//1, do: :atomics.put(newmem, i, :atomics.get(oldmem, i))
-          Process.put(:washy_mem, newmem)
+          Process.put(:tl_mem, newmem)
           :atomics.put(rt.mem_pages, 1, new)
           old
       end
@@ -4101,7 +4101,7 @@ defmodule TinyLasers.Wasm do
   defp step({:simd, 80, _imm}, [<<b::128>>, <<a::128>> | s], l, _rt), do: {:next, [<<bor(a, b)::128>> | s], l}   # v128.or
   defp step({:simd, 81, _imm}, [<<b::128>>, <<a::128>> | s], l, _rt), do: {:next, [<<bxor(a, b)::128>> | s], l}  # v128.xor
   defp step({:simd, 83, _imm}, [<<v::128>> | s], l, _rt), do: {:next, [(if v == 0, do: 0, else: 1) | s], l}      # v128.any_true (1 iff any bit set)
-  defp step({:simd, sub, _imm}, _stack, _l, _rt), do: raise("washy: unimplemented SIMD op 0xFD #{sub}")
+  defp step({:simd, sub, _imm}, _stack, _l, _rt), do: raise("tinylasers: unimplemented SIMD op 0xFD #{sub}")
   defp step({:op, op}, stack, l, _rt), do: {:next, binop(op, stack), l}
 
   # ── pure stack ops: arithmetic + comparisons. `[b, a | s]` — a pushed first, b on top. ──
@@ -4254,7 +4254,7 @@ defmodule TinyLasers.Wasm do
   defp binop(0xC3, [a | s]), do: [sext64(a &&& 0xFFFF, 16) | s]                     # i64.extend16_s
   defp binop(0xC4, [a | s]), do: [sext64(a &&& @mask32, 32) | s]                    # i64.extend32_s
 
-  defp binop(op, _), do: raise("washy: unimplemented stack op 0x#{Integer.to_string(op, 16)}")
+  defp binop(op, _), do: raise("tinylasers: unimplemented stack op 0x#{Integer.to_string(op, 16)}")
 
   defp s64(x) when x >= 0x8000000000000000, do: x - 0x10000000000000000
   defp s64(x), do: x
@@ -4661,7 +4661,7 @@ defmodule TinyLasers.Wasm do
   defp bounds!(rt, addr, n) do
     limit = :atomics.get(rt.mem_pages, 1) * 65536
     if addr < 0 or addr + n > limit do
-      if Process.get(:washy_oob_debug), do: IO.inspect({:OOB, addr: addr, n: n, limit: limit, pages: div(limit, 65536)}, label: "WASHY_OOB")
+      if Process.get(:tl_oob_debug), do: IO.inspect({:OOB, addr: addr, n: n, limit: limit, pages: div(limit, 65536)}, label: "TL_OOB")
       trap!(:out_of_bounds)
     end
   end

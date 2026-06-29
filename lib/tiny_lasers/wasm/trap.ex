@@ -13,7 +13,7 @@ defmodule TinyLasers.Wasm.Trap do
   defexception [:reason]
 
   @impl true
-  def message(%{reason: r}), do: "washy trap: #{r}"
+  def message(%{reason: r}), do: "tinylasers trap: #{r}"
 
   @doc "Raise a trap with `reason` (an atom like `:out_of_bounds` / `:div_by_zero`)."
   def trap!(reason), do: raise(__MODULE__, reason: reason)

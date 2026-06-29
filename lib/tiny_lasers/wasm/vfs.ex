@@ -15,7 +15,7 @@ defmodule TinyLasers.Wasm.VFS do
 
   Two backends, same interface:
 
-    * `:map` (default) — a process-dict map (`:washy_vfs`). Zero deps, per-run, perfect for
+    * `:map` (default) — a process-dict map (`:tl_vfs`). Zero deps, per-run, perfect for
       tests/spikes and the C/Rust generality proofs.
     * `{:store, tenant}` — rows in the tenant-partitioned SQLite store (`TinyLasers.Store`, the one
       persistent data unit). **Tenant isolation is enforced in the store, host-side** — the guest
@@ -23,7 +23,7 @@ defmodule TinyLasers.Wasm.VFS do
       omitted tenant, wb-lijn). Path traversal stays meaningless, and one guest can never read
       another tenant's bytes even with an identical key.
 
-  Select the backend per-process: `Process.put(:washy_backend, {:store, tenant})` before running.
+  Select the backend per-process: `Process.put(:tl_backend, {:store, tenant})` before running.
   Defaults to `:map`. (Content-addressing/dedup is an optional later optimization on the `:store`
   backend — it is NOT what makes this safe; the tenant partition is.)
   """
@@ -43,15 +43,15 @@ defmodule TinyLasers.Wasm.VFS do
   @doc "All file relpaths in the current backend (for directory listing / `fd_readdir`)."
   def list, do: do_list(backend())
 
-  defp do_list(:map), do: Map.keys(Process.get(:washy_vfs, %{}))
+  defp do_list(:map), do: Map.keys(Process.get(:tl_vfs, %{}))
   defp do_list({:store, tenant}), do: Enum.map(TinyLasers.Store.all(TinyLasers.Wasm.FileRow, tenant), & &1.path)
 
   @doc "The backend selected for this process (`:map` default | `{:store, tenant}`)."
-  def backend, do: Process.get(:washy_backend, :map)
+  def backend, do: Process.get(:tl_backend, :map)
 
   # `:map` reads/writes the process-dict map (zero-dep, per-run).
   # `{:store, tenant}` reads/writes the tenant-partitioned SQLite store (durable, isolated).
-  defp do_get(:map, rel), do: Map.get(Process.get(:washy_vfs, %{}), rel)
+  defp do_get(:map, rel), do: Map.get(Process.get(:tl_vfs, %{}), rel)
 
   defp do_get({:store, tenant}, rel) do
     case Enum.find(TinyLasers.Store.all(TinyLasers.Wasm.FileRow, tenant), &(&1.path == rel)) do
@@ -61,7 +61,7 @@ defmodule TinyLasers.Wasm.VFS do
   end
 
   defp do_put(:map, rel, content) do
-    Process.put(:washy_vfs, Map.put(Process.get(:washy_vfs, %{}), rel, content))
+    Process.put(:tl_vfs, Map.put(Process.get(:tl_vfs, %{}), rel, content))
     :ok
   end
 
@@ -76,7 +76,7 @@ defmodule TinyLasers.Wasm.VFS do
   end
 
   defp do_delete(:map, rel) do
-    Process.put(:washy_vfs, Map.delete(Process.get(:washy_vfs, %{}), rel))
+    Process.put(:tl_vfs, Map.delete(Process.get(:tl_vfs, %{}), rel))
     :ok
   end
 

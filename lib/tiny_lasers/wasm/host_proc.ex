@@ -12,7 +12,7 @@ defmodule TinyLasers.Wasm.HostProc do
   exit status later. The guest only needs to BELIEVE it spawned an OS process.
 
   ### proc_spawn — async subprocess  (ABI we chose, DOCUMENTED)
-      proc_spawn(name_ptr, name_len,    -- argv[0] program name (resolved via :washy_programs)
+      proc_spawn(name_ptr, name_len,    -- argv[0] program name (resolved via :tl_programs)
                  args_ptr, args_len,    -- the REMAINING argv, NEWLINE-delimited (one arg per line)
                  env_ptr,  env_len,     -- environment, NEWLINE-delimited "K=V" (currently recorded,
                                             not yet injected into the child's WASI env — documented gap)
@@ -20,7 +20,7 @@ defmodule TinyLasers.Wasm.HostProc do
                  stdout_fd,             -- pipe fd the child's stdout is written to (-1 = capture only)
                  stderr_fd,             -- reserved; merged into stdout in this model (-1 = capture)
                  ret_pid_ptr) -> errno  -- writes the allocated pid (u32) here; returns 0 on success
-  We pick NEWLINE-delimited args/env (not NUL) because it is trivially representable from a `washy`
+  We pick NEWLINE-delimited args/env (not NUL) because it is trivially representable from a `tinylasers`
   shell and unambiguous for the tests; a guest that hands NUL-delimited bytes is split the same way
   (we split on both "\n" and "\0"). DOCUMENT, don't re-derive.
 
@@ -29,7 +29,7 @@ defmodule TinyLasers.Wasm.HostProc do
   meaningful in the BEAM model — there is no native process image to overwrite. The FAITHFUL
   observable behaviour is **run the new image to completion, then exit the caller with the child's
   exit code** (exec never returns on success). So `proc_exec` runs `host_exec` SYNCHRONOUSLY and then
-  `throw {:washy_exit, code}` — exactly what a real `execve` looks like from the outside.
+  `throw {:tl_exit, code}` — exactly what a real `execve` looks like from the outside.
 
   ### proc_fork — TRUE return-twice fork (on the reified-stack interpreter lane, wb-nsrp)
   `proc_fork` returns 0 in the child and the child pid in the parent. We don't need asyncify or native
@@ -41,8 +41,8 @@ defmodule TinyLasers.Wasm.HostProc do
   :running registry entry the child reports its exit to. The legacy 2-arg `fork/2` seam (no reified
   stack, e.g. a transpiled-only run) still returns ENOSYS so such a guest falls back to proc_spawn.
 
-  ## State model — ONE home: the `:washy_procs` process-dict map
-  `:washy_procs` (parent run's process dict) maps `pid -> %{...}`:
+  ## State model — ONE home: the `:tl_procs` process-dict map
+  `:tl_procs` (parent run's process dict) maps `pid -> %{...}`:
       %{os_pid: pid,                     -- the allocated WASIX pid (>= 2; 1 = the root run)
         beam: beam_pid,                  -- the monitored worker BEAM process (nil after reap)
         ref: monitor_ref,
@@ -53,11 +53,11 @@ defmodule TinyLasers.Wasm.HostProc do
         pending: MapSet,                 -- signal numbers raised but not yet acted on
         handlers: %{signum => :default | :ignore | handler_func_idx},
         mask: MapSet}                    -- blocked signals (recorded; full masking deferred)
-  pids are allocated from a per-run counter (`:washy_proc_ctr`) STARTING AT 2 (1 is the root run).
+  pids are allocated from a per-run counter (`:tl_proc_ctr`) STARTING AT 2 (1 is the root run).
 
-  The child BEAM process has its OWN process dict (it can't write the parent's `:washy_procs`), so on
+  The child BEAM process has its OWN process dict (it can't write the parent's `:tl_procs`), so on
   completion it SENDS `{:proc_exited, pid, code, output}` to the parent; `proc_join` does a BOUNDED
-  selective receive for that (or a `:DOWN`), updating `:washy_procs`. A background reaper (the §2
+  selective receive for that (or a `:DOWN`), updating `:tl_procs`. A background reaper (the §2
   threads pattern) drains the monitor message so the parent mailbox stays clean and a crash is logged,
   never propagated.
 
@@ -75,7 +75,7 @@ defmodule TinyLasers.Wasm.HostProc do
   EINTR: when a target is blocked in a BOUNDED receive (proc_join here; poll_oneoff/futex are a
   follow-up), we send it `{:wb_signal, sig}` so the blocking syscall returns EINTR (WASIX errno 27).
 
-  ## errno (WASIX) — the integers already used across washy.ex / host_sock.ex
+  ## errno (WASIX) — the integers already used across wasm.ex / host_sock.ex
       success 0 · EAGAIN 6 · EBADF 8 · ECHILD 12 · EINTR 27 · EINVAL 28 · ENOSYS 52 · ESRCH 71
   BOUNDED blocking ONLY (project rule): proc_join caps at `@join_ms`; reaper at `@reap_ms`. Never an
   infinite block; children complete, are reaped, or hit the cap.
@@ -105,10 +105,10 @@ defmodule TinyLasers.Wasm.HostProc do
   @join_ms 60_000
   @reap_ms 60_000
 
-  @procs :washy_procs
-  @ctr :washy_proc_ctr
+  @procs :tl_procs
+  @ctr :tl_proc_ctr
 
-  # ── registry helpers (ONE home: :washy_procs) ──────────────────────────────────────────────────
+  # ── registry helpers (ONE home: :tl_procs) ──────────────────────────────────────────────────
   defp procs, do: Process.get(@procs, %{})
   defp put_procs(m), do: Process.put(@procs, m)
   defp get_proc(pid), do: Map.get(procs(), pid)
@@ -155,32 +155,32 @@ defmodule TinyLasers.Wasm.HostProc do
         # program registry + VFS so host_exec can resolve argv[0] (else 127). Snapshot the keys
         # host_exec/call_io read (§2 threads adopt context the same way).
         ctx = %{
-          programs: Process.get(:washy_programs),
-          vfs: Process.get(:washy_vfs),
-          backend: Process.get(:washy_backend),
-          rt: Process.get(:washy_rt),
-          exec_policy: Process.get(:washy_exec_policy),
-          host_dispatch: Process.get(:washy_host_dispatch)
+          programs: Process.get(:tl_programs),
+          vfs: Process.get(:tl_vfs),
+          backend: Process.get(:tl_backend),
+          rt: Process.get(:tl_rt),
+          exec_policy: Process.get(:tl_exec_policy),
+          host_dispatch: Process.get(:tl_host_dispatch)
         }
 
         # MONITORED worker (the §2 spawn_monitor + reaper pattern). It runs the sub-program's wasm
         # module via host_exec (isolated run context — call_io snapshots/restores), captures stdout,
-        # and reports back. host_exec swallows :washy_exit/traps and returns {output, code}.
+        # and reports back. host_exec swallows :tl_exit/traps and returns {output, code}.
         {beam, ref} =
           Elixir.Kernel.spawn_monitor(fn ->
-            if ctx.programs, do: Process.put(:washy_programs, ctx.programs)
-            if ctx.vfs, do: Process.put(:washy_vfs, ctx.vfs)
-            if ctx.backend, do: Process.put(:washy_backend, ctx.backend)
-            if ctx.rt, do: Process.put(:washy_rt, ctx.rt)
-            if ctx.exec_policy, do: Process.put(:washy_exec_policy, ctx.exec_policy)
-            if ctx.host_dispatch, do: Process.put(:washy_host_dispatch, ctx.host_dispatch)
+            if ctx.programs, do: Process.put(:tl_programs, ctx.programs)
+            if ctx.vfs, do: Process.put(:tl_vfs, ctx.vfs)
+            if ctx.backend, do: Process.put(:tl_backend, ctx.backend)
+            if ctx.rt, do: Process.put(:tl_rt, ctx.rt)
+            if ctx.exec_policy, do: Process.put(:tl_exec_policy, ctx.exec_policy)
+            if ctx.host_dispatch, do: Process.put(:tl_host_dispatch, ctx.host_dispatch)
 
             {output, code} =
               try do
                 host_exec(argv, stdin)
               catch
                 # defensive: host_exec already catches exit/traps, but never let the worker crash the run.
-                :throw, {:washy_exit, c} -> {"", c}
+                :throw, {:tl_exit, c} -> {"", c}
               end
 
             send(parent, {:proc_exited, pid, code, output})
@@ -216,7 +216,7 @@ defmodule TinyLasers.Wasm.HostProc do
       stdin = fd_drain(stdin_fd)
       {_out, code} = host_exec([name | args], stdin)
       # exec never returns on success — the caller IS the new image, then it exits with its code.
-      throw({:washy_exit, code})
+      throw({:tl_exit, code})
     end
   end
 
@@ -308,9 +308,9 @@ defmodule TinyLasers.Wasm.HostProc do
   # both; the call_host clause picks the arity.
   def raise_self(sig) do
     # record a self-pending signal (pid 1 = the root run). No worker to kill; default-terminate of
-    # SELF would mean exiting the run — we honour SIGKILL/SIGTERM/SIGINT by throwing washy_exit.
+    # SELF would mean exiting the run — we honour SIGKILL/SIGTERM/SIGINT by throwing tl_exit.
     if sig in [@sigkill, @sigterm, @sigint] do
-      throw({:washy_exit, 128 + sig})
+      throw({:tl_exit, 128 + sig})
     else
       @e_ok
     end
@@ -362,7 +362,7 @@ defmodule TinyLasers.Wasm.HostProc do
   # word; the rest of the struct (mask/flags) is recorded as opaque/zero (full mask handling deferred).
   # A pid context: sigaction targets the CURRENT process — pid 1 (the root) by default, or the
   # most-recent child the guest is configuring; we register on pid 1 (the run's own handler table)
-  # since a guest installs its OWN handlers. The handlers map lives per-pid in :washy_procs, and we
+  # since a guest installs its OWN handlers. The handlers map lives per-pid in :tl_procs, and we
   # ensure a pid-1 self entry exists.
   def sigaction(mem, sig, act_ptr, oldact_ptr) do
     self_entry = ensure_self()
@@ -488,7 +488,7 @@ defmodule TinyLasers.Wasm.HostProc do
   defp decode_handler(1), do: :ignore
   defp decode_handler(idx), do: idx
 
-  # little-endian u32 read/write through guest linear memory (write_bytes/read_bytes are washy's).
+  # little-endian u32 read/write through guest linear memory (write_bytes/read_bytes are tinylasers's).
   defp write_u32(mem, addr, val) do
     write_bytes(mem, addr, <<val::little-32>>)
   end

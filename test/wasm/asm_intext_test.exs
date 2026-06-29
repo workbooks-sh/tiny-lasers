@@ -126,7 +126,7 @@ defmodule TinyLasers.WasmAsmIntExtTest do
   end
 
   # ── globals round-trip ─────────────────────────────────────────────────────────────────────────────
-  # The asm function reads `:washy_globals` from the process dict (the seam `call_io` installs for the
+  # The asm function reads `:tl_globals` from the process dict (the seam `call_io` installs for the
   # interp/forms lanes). The bare `apply` path here installs a fresh globals array per call so the asm
   # lane has the same ground-truth context, then asserts asm == interp == forms.
   defp agree_globals!(name, m, argsets) do
@@ -135,9 +135,9 @@ defmodule TinyLasers.WasmAsmIntExtTest do
     for args <- argsets do
       {interp, _} = Wasm.call_io(m, "f", args, transpile: false)
       {forms, _} = Wasm.call_io(m, "f", args, transpile: true, tier_threshold: 1, tier_async: false)
-      prev = Process.put(:washy_globals, Wasm.init_globals(m))
+      prev = Process.put(:tl_globals, Wasm.init_globals(m))
       asm = apply(am, af, args)
-      if prev, do: Process.put(:washy_globals, prev), else: Process.delete(:washy_globals)
+      if prev, do: Process.put(:tl_globals, prev), else: Process.delete(:tl_globals)
 
       assert interp == forms and forms == asm,
              "#{name} @ #{inspect(args)}: interp=#{inspect(interp)} forms=#{inspect(forms)} asm=#{inspect(asm)}"

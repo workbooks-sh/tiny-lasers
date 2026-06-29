@@ -14,13 +14,13 @@ defmodule TinyLasers.WasmVfsTest do
   setup do
     TinyLasers.Store.clear(FileRow, "tenant-a")
     TinyLasers.Store.clear(FileRow, "tenant-b")
-    on_exit(fn -> Process.delete(:washy_backend) end)
+    on_exit(fn -> Process.delete(:tl_backend) end)
     :ok
   end
 
   test ":map backend round-trips (default, zero-dep)" do
-    Process.delete(:washy_backend)
-    Process.put(:washy_vfs, %{})
+    Process.delete(:tl_backend)
+    Process.put(:tl_vfs, %{})
     assert VFS.get("a.txt") == nil
     refute VFS.has?("a.txt")
     VFS.put("a.txt", "hello")
@@ -31,7 +31,7 @@ defmodule TinyLasers.WasmVfsTest do
   end
 
   test "{:store, tenant} backend persists into the tenant-partitioned store" do
-    Process.put(:washy_backend, {:store, "tenant-a"})
+    Process.put(:tl_backend, {:store, "tenant-a"})
     VFS.put("notes.txt", "durable bytes")
     assert VFS.get("notes.txt") == "durable bytes"
     # overwrite-in-place (no duplicate row)
@@ -47,22 +47,22 @@ defmodule TinyLasers.WasmVfsTest do
     # path traversal is meaningless: '../../etc/passwd' is just a string key in YOUR partition.
     escape = "../../etc/passwd"
 
-    Process.put(:washy_backend, {:store, "tenant-a"})
+    Process.put(:tl_backend, {:store, "tenant-a"})
     VFS.put(escape, "A-secret")
     VFS.put("shared.txt", "A-data")
 
-    Process.put(:washy_backend, {:store, "tenant-b"})
+    Process.put(:tl_backend, {:store, "tenant-b"})
     # tenant B cannot see tenant A's bytes, even with an identical key
     assert VFS.get(escape) == nil
     assert VFS.get("shared.txt") == nil
     VFS.put("shared.txt", "B-data")
 
     # each tenant reads only its own partition
-    Process.put(:washy_backend, {:store, "tenant-a"})
+    Process.put(:tl_backend, {:store, "tenant-a"})
     assert VFS.get("shared.txt") == "A-data"
     assert VFS.get(escape) == "A-secret"
 
-    Process.put(:washy_backend, {:store, "tenant-b"})
+    Process.put(:tl_backend, {:store, "tenant-b"})
     assert VFS.get("shared.txt") == "B-data"
   end
 end

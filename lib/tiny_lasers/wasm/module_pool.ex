@@ -4,11 +4,11 @@ defmodule TinyLasers.Wasm.ModulePool do
 
   The JIT compiles guest wasm chunks into generated BEAM modules whose names are ATOMS, and atoms are
   NEVER garbage-collected (hard VM ceiling ~1,048,576). Minting a fresh unique module-name atom per
-  compiled chunk (a fresh `washy_mod_<unique_integer>` atom) grows the atom table O(distinct guest binaries ×
+  compiled chunk (a fresh `tl_mod_<unique_integer>` atom) grows the atom table O(distinct guest binaries ×
   chunks/binary) — unbounded as distinct programs accumulate, so at scale the node crashes.
 
-  This module **pre-interns a FIXED pool of N module-name atoms at startup** (`washy_pool_0 ..
-  washy_pool_(N-1)`). Those N atoms are the ONLY generated-module atoms the JIT ever uses, so total
+  This module **pre-interns a FIXED pool of N module-name atoms at startup** (`tl_pool_0 ..
+  tl_pool_(N-1)`). Those N atoms are the ONLY generated-module atoms the JIT ever uses, so total
   generated-module atoms are bounded to **N forever**, regardless of how many distinct programs run.
 
   ## Acquiring a slot — `acquire/0`
@@ -42,7 +42,7 @@ defmodule TinyLasers.Wasm.ModulePool do
   use GenServer
   require Logger
 
-  @prefix "washy_pool_"
+  @prefix "tl_pool_"
 
   # Pool size. Each loaded BEAM module costs ~10–30 KiB of `ll_alloc` (metadata/exports/literals/
   # stackmaps), so N modules cap generated-code memory at ~N×20 KiB. N=4096 ⇒ ~80 MiB code ceiling and
@@ -100,7 +100,7 @@ defmodule TinyLasers.Wasm.ModulePool do
 
   @doc """
   **Test-only:** reconfigure the pool to size `n` and reset its cursor/counters. Pre-interns
-  `washy_pool_0 .. washy_pool_(n-1)` (a no-op for atoms already interned) and purges any modules currently
+  `tl_pool_0 .. tl_pool_(n-1)` (a no-op for atoms already interned) and purges any modules currently
   loaded in the first `n` slots so the test starts from a clean, bounded pool. Returns `:ok`.
   """
   def reset(n) when is_integer(n) and n > 0, do: GenServer.call(server(), {:reset, n}, 30_000)
@@ -161,7 +161,7 @@ defmodule TinyLasers.Wasm.ModulePool do
   defp ensure_tokens_table do
     case :persistent_term.get({__MODULE__, :tokens}, nil) do
       nil ->
-        tab = :ets.new(:washy_module_pool_tokens, [:named_table, :public, :set, read_concurrency: true])
+        tab = :ets.new(:tl_module_pool_tokens, [:named_table, :public, :set, read_concurrency: true])
         :persistent_term.put({__MODULE__, :tokens}, tab)
         tab
 

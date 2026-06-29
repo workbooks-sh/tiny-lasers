@@ -17,7 +17,7 @@ defmodule TinyLasers.Wasm.AsmOps.Floats do
   import TinyLasers.Wasm.AsmCtx
 
   @transpile :"Elixir.TinyLasers.Wasm.Transpile"
-  @washy :"Elixir.TinyLasers.Wasm"
+  @tinylasers :"Elixir.TinyLasers.Wasm"
 
   # ── float const ──────────────────────────────────────────────────────────────────────────────────
   # finite floats AND non-finite `{:nonfinite, bits, size}` tuples are stored as a literal move (BEAM asm
@@ -88,16 +88,16 @@ defmodule TinyLasers.Wasm.AsmOps.Floats do
         {:farith, op, size} ->
           # guest_farith(a, b, op, size) — IEEE-correct, and rounds f32 internally (no extra f32round).
           [{:move, {:atom, op}, {:x, 2}}, {:move, {:integer, size}, {:x, 3}},
-           {:call_ext, 4, {:extfunc, @washy, :guest_farith, 4}}]
+           {:call_ext, 4, {:extfunc, @tinylasers, :guest_farith, 4}}]
 
         {:fminmax, which, size} ->
           # guest_fminmax(a, b, which, size) — NaN-propagating min/max, non-finite-safe.
           [{:move, {:atom, which}, {:x, 2}}, {:move, {:integer, size}, {:x, 3}},
-           {:call_ext, 4, {:extfunc, @washy, :guest_fminmax, 4}}]
+           {:call_ext, 4, {:extfunc, @tinylasers, :guest_fminmax, 4}}]
 
         {:fcopysign, size} ->
           # guest_fcopysign(a, b, size) — magnitude of a (incl. Inf/NaN) carrying the sign of b.
-          [{:move, {:integer, size}, {:x, 2}}, {:call_ext, 3, {:extfunc, @washy, :guest_fcopysign, 3}}]
+          [{:move, {:integer, size}, {:x, 2}}, {:call_ext, 3, {:extfunc, @tinylasers, :guest_fcopysign, 3}}]
 
         {:gc_bif, op} ->
           [{:gc_bif, op, {:f, 0}, 2, [{:x, 0}, {:x, 1}], {:x, 0}}]
@@ -184,7 +184,7 @@ defmodule TinyLasers.Wasm.AsmOps.Floats do
   end
 
   # IEEE non-finite-safe unary via a TinyLasers.Wasm.guest_* mirror taking (x0, size).
-  defp stage({:gfun, fun, size}), do: [{:move, {:integer, size}, {:x, 1}}, {:call_ext, 2, {:extfunc, @washy, fun, 2}}]
+  defp stage({:gfun, fun, size}), do: [{:move, {:integer, size}, {:x, 1}}, {:call_ext, 2, {:extfunc, @tinylasers, fun, 2}}]
   defp stage({:gc_bif, op, :unary}), do: [{:gc_bif, op, {:f, 0}, 1, [{:x, 0}], {:x, 0}}]
   defp stage({:ext, m, f}), do: [{:call_ext, 1, {:extfunc, ext_mod(m), f, 1}}]
   defp stage(:f32r), do: f32round(true)
@@ -230,7 +230,7 @@ defmodule TinyLasers.Wasm.AsmOps.Floats do
       {:move, yd(s, s.d - 2), {:x, 0}},
       {:move, yd(s, s.d - 1), {:x, 1}},
       {:move, {:atom, op}, {:x, 2}},
-      {:call_ext, 3, {:extfunc, @washy, :guest_fcmp, 3}},
+      {:call_ext, 3, {:extfunc, @tinylasers, :guest_fcmp, 3}},
       {:move, {:x, 0}, yd(s, s.d - 2)}
     ]
 

@@ -48,7 +48,7 @@ defmodule TinyLasers.Wasm.Metrics do
     ArgumentError -> :persistent_term.get(@counters)
   end
 
-  defp reasons_name, do: :nexus_washy_metric_reasons
+  defp reasons_name, do: :tl_metric_reasons
   defp ctr, do: :persistent_term.get(@counters, nil) || ensure()
 
   @doc "Mark a run started: bump in-flight (+ peak) and the live memory gauge. Returns a token to finish."

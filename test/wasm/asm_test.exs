@@ -182,7 +182,7 @@ defmodule TinyLasers.WasmAsmTest do
     set_fuel = fn n ->
       ref = :atomics.new(1, signed: true)
       :atomics.put(ref, 1, n)
-      Process.put(:washy_last_fuel, {n, ref})
+      Process.put(:tl_last_fuel, {n, ref})
     end
 
     # a 1000-iteration loop with only 100 fuel must trap out_of_fuel (the asm lane reuses charge_fuel/0)

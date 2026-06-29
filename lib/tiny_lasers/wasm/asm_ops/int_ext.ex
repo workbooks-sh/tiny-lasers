@@ -10,7 +10,7 @@ defmodule TinyLasers.Wasm.AsmOps.IntExt do
   for everything else.
 
   Covered (all i32):
-    * GLOBALS `global.get`/`global.set` — atomics over `:washy_globals` (slot = index + 1); `set` masks 32.
+    * GLOBALS `global.get`/`global.set` — atomics over `:tl_globals` (slot = index + 1); `set` masks 32.
     * `select` (0x1B) — 3 operands; pops [c, b, a] from top, result = c≠0 ? a : b.
     * shifts/rotates — shl 0x74, shr_s 0x75, shr_u 0x76, rotl 0x77, rotr 0x78 (count masked by 31).
     * div/rem — div_s 0x6D, div_u 0x6E, rem_s 0x6F, rem_u 0x70 (trap on /0; div_s traps INT32_MIN/-1).
@@ -24,7 +24,7 @@ defmodule TinyLasers.Wasm.AsmOps.IntExt do
   import TinyLasers.Wasm.AsmCtx
 
   @transpile :"Elixir.TinyLasers.Wasm.Transpile"
-  @washy :"Elixir.TinyLasers.Wasm"
+  @tinylasers :"Elixir.TinyLasers.Wasm"
   @mask32 0xFFFFFFFF
 
   # sign-extension (§0): opcode → TinyLasers.Wasm.guest_* mirror (i32/i64.extend8_s/16_s/32_s).
@@ -64,7 +64,7 @@ defmodule TinyLasers.Wasm.AsmOps.IntExt do
 
     ops = [
       {:move, yd(s, top), {:x, 0}},
-      {:call_ext, 1, {:extfunc, @washy, @sign_ext[opcode], 1}},
+      {:call_ext, 1, {:extfunc, @tinylasers, @sign_ext[opcode], 1}},
       {:move, {:x, 0}, yd(s, top)}
     ]
 
@@ -83,13 +83,13 @@ defmodule TinyLasers.Wasm.AsmOps.IntExt do
     ]
   end
 
-  # ── globals (atomics over :washy_globals, slot = index + 1) ──
-  # x0 := atomics:get(erlang:get(washy_globals), i+1)
+  # ── globals (atomics over :tl_globals, slot = index + 1) ──
+  # x0 := atomics:get(erlang:get(tl_globals), i+1)
   defp global_get(i, s) do
     vt = elem(TinyLasers.Wasm.global_types(s.mod), i)
 
     read = [
-      {:move, {:atom, :washy_globals}, {:x, 0}},
+      {:move, {:atom, :tl_globals}, {:x, 0}},
       {:call_ext, 1, {:extfunc, :erlang, :get, 1}},
       {:move, {:integer, i + 1}, {:x, 1}},
       {:call_ext, 2, {:extfunc, :atomics, :get, 2}}
@@ -105,7 +105,7 @@ defmodule TinyLasers.Wasm.AsmOps.IntExt do
     push(emit(s, read ++ decode ++ [{:move, {:x, 0}, yd(s, s.d)}]))
   end
 
-  # atomics:put(erlang:get(washy_globals), i+1, top band mask32)
+  # atomics:put(erlang:get(tl_globals), i+1, top band mask32)
   defp global_set(i, s) do
     if s.d < 1, do: throw(:unsupported)
     vt = elem(TinyLasers.Wasm.global_types(s.mod), i)
@@ -131,7 +131,7 @@ defmodule TinyLasers.Wasm.AsmOps.IntExt do
     ops =
       pre ++
         [
-          {:move, {:atom, :washy_globals}, {:x, 0}},
+          {:move, {:atom, :tl_globals}, {:x, 0}},
           {:call_ext, 1, {:extfunc, :erlang, :get, 1}},
           {:move, {:integer, i + 1}, {:x, 1}},
           {:move, yd(s, s.d - 1), {:x, 2}}

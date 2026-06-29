@@ -20,7 +20,7 @@ defmodule TinyLasers.WasmWasixCTest do
   # Concurrency fixtures share process-global futex/thread registries; clear them between tests so the
   # suite is deterministic (each fixture is independently green; only cross-test state caused flakes).
   setup do
-    for tab <- [:washy_futex, :washy_threads] do
+    for tab <- [:tl_futex, :tl_threads] do
       try do
         if :ets.whereis(tab) != :undefined, do: :ets.delete_all_objects(tab)
       rescue
@@ -30,10 +30,10 @@ defmodule TinyLasers.WasmWasixCTest do
       end
     end
 
-    for pid <- Process.get(:washy_thread_pids, []), is_pid(pid), do: Process.exit(pid, :kill)
-    Process.delete(:washy_thread_pids)
+    for pid <- Process.get(:tl_thread_pids, []), is_pid(pid), do: Process.exit(pid, :kill)
+    Process.delete(:tl_thread_pids)
 
-    for {_id, %{transport: t}} when t != nil <- Map.values(Process.get(:washy_sockstate, %{})) do
+    for {_id, %{transport: t}} when t != nil <- Map.values(Process.get(:tl_sockstate, %{})) do
       try do
         :gen_tcp.close(t)
       rescue
@@ -43,7 +43,7 @@ defmodule TinyLasers.WasmWasixCTest do
       end
     end
 
-    for key <- [:washy_sockstate, :washy_socknext, :washy_fdmap, :washy_descs, :washy_pipes, :washy_thread_id],
+    for key <- [:tl_sockstate, :tl_socknext, :tl_fdmap, :tl_descs, :tl_pipes, :tl_thread_id],
         do: Process.delete(key)
 
     :ok
@@ -59,7 +59,7 @@ defmodule TinyLasers.WasmWasixCTest do
 
       :no_exit
     catch
-      :throw, {:washy_exit, code} -> {:exit, code}
+      :throw, {:tl_exit, code} -> {:exit, code}
     end
   end
 

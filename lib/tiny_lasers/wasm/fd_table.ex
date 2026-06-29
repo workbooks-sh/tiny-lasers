@@ -2,7 +2,7 @@ defmodule TinyLasers.Wasm.FdTable do
   @moduledoc """
   The ONE unified fd table for a Wasm guest — the single source of truth for every fd kind
   (file, dir, socket, pipe, and a placeholder for timers). Replaces the old fragmented trio of
-  `:washy_fds` / `:washy_sockets` / `:washy_nextfd` process-dict entries.
+  `:tl_fds` / `:tl_sockets` / `:tl_nextfd` process-dict entries.
 
   POSIX faithful: an fd is a small int that points at an *open file description* (we call it a
   "desc"), which carries the actual resource state (`kind`/`ref`/`pos`/`flags`/refcount). Multiple
@@ -13,9 +13,9 @@ defmodule TinyLasers.Wasm.FdTable do
   exact fd model.
 
   Backing is the current guest's process dictionary (same scoping the old maps used), under two keys:
-    * `:washy_fdmap`   — `%{fd => desc_id}`
-    * `:washy_descs`   — `%{desc_id => desc}`  (desc = the open file description map)
-  plus `:washy_nextfd` (next fd counter) and `:washy_nextdesc` (next desc id), preserved so the
+    * `:tl_fdmap`   — `%{fd => desc_id}`
+    * `:tl_descs`   — `%{desc_id => desc}`  (desc = the open file description map)
+  plus `:tl_nextfd` (next fd counter) and `:tl_nextdesc` (next desc id), preserved so the
   call_io / host_exec save+restore dance keeps working unchanged.
 
   A desc is a map:
@@ -30,10 +30,10 @@ defmodule TinyLasers.Wasm.FdTable do
   # fdflags (WASI): APPEND=0x0001, DSYNC=0x0002, NONBLOCK=0x0004, RSYNC=0x0008, SYNC=0x0010
   @o_nonblock 0x0004
 
-  @fdmap :washy_fdmap
-  @descs :washy_descs
-  @nextfd :washy_nextfd
-  @nextdesc :washy_nextdesc
+  @fdmap :tl_fdmap
+  @descs :tl_descs
+  @nextfd :tl_nextfd
+  @nextdesc :tl_nextdesc
 
   # fd 3 = the /work preopen dir; user fds start at 4 (0/1/2 = stdio).
   @first_user_fd 4
@@ -164,7 +164,7 @@ defmodule TinyLasers.Wasm.FdTable do
   defp teardown(_), do: :ok
 
   defp sock_close(ref) do
-    case Process.get(:washy_sock) do
+    case Process.get(:tl_sock) do
       f when is_function(f, 1) -> f.({:close, ref})
       _ -> :ok
     end
@@ -237,7 +237,7 @@ defmodule TinyLasers.Wasm.FdTable do
   @doc """
   Immediate read-readiness of `fd` for `poll_oneoff` — purely emulated, never blocks. Returns
   `{ready?, nbytes_available, hangup?}`:
-    * stdin (fd 0): ready if `:washy_stdin` has buffered bytes (nbytes = buffered size).
+    * stdin (fd 0): ready if `:tl_stdin` has buffered bytes (nbytes = buffered size).
     * a `:pipe`: ready if the buffer has bytes (nbytes = available) OR all writers have closed (EOF
       ⇒ ready with `hangup? = true`, nbytes 0) — POLLHUP semantics.
     * a `:file`: always ready; nbytes = bytes remaining from the fd's `pos` (best-effort).
@@ -245,7 +245,7 @@ defmodule TinyLasers.Wasm.FdTable do
       not-ready (the guest re-polls). Never blocks here.
   """
   def readable?(0) do
-    n = byte_size(Process.get(:washy_stdin, ""))
+    n = byte_size(Process.get(:tl_stdin, ""))
     {n > 0, n, false}
   end
 
@@ -299,11 +299,11 @@ end
 defmodule TinyLasers.Wasm.FdTable.Pipe do
   @moduledoc """
   An in-memory pipe buffer — a queue of bytes + a writer-open count, kept in the guest's process
-  dictionary under `:washy_pipes`. Pure emulation: there is NO real OS pipe; the guest only needs the
+  dictionary under `:tl_pipes`. Pure emulation: there is NO real OS pipe; the guest only needs the
   observable cause-and-effect (write appends, read consumes, EOF once all writers close).
   """
 
-  @key :washy_pipes
+  @key :tl_pipes
 
   defp store, do: Process.get(@key, %{})
   defp put_store(m), do: Process.put(@key, m)

@@ -100,7 +100,7 @@ defmodule TinyLasers.WasmPorfforFixtureTest do
       "d" => fn [] -> 0.0 end
     }
 
-    Process.put(:washy_imports, imports)
+    Process.put(:tl_imports, imports)
     {:ok, _inst, _} = Wasm.instance_start(mod, "m", [], transpile: true)
     Process.get(:porffor_out, []) |> Enum.reverse() |> IO.iodata_to_binary()
   end

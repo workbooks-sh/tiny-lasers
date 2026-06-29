@@ -5,8 +5,8 @@ defmodule TinyLasers.Wasm.Tty do
   `isatty` path that `fd_fdstat_get` derives from (stdio fds 0/1/2 → char device when a tty
   is attached).
 
-  State lives in the process dict under `:washy_tty` (per-guest-process, like `:washy_mem` /
-  `:washy_sockstate`). Shape:
+  State lives in the process dict under `:tl_tty` (per-guest-process, like `:tl_mem` /
+  `:tl_sockstate`). Shape:
 
       %{
         cols: 80, rows: 24, width_px: 0, height_px: 0,
@@ -40,9 +40,9 @@ defmodule TinyLasers.Wasm.Tty do
   @doc "The current virtual-tty state, installing defaults on first read."
   @spec get() :: map()
   def get do
-    case Process.get(:washy_tty) do
+    case Process.get(:tl_tty) do
       nil ->
-        Process.put(:washy_tty, @defaults)
+        Process.put(:tl_tty, @defaults)
         @defaults
 
       state ->
@@ -54,7 +54,7 @@ defmodule TinyLasers.Wasm.Tty do
   @spec put(map()) :: map()
   def put(updates) when is_map(updates) do
     state = Map.merge(get(), updates)
-    Process.put(:washy_tty, state)
+    Process.put(:tl_tty, state)
     state
   end
 

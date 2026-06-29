@@ -37,7 +37,7 @@ defmodule TinyLasers.WasmPorfforHostCallTest do
   end
 
   # a/b/c/d as the pure-compute lane, plus `e` = the host-call bridge. The `e` handler mirrors nexus's
-  # PorfforHost.host_call: read op+req from the live :washy_mem, dispatch, write the result region back,
+  # PorfforHost.host_call: read op+req from the live :tl_mem, dispatch, write the result region back,
   # return the byte count (or -1.0 on overflow / unknown op). Dispatch is test-local — no nexus dep.
   defp run_with_hostcall(wasm) do
     {:ok, mod} = Wasm.decode(wasm)
@@ -52,13 +52,13 @@ defmodule TinyLasers.WasmPorfforHostCallTest do
       "e" => &host_call/1
     }
 
-    Process.put(:washy_imports, imports)
+    Process.put(:tl_imports, imports)
     {:ok, _inst, _} = Wasm.instance_start(mod, "m", [], transpile: true)
     Process.get(:porffor_out, []) |> Enum.reverse() |> IO.iodata_to_binary()
   end
 
   defp host_call([op_ptr, op_len, req_ptr, req_len, res_ptr, res_cap]) do
-    mem = Process.get(:washy_mem)
+    mem = Process.get(:tl_mem)
     op = Wasm.read_bytes(mem, trunc(op_ptr), trunc(op_len))
     req = Wasm.read_bytes(mem, trunc(req_ptr), trunc(req_len))
 
@@ -73,7 +73,7 @@ defmodule TinyLasers.WasmPorfforHostCallTest do
       result == nil -> -1.0
       byte_size(result) > trunc(res_cap) -> -1.0
       true ->
-        Wasm.write_bytes(Process.get(:washy_mem), trunc(res_ptr), result)
+        Wasm.write_bytes(Process.get(:tl_mem), trunc(res_ptr), result)
         byte_size(result) * 1.0
     end
   end

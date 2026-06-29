@@ -5,7 +5,7 @@ defmodule TinyLasers.Wasm.DiffTrace do
 
   The interpreter is the correctness ORACLE; the asm/transpiler lane is the production deliverable and must
   be bit-identical. When it isn't, this harness binary-searches *which* asm-compiled guest function causes
-  the divergence, using the `:washy_jit_only` seam in `TinyLasers.Wasm.lazy_invoke/6`: an installed allow-set
+  the divergence, using the `:tl_jit_only` seam in `TinyLasers.Wasm.lazy_invoke/6`: an installed allow-set
   restricts the asm lane to exactly those gfidxs (everything else interprets), so we can run a subset
   through the asm lane and check whether the divergence reproduces.
 
@@ -23,7 +23,7 @@ defmodule TinyLasers.Wasm.DiffTrace do
       #=> {:interaction, [gfidx, ...]}   # no single fn; the set is the minimal reproducing block
 
   Localizing requires running the guest O(log n) times, so it's a diagnostic — call it from a test or an
-  iex session, not on the hot path. The `:washy_jit_only` check it relies on is a single process-dict read
+  iex session, not on the hot path. The `:tl_jit_only` check it relies on is a single process-dict read
   in the JIT gate (nil in normal operation).
   """
 
@@ -35,7 +35,7 @@ defmodule TinyLasers.Wasm.DiffTrace do
   is responsible), or `{:interaction, gfidxs}` (a minimal multi-fn set — no single culprit).
   """
   def localize(nfuncs, n_imports, thunk) when is_integer(nfuncs) and is_integer(n_imports) do
-    Process.delete(:washy_jit_only)
+    Process.delete(:tl_jit_only)
     golden = thunk.([])
 
     all = for i <- 0..(nfuncs - 1)//1, do: i + n_imports
@@ -48,16 +48,16 @@ defmodule TinyLasers.Wasm.DiffTrace do
   end
 
   # Install the asm allow-set, run the asm lane, clear it. A run is independent (the thunk re-decodes and
-  # `instance_start` resets `:washy_jit`); a trap/throw counts as "divergent" (catch → sentinel ≠ golden).
+  # `instance_start` resets `:tl_jit`); a trap/throw counts as "divergent" (catch → sentinel ≠ golden).
   defp run_allow(allow, thunk) do
-    Process.put(:washy_jit_only, allow)
+    Process.put(:tl_jit_only, allow)
 
     try do
       thunk.(@asm_opts)
     catch
       kind, val -> {:difftrace_threw, kind, val}
     after
-      Process.delete(:washy_jit_only)
+      Process.delete(:tl_jit_only)
     end
   end
 

@@ -15,10 +15,10 @@ defmodule TinyLasers.WasmBeamHostTest do
   setup do
     {Registry, keys: :unique, name: TinyLasers.Wasm.Actor.Registry} |> maybe_start()
     {DynamicSupervisor, strategy: :one_for_one, name: TinyLasers.Wasm.Actor.Supervisor} |> maybe_start()
-    # a 1-page packed memory, installed where the host clauses read it (`wmem/0` → :washy_mem).
+    # a 1-page packed memory, installed where the host clauses read it (`wmem/0` → :tl_mem).
     mem = :atomics.new(8192, signed: false)
-    Process.put(:washy_mem, mem)
-    Process.put(:washy_mem_pages, 1)
+    Process.put(:tl_mem, mem)
+    Process.put(:tl_mem_pages, 1)
     {:ok, mem: mem}
   end
 
@@ -53,7 +53,7 @@ defmodule TinyLasers.WasmBeamHostTest do
   end
 
   test "beam_self writes the guest's handle into memory", %{mem: mem} do
-    Process.put(:washy_actor_self, self())
+    Process.put(:tl_actor_self, self())
     out_ptr = 400
     len = Wasm.invoke_host({"beam", "beam_self", nil}, [out_ptr])
     assert len > 0
@@ -88,7 +88,7 @@ defmodule TinyLasers.WasmBeamHostTest do
     len = Wasm.invoke_host({"beam", "beam_recv", nil}, [out_ptr])
     assert Wasm.read_bytes(mem, out_ptr, len) == "null"
 
-    Process.put(:washy_beam_inbox, Json.encode!(%{"hello" => "world"}))
+    Process.put(:tl_beam_inbox, Json.encode!(%{"hello" => "world"}))
     len2 = Wasm.invoke_host({"beam", "beam_recv", nil}, [out_ptr])
     assert Json.decode!(Wasm.read_bytes(mem, out_ptr, len2)) == %{"hello" => "world"}
   end

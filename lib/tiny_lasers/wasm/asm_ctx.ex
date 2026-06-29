@@ -37,11 +37,11 @@ defmodule TinyLasers.Wasm.AsmCtx do
   @mask64 0xFFFFFFFFFFFFFFFF
   @sign32 0x80000000
   @sign64 0x8000000000000000
-  @washy :"Elixir.TinyLasers.Wasm"
+  @tinylasers :"Elixir.TinyLasers.Wasm"
 
   def mask32, do: @mask32
   def mask64, do: @mask64
-  def washy, do: @washy
+  def tinylasers, do: @tinylasers
 
   @doc "Append `ops` (chronological list) to the reverse-chronological accumulator."
   def emit(s, ops), do: %{s | acc: Enum.reverse(ops) ++ s.acc}
