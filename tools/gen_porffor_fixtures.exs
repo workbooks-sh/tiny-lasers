@@ -59,10 +59,28 @@ fixtures = [
   {"string_pad", "console.log('5'.padStart(3,'0'));", "005"}
 ]
 
+# Host-call fixtures: a guest that exercises the Porffor↔host memory-exchange bridge (the `e` import
+# = __host_call), prepended with the guest-side hostCall prelude. The op is `echo_upper`, which both
+# the nexus lane (PorfforHost.host_call) and the tiny-lasers test implement identically as String.upcase
+# — so a byte-match proves the memory-exchange ABI (the same mechanism rollup's __host('rollup_parse')
+# rides), with NO nexus rollup machinery (Rust parser, render path) needed.
+host_fixtures = [
+  {"hostcall_echo",
+   """
+   const r = hostCall("echo_upper", "hello world");
+   let s = "";
+   for (let i = 0; i < r.length; i++) { s += String.fromCharCode(r[i]); }
+   console.log(s);
+   """,
+   "HELLO WORLD"}
+]
+
 unless File.regular?(Porffor.porf_entry()) and System.find_executable("node") do
   IO.puts(:stderr, "ABORT: Porffor not vendored / node absent — cannot generate fixtures")
   System.halt(1)
 end
+
+prelude = Porffor.host_prelude()
 
 results =
   for {name, js, want} <- fixtures do
@@ -93,7 +111,35 @@ results =
     end
   end
 
-fails = Enum.reject(results, &(&1 == :ok))
-IO.puts("\n#{Enum.count(results, &(&1 == :ok))}/#{length(results)} fixtures written → #{out_dir}")
+# Host-call fixtures (prelude-prepended; validated on the nexus lane, which provides the real `e` import).
+host_results =
+  for {name, program, want} <- host_fixtures do
+    js = prelude <> "\n" <> program
+
+    nexus_ok =
+      case Porffor.eval(js) do
+        {:ok, out} ->
+          got = out |> String.replace(~r/\e\[[0-9;]*m/, "") |> String.trim()
+          got == want or {:mismatch, got}
+
+        err ->
+          {:eval_err, err}
+      end
+
+    case {nexus_ok, Porffor.compile(js)} do
+      {true, {:ok, wasm}} ->
+        File.write!(Path.join(out_dir, name <> ".wasm"), wasm)
+        IO.puts("  ✓ #{name}  (#{byte_size(wasm)} bytes, host-call)  → #{inspect(want)}")
+        :ok
+
+      {bad, comp} ->
+        IO.puts(:stderr, "  ✗ #{name}: nexus #{inspect(bad)} / compile #{inspect(elem(comp, 0))}")
+        {:fail, name}
+    end
+  end
+
+all = results ++ host_results
+fails = Enum.reject(all, &(&1 == :ok))
+IO.puts("\n#{Enum.count(all, &(&1 == :ok))}/#{length(all)} fixtures written → #{out_dir}")
 
 if fails != [], do: System.halt(1)

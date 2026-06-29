@@ -194,13 +194,16 @@ defmodule TinyLasers.GateRedteamTest do
   # 11. Atom-table DoS is closed: running guest code creates no atoms from guest data.
   # ════════════════════════════════════════════════════════════════════════════
   test "executing a guest creates zero atoms (atom-exhaustion vector closed)" do
-    # build many distinct runtime string keys via concatenation, store them on an object
+    # build many distinct runtime string keys via concatenation, store them on an object.
+    # Distinctive prefix so a key can never coincide with a pre-existing host atom.
+    keys = for i <- 0..200, do: "guestkey_#{i}"
+
     sets =
       for i <- 0..200 do
-        {:set, var("o"), {:binop, :+, lit("k"), lit("#{i}")}, lit(i)}
+        {:set, var("o"), {:binop, :+, lit("guestkey_"), lit("#{i}")}, lit(i)}
       end
 
-    ast = {:seq, [{:let, "o", {:obj, []}} | sets] ++ [get(var("o"), lit("k7"))]}
+    ast = {:seq, [{:let, "o", {:obj, []}} | sets] ++ [get(var("o"), lit("guestkey_7"))]}
 
     # compile FIRST (compilation interns identifiers); measure only the RUN.
     c = Gate.compile(ast, [])
@@ -209,6 +212,17 @@ defmodule TinyLasers.GateRedteamTest do
     later = :erlang.system_info(:atom_count)
 
     assert out.result == {:ok, 7.0}
-    assert later - before == 0, "guest run created #{later - before} atoms"
+
+    # The PRECISE invariant: no guest-derived string ever crosses into the atom domain. Checked
+    # directly with binary_to_existing_atom (raises iff the atom doesn't exist) — concurrency-immune,
+    # unlike the global atom_count, which the WASM transpile lane perturbs from other (async) tests.
+    for k <- keys do
+      assert_raise ArgumentError, fn -> :erlang.binary_to_existing_atom(k, :utf8) end
+    end
+
+    # Backstop: a systematic "every guest key → atom" regression would add ≥201 atoms; ambient
+    # host-side churn (transpile-lane module names from concurrent tests) is at most tens. A bound
+    # well below the guest-data count catches the real vector without flaking on unrelated atoms.
+    assert later - before < length(keys), "guest run created #{later - before} atoms (data count #{length(keys)})"
   end
 end
