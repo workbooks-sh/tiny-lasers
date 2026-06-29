@@ -1,71 +1,58 @@
-# tiny-lasers — next steps (inked)
+# tiny-lasers — roadmap
 
 ## Mission
 
-tiny-lasers is the **standalone, publishable execution substrate**: run untrusted
-multi-language code isolated on the BEAM. It is intended to **replace Washy** (the
-WASM→BEAM runtime currently living deep inside `nexus`), be **published as its own
-library**, and then be **vendored back into nexus**. Pulling it out of the heavy nexus
-mix project is the point — a clean PoC we can prove, publish, and depend on.
+The **standalone, publishable execution substrate**: run untrusted multi-language code
+isolated on the BEAM. Extract it out of the heavy nexus mix project, prove it, **publish it**,
+then **vendor it back into nexus**. WASM-on-BEAM is the substrate; the work is making the
+WASM→BEAM lowering more native/efficient, migrating off it only where it truly can't reach.
 
-## The layering (keep this clean — do NOT drag compilers/product in here)
+## Layering (keep it clean — no compilers/product in here)
 
-| Belongs in **tiny-lasers** (substrate) | Stays in **nexus** (consumer) |
+`nexus → tiny-lasers`, never the reverse.
+
+| In **tiny-lasers** (substrate) | Stays in **nexus** (consumer) |
 |---|---|
-| WASM→BEAM runtime (Washy core) | Porffor (JS→WASM **compiler**) |
-| JS→BEAM capability gate (`TinyLasers.Gate`) | test262 / rollup conformance harnesses |
-| capability / host-import **interface** | the `.work` product, dogfood, DeployKit |
-| memory model, sandbox, fuel, heap-cap | host-backend **implementations** (Store-backed VFS, rollup host) |
+| `TinyLasers.Wasm.*` — WASM→BEAM runtime (was Washy) | Porffor (JS→WASM **compiler**) |
+| `TinyLasers.Gate.*` — JS→BEAM capability gate | test262 / rollup conformance |
+| capability / host-import surface | the `.work` product, dogfood, DeployKit |
+| memory, sandbox, fuel, heap-cap | host-backend impls (real Store, rollup host) |
 
-**Dependency direction: `nexus → tiny-lasers`, never the reverse.** nexus provides the
-backends (storage, compiler hooks) through interfaces tiny-lasers defines.
+## Done
 
-## Current state
+- **Scaffold + Lane 1 (gate).** Clean mix project, zero third-party deps. `TinyLasers.Gate`
+  (JS→BEAM, red-team **18/18**).
+- **Runtime extracted.** The full Washy WASM→BEAM runtime (27 modules: decode / transpile /
+  transpile_asm / asm_ops / validate / trap / module_pool / jit_cache / wat / fd_table /
+  host_* / vfs / actor / ...) moved out of nexus and **renamed `Nexus.Washy → TinyLasers.Wasm`**.
+  Booted by `TinyLasers.Application`. Decoupled — only a `TinyLasers.Store` stub stands in for
+  the throwaway VFS `{:store}` backend. Dropped nexus-product wrappers (session/sandbox/oracle/
+  host_rollup). **Suite: 125 tests, 0 failures, 1 skipped.**
+- **Faithfulness proven.** The 1 skip (asm EH-op fallback) **fails identically in nexus** — a
+  pre-existing bug we inherited, not extraction damage. The runtime behaves byte-for-byte as it
+  did inside nexus.
 
-- **Phase 0 — DONE.** Scaffolded as a clean mix project (zero third-party deps). Lane 1,
-  the **JS→BEAM capability gate**, migrated in as `TinyLasers.Gate.{Runtime,Codegen,Parser,
-  Interp}` — red-team **18/18 green**. This is the JS→BEAM work, owned here, free of any
-  compiler baggage.
-- Washy still lives in `nexus/lib/washy*` (~13k LOC, 28 modules).
+## Next (ordered, proof-gated)
 
-## Scoping the Washy extraction (grounded — measured, not guessed)
-
-Washy's coupling is almost all to its **own** `Nexus.Washy.*` sub-modules. The only real
-external nexus dependencies to break:
-
-- **`Nexus.Store`** (~10 refs) — the storage backend behind the VFS.
-- **`Nexus.Compilers`** (1 ref) — a single hook.
-- **`host_rollup.ex`** — rollup-specific; does **not** migrate (stays in nexus, plugs in via
-  the host-import interface).
-
-So the extraction is: a small decoupling seam + a mechanical namespace rename. Not a rewrite.
-
-## Next steps (ordered, each gated by a green proof)
-
-1. **Define the seams in tiny-lasers** — a `TinyLasers.Store` behaviour (key→bytes,
-   tenant-scoped) and a host-import/capability interface. This is the contract that lets the
-   runtime depend on *nothing* in nexus.
-   *Proof:* compiles standalone; a trivial in-memory Store impl passes a roundtrip test.
-2. **Extract Washy core → tiny-lasers** — move the runtime engine (decode, transpile /
-   transpile_asm, validate, trap, sandbox, memory, module_pool, jit_cache) renamed
-   `Nexus.Washy.* → TinyLasers.Wasm.*`; wire `Nexus.Store` calls to the Store behaviour;
-   leave `host_rollup` + the lone `Nexus.Compilers` hook behind in nexus.
-   *Proof:* Washy's existing test suite passes **in tiny-lasers standalone** (no nexus dep);
-   a WASM module decode→run roundtrip is green.
-3. **Native-speed lever (the differentiating PoC)** — measure how close the WASM→BEAM
-   lowering gets to native BeamAsm on a tight compute kernel, then improve it. This is the
-   "interpret/AOT WASM better for isolation" thesis made concrete.
-   *Proof:* a measured slowdown number vs native, and a demonstrated improvement.
-4. **Lane-2 host/POSIX layer** — the capability surface (fs→Store, gated net, clock/rand,
-   no host exec) so recompiled WASM (Rust/Go/C/C++) runs against it.
-   *Proof:* a recompiled C/Rust program runs isolated, fs→Store, byte-correct output.
-5. **Publish + vendor** — release tiny-lasers; nexus deletes its Washy copy and depends on
-   tiny-lasers, supplying the Store/host backend impls.
-   *Proof:* nexus's Porffor/rollup lanes run on the vendored tiny-lasers, suites green.
+1. **Finish the test migration.** Bring the remaining `washy_*` suites (conformance, async,
+   crypto, density, beam_e2e, env_policy, ...) — some may need helpers/host shims. Locks the
+   full runtime behavior in tiny-lasers.
+2. **WASIX / Linux ABI rebuild** (the big forward work). Replace the throwaway VFS/Store + host
+   layer with a proper POSIX/syscall surface (fs→pluggable backend, gated net, clock/rand, no
+   host exec) — this is what lets recompiled Rust/Go/C/C++ (lane 2) and emulated binaries
+   (lane 3) run. The `TinyLasers.Store` stub and the host_* modules are placeholders for this.
+3. **Native-speed lever (R0).** Measure how close `TinyLasers.Wasm`'s WASM→BEAM lowering gets to
+   native BeamAsm on a compute kernel; improve it. This is the differentiating PoC.
+4. **Fix inherited bugs** — the asm EH-op fallback (the skipped test), as the transpile lane
+   matures.
+5. **Full rebrand (optional cleanup).** Internal runtime atoms are still `:washy_*` (ETS / pdict
+   keys — consistent and internal, not module namespaces). Sweep to `:tl_*` before publish.
+6. **Publish + vendor.** Release tiny-lasers; nexus deletes its own Washy, depends on
+   tiny-lasers, and supplies the real Store/host backends.
 
 ## Principles
 
-- **Lean.** Substrate only. No compilers, no conformance suites, no product code.
-- **Decouple via behaviours**, not direct nexus calls.
-- **Proof-driven + incremental.** Migrate a piece only with explicit time and a green gate —
-  never big-bang. The monorepo folder is the working copy; publishing comes after the PoC.
+- **Lean.** Substrate only. No compilers, no conformance, no product.
+- **Decouple via interfaces**, not direct nexus calls.
+- **Proof-driven + incremental.** Each migration step gated by a green suite; never big-bang.
+- nexus stays untouched until the publish-and-vendor step — the two run in parallel for now.
