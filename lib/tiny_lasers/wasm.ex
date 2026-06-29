@@ -1117,7 +1117,6 @@ defmodule TinyLasers.Wasm do
   Coarser than the interpreter's per-instruction charge (per-iteration here), but it bounds runaway loops.
   """
   def charge_fuel do
-    bench_tick(1)
     case Process.get(:tl_last_fuel) do
       {_budget, fuel} -> if :atomics.sub_get(fuel, 1, 1) < 0, do: trap!(:out_of_fuel)
       _ -> :ok
@@ -1359,7 +1358,6 @@ defmodule TinyLasers.Wasm do
   `:out_of_bounds` against the logical memory size — byte-identical to the interpreter's `gload/3`.
   """
   def guest_load(addr, n) do
-    bench_tick(2)
     bounds_g!(addr, n)
     load(wmem(), addr, n)
   end
@@ -1369,14 +1367,12 @@ defmodule TinyLasers.Wasm do
   from `n*8` bits into the unsigned i32 representation — mirrors the interpreter's `sext(gload(..), bits)`.
   """
   def guest_load_s(addr, n) do
-    bench_tick(3)
     bounds_g!(addr, n)
     sext(load(wmem(), addr, n), n * 8)
   end
 
   @doc "Bounds-checked SIGNED load that sign-extends to 64 bits (i64 partial loads). Matches the interpreter's `{:i64_load, _, n, true}` (`sext64(v, n*8)`)."
   def guest_load_s64(addr, n) do
-    bench_tick(4)
     bounds_g!(addr, n)
     sext64(load(wmem(), addr, n), n * 8)
   end
@@ -1387,7 +1383,6 @@ defmodule TinyLasers.Wasm do
   ±Inf/NaN/-0 (the same shape every float op in both lanes carries). n ∈ 4 (f32) | 8 (f64).
   """
   def guest_fload(addr, n) do
-    bench_tick(5)
     bounds_g!(addr, n)
     fload(wmem(), addr, n)
   end
@@ -1397,7 +1392,6 @@ defmodule TinyLasers.Wasm do
   (`fstore/3`): encodes a finite float (or `{:nonfinite, bits, size}`) to little-endian bytes and writes them.
   """
   def guest_fstore(addr, val, n) do
-    bench_tick(7)
     bounds_g!(addr, n)
     fstore(wmem(), addr, val, n)
   end
@@ -1407,7 +1401,6 @@ defmodule TinyLasers.Wasm do
   code — byte-identical to the interpreter's `gstore/4`. Returns `:ok`.
   """
   def guest_store(addr, val, n) do
-    bench_tick(6)
     bounds_g!(addr, n)
     store(wmem(), addr, val, n)
   end
@@ -2043,13 +2036,12 @@ defmodule TinyLasers.Wasm do
     end
   end
 
-  # Gated per-seam call counter for the asm-lane perf loop: counts how often each hot host seam is hit
-  # (charge_fuel / guest_load* / guest_store* / call_local) so we can see which remote-call seam dominates
-  # a transpiled run. Zero overhead when `:tl_bench` is unset (the normal path).
-  @bench_slots %{
-    charge_fuel: 1, guest_load: 2, guest_load_s: 3, guest_load_s64: 4,
-    guest_fload: 5, guest_store: 6, guest_fstore: 7, call_local: 8
-  }
+  # Gated per-seam call counter for the asm-lane perf loop. Only `call_local` (the asm→interp trampoline,
+  # ~hundreds of k/run) is wired by default — it's the cheapest high-signal seam (tracks how much a run
+  # bails to the interpreter). The hot per-op seams (guest_load*/guest_store*/charge_fuel) are NOT ticked
+  # by default because they fire 10M+ times/run and a per-call Process.get would tax the hot path; wire
+  # them temporarily when re-measuring. Zero overhead when `:tl_bench` is unset.
+  @bench_slots %{call_local: 8}
   @compile {:inline, bench_tick: 1}
   defp bench_tick(slot) do
     case Process.get(:tl_bench) do
@@ -2059,9 +2051,8 @@ defmodule TinyLasers.Wasm do
   end
 
   @doc """
-  Run `fun` with per-seam call counters on; returns `{result, counts_map}`. Counts how often each hot
-  host seam (charge_fuel, guest_load*, guest_store*, call_local) is invoked during a transpiled run —
-  the diagnostic for which remote-call seam dominates asm-lane execution time.
+  Run `fun` with per-seam call counters on; returns `{result, counts_map}`. Reports how often each wired
+  host seam is invoked during a transpiled run — default wires `call_local` (asm→interp trampolines).
   """
   def with_bench(fun) when is_function(fun, 0) do
     ref = :counters.new(8, [:write_concurrency])
@@ -4382,10 +4373,50 @@ defmodule TinyLasers.Wasm do
     end
   end
 
+  # FAST PATH: a word-aligned 4/8-byte float access is a single `:atomics` op + a binary reinterpret,
+  # instead of the per-byte mget/mput loop (which re-reads the SAME backing word up to 8×). The backing
+  # is `signed: false` 8-byte slots (see `load/3` above), so a bare `get` yields the full 64-bit LE
+  # pattern — `decode_f` reinterprets it bit-identically to the byte loop's `decode_unsigned` result.
+  defp fload(mem, addr, 8) when (addr &&& 7) == 0 do
+    decode_f(:atomics.get(mem, (addr >>> 3) + 1) &&& @mask64, 64)
+  end
+
+  defp fload(mem, addr, 4) when (addr &&& 7) == 0 do
+    decode_f(:atomics.get(mem, (addr >>> 3) + 1) &&& 0xFFFFFFFF, 32)
+  end
+
+  defp fload(mem, addr, 4) when (addr &&& 7) == 4 do
+    decode_f((:atomics.get(mem, (addr >>> 3) + 1) >>> 32) &&& 0xFFFFFFFF, 32)
+  end
+
   defp fload(mem, addr, n) do
     bin = for(i <- 0..(n - 1)//1, do: mget(mem, addr + i)) |> :erlang.list_to_binary()
     # decode via the bit pattern so non-finite values (±Inf/NaN) survive as {:nonfinite, bits, size}
     decode_f(:binary.decode_unsigned(bin, :little), n * 8)
+  end
+
+  # the LE integer bit-pattern of a float value (finite float OR {:nonfinite, bits, size}).
+  defp fbits({:nonfinite, bits, _}, _n), do: bits
+  defp fbits(v, 4), do: <<v::float-32-little>> |> :binary.decode_unsigned(:little)
+  defp fbits(v, 8), do: <<v::float-64-little>> |> :binary.decode_unsigned(:little)
+
+  defp fstore(mem, addr, v, 8) when (addr &&& 7) == 0 do
+    :atomics.put(mem, (addr >>> 3) + 1, fbits(v, 8) &&& @mask64)
+    :ok
+  end
+
+  defp fstore(mem, addr, v, 4) when (addr &&& 7) == 0 do
+    idx = (addr >>> 3) + 1
+    w = :atomics.get(mem, idx)
+    :atomics.put(mem, idx, ((w &&& bnot(0xFFFFFFFF)) ||| (fbits(v, 4) &&& 0xFFFFFFFF)) &&& @mask64)
+    :ok
+  end
+
+  defp fstore(mem, addr, v, 4) when (addr &&& 7) == 4 do
+    idx = (addr >>> 3) + 1
+    w = :atomics.get(mem, idx)
+    :atomics.put(mem, idx, ((w &&& 0xFFFFFFFF) ||| ((fbits(v, 4) &&& 0xFFFFFFFF) <<< 32)) &&& @mask64)
+    :ok
   end
 
   defp fstore(mem, addr, v, n) do
