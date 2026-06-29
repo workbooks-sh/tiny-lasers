@@ -1,0 +1,25 @@
+{
+  "name": "porffor",
+  "description": "An ahead-of-time JavaScript compiler",
+  "version": "0.61.13",
+  "author": "Oliver Medhurst <honk@goose.icu>",
+  "license": "MIT",
+  "scripts": {},
+  "dependencies": {
+    "acorn": "^8.15.0",
+    "astring": "^1.9.0"
+  },
+  "bin": {
+    "porf": "./runtime/index.js"
+  },
+  "main": "./compiler/wrap.js",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CanadaHonk/porffor.git"
+  },
+  "bugs": {
+    "url": "https://github.com/CanadaHonk/porffor/issues"
+  },
+  "homepage": "https://porffor.dev"
+}

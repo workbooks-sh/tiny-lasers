@@ -1,0 +1,3 @@
+node_modules/
+.repl_history
+*.log
