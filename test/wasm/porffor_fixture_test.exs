@@ -48,7 +48,9 @@ defmodule TinyLasers.WasmPorfforFixtureTest do
     {"typed_array", "13"},
     {"sort_numeric", "1,2,3,10"},
     {"optional_chain", "5/none"},
-    {"string_pad", "005"}
+    {"string_pad", "005"},
+    # Bundler-class compute (rollup's workload shape, self-contained)
+    {"mini_bundler", "d,b,c,a|4|113"}
   ]
 
   setup_all do

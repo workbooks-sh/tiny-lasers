@@ -56,7 +56,40 @@ fixtures = [
   {"typed_array", "let a=new Uint8Array([1,2,3]); a[1]=9; console.log(a.reduce((x,y)=>x+y,0));", "13"},
   {"sort_numeric", "console.log([3,1,2,10].sort((a,b)=>a-b).join(','));", "1,2,3,10"},
   {"optional_chain", "let o={a:{b:5}}; console.log((o?.a?.b ?? 'none')+'/'+(o?.x?.y ?? 'none'));", "5/none"},
-  {"string_pad", "console.log('5'.padStart(3,'0'));", "005"}
+  {"string_pad", "console.log('5'.padStart(3,'0'));", "005"},
+
+  # --- Bundler-class compute (rollup's actual workload shape, self-contained: dep-graph resolution,
+  #     topo-sort via recursion + Set, Object.keys, String.replace, scale string concatenation) ---
+  {"mini_bundler",
+   """
+   const modules = {
+     a: { deps: ["b", "c"], code: "export const a = b + c;" },
+     b: { deps: ["d"], code: "export const b = d * 2;" },
+     c: { deps: ["d"], code: "export const c = d + 1;" },
+     d: { deps: [], code: "export const d = 10;" }
+   };
+   function topoSort(mods) {
+     const visited = new Set();
+     const order = [];
+     function visit(id) {
+       if (visited.has(id)) return;
+       visited.add(id);
+       for (const dep of mods[id].deps) visit(dep);
+       order.push(id);
+     }
+     for (const id of Object.keys(mods)) visit(id);
+     return order;
+   }
+   const order = topoSort(modules);
+   let bundle = "";
+   let count = 0;
+   for (const id of order) {
+     bundle += "// module " + id + "\\n" + modules[id].code.replace("export ", "") + "\\n";
+     count++;
+   }
+   console.log(order.join(",") + "|" + count + "|" + bundle.length);
+   """,
+   "d,b,c,a|4|113"}
 ]
 
 # Host-call fixtures: a guest that exercises the Porffor↔host memory-exchange bridge (the `e` import
