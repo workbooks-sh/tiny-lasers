@@ -241,7 +241,7 @@ defmodule TinyLasers.Gate.Runtime do
   def cap_fs_write([path, data | _], ctx) when is_binary(path) do
     case confine(ctx.tenant_root, path) do
       {:ok, key} ->
-        # In production this delegates to Nexus.Washy.VFS (tenant-partitioned Store).
+        # In production this delegates to Nexus.Wasm.VFS (tenant-partitioned Store).
         # Here we record the write on the ctx's fs-writes log so the red-team can assert
         # exactly which keys a guest managed to write — and that traversal never escapes.
         log = Process.get(:gg_fs_writes, [])

@@ -18,7 +18,7 @@ defmodule TinyLasers.MixProject do
   end
 
   def application do
-    [extra_applications: [:logger]]
+    [mod: {TinyLasers.Application, []}, extra_applications: [:logger]]
   end
 
   # No third-party deps in the core. Keep it lean — tiny-lasers is the substrate, not the product.

@@ -2,7 +2,7 @@ defmodule TinyLasers do
   @moduledoc """
   Isolated multi-language execution + build sandbox on the BEAM.
 
-  Architecture (see README): everything untrusted runs as BEAM-native or WASM-on-Washy —
+  Architecture (see README): everything untrusted runs as BEAM-native or WASM-on-Wasm —
   never on the host CPU (no NIFs). Three lanes by speed:
 
     1. `TinyLasers.Gate` — JS → native BEAM, confined by a handle-capability gate. No WASM.
