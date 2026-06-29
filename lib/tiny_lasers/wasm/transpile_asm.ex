@@ -79,10 +79,36 @@ defmodule TinyLasers.Wasm.TranspileAsm do
   def compile_module(mod, gfidxs) do
     # Draw the module name from the FIXED recycled atom pool (atom-table wall fix). `:exhausted` means
     # every pool slot currently carries a live, in-execution module — fall back to interpreting this chunk
-    # (the caller treats `:none` as "nothing lowered"), never minting an unbounded fresh atom.
+    # (the caller treats `:none` as "nothing lowered"), never minting an unbound fresh atom.
     case TinyLasers.Wasm.ModulePool.acquire() do
       {:ok, mname, tok} -> compile_module(mod, gfidxs, mname, tok)
       :exhausted -> :none
+    end
+  end
+
+  # Gated diagnostic: lower ONE function and report either {:ok, nlabels} or the EXACT instruction that
+  # forced a bail to the interpreter (so the conformance loop can see WHICH op/shape the asm lane rejects,
+  # instead of the opaque :unsupported). Sets :tl_asm_probe so lower_seq records the failing instr.
+  def diagnose_one(mod, gfidx) do
+    ni = length(mod.imports)
+    li = gfidx - ni
+    {nlocals, instrs} = Enum.at(mod.code, li)
+    {params, results} = Enum.at(mod.types, Enum.at(mod.funcs, li))
+    sig_ok? = supported_sig?(params, results)
+    Process.put(:tl_asm_probe, true)
+    Process.delete(:tl_asm_probe_instr)
+    try do
+      if not sig_ok? do
+        {:unsupported, {:sig, params, results}}
+      else
+        case gen_function(mod, gfidx, :_probe) do
+          {:ok, _func, _fname, _arity, nlabels} -> {:ok, nlabels, nlocals, length(instrs)}
+          :unsupported -> {:unsupported, Process.get(:tl_asm_probe_instr) || :post_body_shape}
+        end
+      end
+    after
+      Process.delete(:tl_asm_probe)
+      Process.delete(:tl_asm_probe_instr)
     end
   end
 
@@ -318,7 +344,17 @@ defmodule TinyLasers.Wasm.TranspileAsm do
     ])
   end
 
-  defp lower_seq(instrs, s), do: Enum.reduce(instrs, s, &step/2)
+  defp lower_seq(instrs, s) do
+    probe = Process.get(:tl_asm_probe)
+    if probe do
+      Enum.reduce(instrs, s, fn instr, acc ->
+        Process.put(:tl_asm_probe_instr, instr)
+        step(instr, acc)
+      end)
+    else
+      Enum.reduce(instrs, s, &step/2)
+    end
+  end
 
   # ── dead code: skip until a join label restores reachability ──
   defp step(_instr, %{reachable: false} = s), do: s

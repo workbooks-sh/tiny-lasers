@@ -308,4 +308,138 @@ defmodule TinyLasers.WasmAsmMemoryTest do
 
     agree(m, for(a <- [0, 8, 64], v <- [0, 1, 255, 0x1234], do: [a, v]))
   end
+
+  # ── f32/f64 store+load (epic: the asm lane lowered integer memory ops but bailed f32/f64 to the
+  # interpreter, so Porffor's hot f64-value tokenizer loops ran interpreted → ~3x slower. These lock in
+  # bit-identical f32/f64 memory parity: finite floats, ±Inf/NaN via {:nonfinite,…}, unaligned addresses,
+  # static offset, OOB trap, and the wb-95w7 store-pops-both-operands shape for floats.
+  defp build_f(nlocals, instrs, result \\ 124) do
+    # (i32) -> f32|f64 : arg0 is the address.
+    %Wasm{
+      types: [{[127], [result]}],
+      funcs: [0],
+      code: [{nlocals, instrs}],
+      exports: %{"f" => 0},
+      mem: {1, nil},
+      globals: [],
+      data: [],
+      imports: [],
+      elements: [],
+      id: :crypto.hash(:sha256, :erlang.term_to_binary({:f, result, nlocals, instrs}))
+    }
+  end
+
+  @f64_vals [
+    0.0,
+    -0.0,
+    1.0,
+    -2.5,
+    3.141592653589793,
+    1.0e308,
+    -1.0e-308,
+    {:nonfinite, 0x7FF0000000000000, 64},  # +Inf
+    {:nonfinite, 0xFFF0000000000000, 64},  # -Inf
+    {:nonfinite, 0x7FF8000000000000, 64}   # NaN
+  ]
+
+  test "f64 store+load round-trips finite + nonfinite values at aligned/unaligned addresses" do
+    for v <- @f64_vals do
+      # f(addr): mem[addr] = v (f64); return mem[addr] (f64).  Store order: addr below, val on top.
+      m =
+        build_f(0, [
+          {:local_get, 0},
+          {:fconst, v},
+          {:f64_store, 0},
+          {:local_get, 0},
+          {:f64_load, 0}
+        ])
+
+      agree(m, for(a <- [0, 1, 4, 7, 8, 13, 100, 4088], do: [a]))
+    end
+  end
+
+  test "f64 static offset folds into the effective address" do
+    for v <- [0.0, 1.5, -3.25, {:nonfinite, 0x7FF0000000000000, 64}] do
+      m =
+        build_f(0, [
+          {:local_get, 0},
+          {:fconst, v},
+          {:f64_store, 16},
+          {:local_get, 0},
+          {:f64_load, 16}
+        ])
+
+      agree(m, for(a <- [0, 3, 7, 8, 64], do: [a]))
+    end
+  end
+
+  test "f64 out-of-bounds load traps identically in both lanes" do
+    m = build_f(0, [{:local_get, 0}, {:f64_load, 0}])
+
+    for addr <- [65529, 65530, 65536, 70000, 0x7FFFFFFF] do
+      i =
+        try do
+          {:ok, interp(m, [addr])}
+        rescue
+          e in TinyLasers.Wasm.Trap -> {:trap, e.reason}
+        end
+
+      a =
+        try do
+          {:ok, asm(m, [addr])}
+        rescue
+          e in TinyLasers.Wasm.Trap -> {:trap, e.reason}
+        end
+
+      assert i == a and i == {:trap, :out_of_bounds}, "@addr #{addr}: interp=#{inspect(i)} asm=#{inspect(a)}"
+    end
+  end
+
+  test "f64 out-of-bounds store traps identically in both lanes" do
+    # (i32)->i32: store 1.0 at addr; return 0. Use the i32 build (2 args, ignore arg1).
+    m = build(0, [{:local_get, 0}, {:fconst, 1.0}, {:f64_store, 0}, {:i32_const, 0}])
+
+    for addr <- [65529, 65536, 99999] do
+      trap = fn fun ->
+        try do
+          {:ok, fun.()}
+        rescue
+          e in TinyLasers.Wasm.Trap -> {:trap, e.reason}
+        end
+      end
+
+      i = trap.(fn -> interp(m, [addr, 0]) end)
+      a = trap.(fn -> asm(m, [addr, 0]) end)
+      assert i == a and i == {:trap, :out_of_bounds}, "@addr #{addr}: interp=#{inspect(i)} asm=#{inspect(a)}"
+    end
+  end
+
+  test "f64 store consumes BOTH addr+val — later operand slots stay aligned" do
+    # (i32,i32)->i32: mem[a]=1.5 (f64 store); then a + b + a from operands pushed AFTER the store.
+    m =
+      build(0, [
+        {:local_get, 0}, {:fconst, 1.5}, {:f64_store, 0},
+        {:local_get, 0}, {:local_get, 1}, {:op, 0x6A},
+        {:local_get, 0}, {:op, 0x6A}
+      ])
+
+    agree(m, for(a <- [0, 7, 8, 16, 100], b <- [0, 1, 0x7F, 0x1234], do: [a, b]))
+  end
+
+  test "f32 store+load round-trips finite + nonfinite values" do
+    f32_vals = [0.0, 1.0, -2.5, {:nonfinite, 0x7F800000, 32}, {:nonfinite, 0xFF800000, 32}]
+
+    for v <- f32_vals do
+      m =
+        build_f(0, [
+          {:local_get, 0},
+          {:fconst, v},
+          {:f32_store, 0},
+          {:local_get, 0},
+          {:f32_load, 0}
+        ], 125)
+
+      agree(m, for(a <- [0, 1, 2, 4, 7, 100], do: [a]))
+    end
+  end
 end

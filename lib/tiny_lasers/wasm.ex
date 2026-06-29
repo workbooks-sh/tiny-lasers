@@ -1012,6 +1012,7 @@ defmodule TinyLasers.Wasm do
   → `invoke`, which may itself re-dispatch to native), all on the shared run state held in `:tl_rt`.
   """
   def call_local(fidx, args) when is_integer(fidx) and is_list(args) do
+    bench_tick(8)
     case Process.get(:tl_rt) do
       nil -> raise "call_local/2 outside a tinylasers run (no :tl_rt)"
       rt -> call_fn(rt, fidx, args)
@@ -1116,6 +1117,7 @@ defmodule TinyLasers.Wasm do
   Coarser than the interpreter's per-instruction charge (per-iteration here), but it bounds runaway loops.
   """
   def charge_fuel do
+    bench_tick(1)
     case Process.get(:tl_last_fuel) do
       {_budget, fuel} -> if :atomics.sub_get(fuel, 1, 1) < 0, do: trap!(:out_of_fuel)
       _ -> :ok
@@ -1357,6 +1359,7 @@ defmodule TinyLasers.Wasm do
   `:out_of_bounds` against the logical memory size — byte-identical to the interpreter's `gload/3`.
   """
   def guest_load(addr, n) do
+    bench_tick(2)
     bounds_g!(addr, n)
     load(wmem(), addr, n)
   end
@@ -1366,14 +1369,37 @@ defmodule TinyLasers.Wasm do
   from `n*8` bits into the unsigned i32 representation — mirrors the interpreter's `sext(gload(..), bits)`.
   """
   def guest_load_s(addr, n) do
+    bench_tick(3)
     bounds_g!(addr, n)
     sext(load(wmem(), addr, n), n * 8)
   end
 
-  @doc "Bounds-checked signed load that sign-extends to 64 bits (i64 partial loads). Matches the interpreter's `{:i64_load, _, n, true}` (`sext64(v, n*8)`)."
+  @doc "Bounds-checked SIGNED load that sign-extends to 64 bits (i64 partial loads). Matches the interpreter's `{:i64_load, _, n, true}` (`sext64(v, n*8)`)."
   def guest_load_s64(addr, n) do
+    bench_tick(4)
     bounds_g!(addr, n)
     sext64(load(wmem(), addr, n), n * 8)
+  end
+
+  @doc """
+  Bounds-checked FLOAT load (f32/f64) for TRANSPILED code — bit-identical to the interpreter's `gfload/3`
+  (`fload/2` → `decode_f`): returns an Elixir float for finite values, or `{:nonfinite, bits, size}` for
+  ±Inf/NaN/-0 (the same shape every float op in both lanes carries). n ∈ 4 (f32) | 8 (f64).
+  """
+  def guest_fload(addr, n) do
+    bench_tick(5)
+    bounds_g!(addr, n)
+    fload(wmem(), addr, n)
+  end
+
+  @doc """
+  Bounds-checked FLOAT store (f32/f64) for TRANSPILED code — bit-identical to the interpreter's `gfstore/4`
+  (`fstore/3`): encodes a finite float (or `{:nonfinite, bits, size}`) to little-endian bytes and writes them.
+  """
+  def guest_fstore(addr, val, n) do
+    bench_tick(7)
+    bounds_g!(addr, n)
+    fstore(wmem(), addr, val, n)
   end
 
   @doc """
@@ -1381,6 +1407,7 @@ defmodule TinyLasers.Wasm do
   code — byte-identical to the interpreter's `gstore/4`. Returns `:ok`.
   """
   def guest_store(addr, val, n) do
+    bench_tick(6)
     bounds_g!(addr, n)
     store(wmem(), addr, val, n)
   end
@@ -2013,6 +2040,38 @@ defmodule TinyLasers.Wasm do
     case Process.get(:tl_cov) do
       nil -> :ok
       ref -> :atomics.add(ref, slot, 1)
+    end
+  end
+
+  # Gated per-seam call counter for the asm-lane perf loop: counts how often each hot host seam is hit
+  # (charge_fuel / guest_load* / guest_store* / call_local) so we can see which remote-call seam dominates
+  # a transpiled run. Zero overhead when `:tl_bench` is unset (the normal path).
+  @bench_slots %{
+    charge_fuel: 1, guest_load: 2, guest_load_s: 3, guest_load_s64: 4,
+    guest_fload: 5, guest_store: 6, guest_fstore: 7, call_local: 8
+  }
+  @compile {:inline, bench_tick: 1}
+  defp bench_tick(slot) do
+    case Process.get(:tl_bench) do
+      nil -> :ok
+      ref -> :counters.add(ref, slot, 1)
+    end
+  end
+
+  @doc """
+  Run `fun` with per-seam call counters on; returns `{result, counts_map}`. Counts how often each hot
+  host seam (charge_fuel, guest_load*, guest_store*, call_local) is invoked during a transpiled run —
+  the diagnostic for which remote-call seam dominates asm-lane execution time.
+  """
+  def with_bench(fun) when is_function(fun, 0) do
+    ref = :counters.new(8, [:write_concurrency])
+    prev = Process.put(:tl_bench, ref)
+    try do
+      result = fun.()
+      counts = Map.new(@bench_slots, fn {k, s} -> {k, :counters.get(ref, s)} end)
+      {result, counts}
+    after
+      if prev, do: Process.put(:tl_bench, prev), else: Process.delete(:tl_bench)
     end
   end
 

@@ -21,11 +21,11 @@ defmodule TinyLasers.Wasm.AsmOps.Memory do
   The frame is pre-allocated and call-safe, so no spilling.
 
   ## Ops handled
-  loads:  `:i32_load` (4) · `:i32_load8u`/`:i32_load8s` (1) · `:i32_load16u`/`:i32_load16s` (2)
-  stores: `:i32_store` (4) · `:i32_store8` (1) · `:i32_store16` (2)
+  loads:  `:i32_load` (4) · `:i32_load8u`/`:i32_load8s` (1) · `:i32_load16u`/`:i32_load16s` (2) · `:f32_load` (4) · `:f64_load` (8)
+  stores: `:i32_store` (4) · `:i32_store8` (1) · `:i32_store16` (2) · `:f32_store` (4) · `:f64_store` (8)
   bulk/size: `:memory_size` · `:memory_grow` · `:memory_copy` · `:memory_fill` · `:data_drop`
 
-  Anything else (notably i64 loads/stores, f32/f64) → `:unsupported` (clean fallback to forms).
+  i64 loads/stores (uniform `{:i64_load, off, n, signed?}` / `{:i64_store, off, n}`) are handled below.
   """
   import TinyLasers.Wasm.AsmCtx
 
@@ -118,6 +118,42 @@ defmodule TinyLasers.Wasm.AsmOps.Memory do
         ]
 
     # i64 store also pops BOTH addr and val — `d - 2` (same wb-95w7 fix as the i32 store above).
+    {:ok, %{emit(s, ops) | d: s.d - 2}}
+  end
+
+  # ── f32/f64 loads ── pop addr, push the decoded float (or {:nonfinite,bits,size}). n ∈ 4|8. Bit-identical
+  # to the interpreter's `gfload` (host `guest_fload/2` = `fload` → `decode_f`).
+  def handle({op, offset}, s) when op in [:f32_load, :f64_load] do
+    if s.d < 1, do: throw(:unsupported)
+    n = if op == :f32_load, do: 4, else: 8
+    top = s.d - 1
+
+    ops =
+      addr_into_x0(s, top, offset) ++
+        [
+          {:move, {:integer, n}, {:x, 1}},
+          {:call_ext, 2, {:extfunc, @tinylasers, :guest_fload, 2}},
+          {:move, {:x, 0}, yd(s, top)}
+        ]
+
+    {:ok, emit(s, ops)}
+  end
+
+  # ── f32/f64 stores ── pop [addr, val] (val on top), push nothing. n ∈ 4|8. Bit-identical to `gfstore`.
+  def handle({op, offset}, s) when op in [:f32_store, :f64_store] do
+    if s.d < 2, do: throw(:unsupported)
+    n = if op == :f32_store, do: 4, else: 8
+    addr_pos = s.d - 2
+    val_pos = s.d - 1
+
+    ops =
+      addr_into_x0(s, addr_pos, offset) ++
+        [
+          {:move, yd(s, val_pos), {:x, 1}},
+          {:move, {:integer, n}, {:x, 2}},
+          {:call_ext, 3, {:extfunc, @tinylasers, :guest_fstore, 3}}
+        ]
+
     {:ok, %{emit(s, ops) | d: s.d - 2}}
   end
 

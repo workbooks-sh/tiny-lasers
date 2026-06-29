@@ -250,10 +250,10 @@ defmodule TinyLasers.WasmAsmTest do
   end
 
   test "out-of-subset shapes return :unsupported (clean fallback, never wrong code)" do
-    # call with too few args on the stack; a MULTI-value block (delta 2, not 0/1); float memory access. All deferred.
+    # call with too few args on the stack; a MULTI-value block (delta 2, not 0/1). All deferred.
+    # (f32/f64 memory access is NOW supported in asm — see asm_memory_test; the float ops group lowers it.)
     assert :unsupported = TranspileAsm.try_emit(build(0, [{:local_get, 0}, {:call, 0}]), 0)
     assert :unsupported = TranspileAsm.try_emit(build(0, [{:block, [{:local_get, 0}, {:local_get, 1}]}]), 0)
-    assert :unsupported = TranspileAsm.try_emit(build(0, [{:local_get, 0}, {:f32_load, 0}, {:drop}, {:local_get, 0}]), 0)
     # a SIMD v128 op is not covered by any asm op-group yet → clean fallback (interp oracle covers it)
     assert :unsupported = TranspileAsm.try_emit(build(0, [{:v128_const, 0}]), 0)
   end
