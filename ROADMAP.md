@@ -47,6 +47,22 @@ WASM→BEAM lowering more native/efficient, migrating off it only where it truly
 - **Suite: 171 tests, 0 failures, 1 skipped** — stable across seeds (the two first-spike gate atom
   red-team tests were hardened from a flaky global `atom_count` proxy to the precise invariant).
 
+### Then, this session
+
+- **WASIX is LOCKED (lanes 2–3, C + Rust).** The full conformance suite (14 real recompiled binaries,
+  11MB of fixtures) runs on `TinyLasers.Wasm`, interp ≡ asm, exit 42 — C/wasix-libc (socket+poll, fs
+  open/write/read, pthreads, termios/tty, TCP server) and Rust/wasix (std threads, rayon, **tokio**,
+  serde_json+regex, flate2+sha2, float, num-bigint, trait-objects, std::net). Blink is **dropped** —
+  recompile-to-WASIX is the clean ABI→BEAM seam; Blink only earns its keep for opaque prebuilt x86.
+- **The ABI translates to BEAM-resident resources.** `fd_read` dispatches on fd kind: files → VFS,
+  pipes → BEAM processes, sockets → host BEAM. Linear memory holds only the transient syscall buffer.
+- **The washy shell runs ("bash in WASM").** `priv/shell/sh.c` → `wasm32-wasip1` (`tools/build_shell.sh`),
+  run on the runtime interp ≡ asm: builtins, **fork-less pipelines** (buffered chaining), `for`/`if`
+  grammar, and `> /work/f` redirect persisting into the BEAM-resident VFS.
+- **Rename complete.** Internal `:washy_*` atoms → `:tl_*` (was module-namespaces only); branding swept;
+  `:nexus_washy_metric_reasons` (wrongly nexus-branded) → `:tl_metric_reasons`. Nothing reads "washy".
+- **Suite: 203 tests, 0 failures, 1 skipped.**
+
 ## Next (ordered, proof-gated)
 
 1. **Finish the test migration.** Bring the remaining `washy_*` suites (conformance, async,
