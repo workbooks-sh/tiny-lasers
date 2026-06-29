@@ -12,6 +12,8 @@ defmodule TinyLasers.Store do
 
   def all(mod, tenant), do: Process.get(k(mod, tenant), [])
 
+  def count(mod, tenant), do: length(all(mod, tenant))
+
   def create(mod, attrs, tenant) do
     Process.put(k(mod, tenant), all(mod, tenant) ++ [struct(mod, attrs)])
     :ok
