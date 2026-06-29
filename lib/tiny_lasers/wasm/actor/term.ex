@@ -47,11 +47,11 @@ defmodule TinyLasers.Wasm.Actor.Term do
   defp key(k) when is_integer(k), do: Integer.to_string(k)
   defp key(k), do: raise(ArgumentError, "Beam map key not bridgeable: #{inspect(k)}")
 
-  @doc "Encode a normalized term as JSON text (the cross-host / debug wire form)."
+  @doc "Encode a normalized term as JSON text (the JS↔BEAM wire form)."
   @spec to_json(term()) :: binary()
-  def to_json(term), do: term |> normalize() |> Jason.encode!()
+  def to_json(term), do: term |> normalize() |> TinyLasers.Wasm.Json.encode!()
 
   @doc "Decode JSON text from a guest into the shared term shape (string-keyed maps, lists, scalars)."
   @spec from_json(binary()) :: t
-  def from_json(json), do: json |> Jason.decode!() |> normalize()
+  def from_json(json), do: json |> TinyLasers.Wasm.Json.decode!() |> normalize()
 end
