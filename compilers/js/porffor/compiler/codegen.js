@@ -2444,15 +2444,22 @@ const generateCall = (scope, decl, _global, _name, unusedValue = false) => {
   // tagged host handle is rebuilt into a memory object first; non-tagged values pass through untouched. Done
   // once here (not per-builtin) and idempotent (the marker isn't itself a target name).
   if (Prefs.hostObjects && !decl._hoWrapped && name && decl.arguments?.length) {
-    const single = { __Object_keys: 0, __Object_values: 0, __Object_entries: 0, __Object_getOwnPropertyNames: 0, __JSON_stringify: 0, __Porffor_object_spread: 1 };
+    // builtins that take an object arg and read it as an in-memory object — materialize a host handle first.
+    const single = {
+      __Object_keys: 0, __Object_values: 0, __Object_entries: 0, __Object_getOwnPropertyNames: 0,
+      __Object_getOwnPropertySymbols: 0, __Object_getOwnPropertyDescriptor: 0, __Object_getPrototypeOf: 0,
+      __Object_create: 0, __JSON_stringify: 0, __Porffor_object_spread: 1
+    };
     if (name in single) {
       decl._hoWrapped = true;
       const i = single[name];
       if (decl.arguments[i] && decl.arguments[i].type !== '_HostMaterialize')
         decl.arguments[i] = { type: '_HostMaterialize', argument: decl.arguments[i] };
     } else if (name === '__Object_assign') {
+      // assign(target, ...sources): materialize every arg (incl. a host-object target like {}) so the copy
+      // runs entirely in memory and returns a memory object.
       decl._hoWrapped = true;
-      decl.arguments = decl.arguments.map((a, i) => i === 0 || a.type === '_HostMaterialize' ? a : { type: '_HostMaterialize', argument: a });
+      decl.arguments = decl.arguments.map(a => a.type === '_HostMaterialize' ? a : { type: '_HostMaterialize', argument: a });
     }
   }
 
@@ -2580,6 +2587,16 @@ const generateCall = (scope, decl, _global, _name, unusedValue = false) => {
           _callType: [ [ Opcodes.local_get, typeTmp ] ]
         }
       });
+    }
+
+    // --host-objects: Object.prototype methods (hasOwnProperty etc.) called on a host handle read it as an
+    // in-memory object → OOB. Materialize the receiver first (passes non-host values through untouched).
+    // Gated on the method NAME so array/string/etc. prototype methods are never touched, and only when the
+    // receiver isn't statically a non-object type.
+    const HO_PROTO_METHODS = ['hasOwnProperty', 'propertyIsEnumerable', 'isPrototypeOf', 'valueOf', 'toLocaleString'];
+    if (Prefs.hostObjects && HO_PROTO_METHODS.includes(protoName) && target.type !== '_HostMaterialize') {
+      const tt = knownType(scope, getNodeType(scope, target));
+      if (tt == null || tt === TYPES.object) target = { type: '_HostMaterialize', argument: target };
     }
 
     const builtinProtoCands = Object.keys(builtinFuncs).filter(x => x.startsWith('__') && x.endsWith('_prototype_' + protoName));

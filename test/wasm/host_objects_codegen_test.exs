@@ -86,7 +86,17 @@ defmodule TinyLasers.HostObjectsCodegenTest do
     {"spread merge", "function f(){ var o={x:1,y:2}; var p={...o, z:3}; return p.x+p.y+p.z; } f();"},
     {"spread override", "function f(){ var o={x:1,y:2}; var p={...o, x:9}; return p.x*10+p.y; } f();"},
     {"JSON.stringify length", "function f(){ var o={x:1,y:2}; return JSON.stringify(o).length; } f();"},
-    {"Object.values after write", "function f(){ var o={a:1}; o.b=2; o.c=3; var v=Object.values(o); return v[0]+v[1]+v[2]; } f();"}
+    {"Object.values after write", "function f(){ var o={a:1}; o.b=2; o.c=3; var v=Object.values(o); return v[0]+v[1]+v[2]; } f();"},
+    # Phase C prototype/reflection: instanceof, getPrototypeOf, hasOwnProperty, assign, create
+    {"instanceof Object", "function f(){ var o={x:1}; return (o instanceof Object)?1:0; } f();"},
+    {"getPrototypeOf is Object.prototype", "function f(){ var o={x:1}; return (Object.getPrototypeOf(o)===Object.prototype)?1:0; } f();"},
+    {"hasOwnProperty present", "function f(){ var o={x:1,y:2}; return o.hasOwnProperty('x')?1:0; } f();"},
+    {"hasOwnProperty absent", "function f(){ var o={x:1}; return o.hasOwnProperty('z')?1:0; } f();"},
+    {"hasOwnProperty after write", "function f(){ var o={x:1}; o.y=2; return (o.hasOwnProperty('y')?1:0) + (o.hasOwnProperty('q')?1:0); } f();"},
+    {"Object.assign into fresh", "function f(){ var o={a:1,b:2}; var t=Object.assign({}, o); return t.a+t.b; } f();"},
+    {"Object.assign merge", "function f(){ var a={x:1}; var b={y:2}; var t=Object.assign({}, a, b); return t.x*10+t.y; } f();"},
+    {"Object.create proto read", "function f(){ var p={greet:7}; var o=Object.create(p); return o.greet; } f();"},
+    {"getOwnPropertyNames length", "function f(){ var o={a:1,b:2,c:3}; return Object.getOwnPropertyNames(o).length; } f();"}
   ]
 
   for {name, src} <- @cases do
