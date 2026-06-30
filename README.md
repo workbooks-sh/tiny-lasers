@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/laser.gif" width="72" alt="pew pew" />
+  <img src="assets/laser.gif" width="200" alt="pew pew" />
   <br />
   <em><sub>a "pew-pew" type sandbox</sub></em>
 </p>
