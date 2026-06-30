@@ -17,7 +17,12 @@ trap 'rm -rf "$TMP"' EXIT
 
 command -v git-filter-repo >/dev/null 2>&1 || { echo "git-filter-repo not installed (brew install git-filter-repo)"; exit 1; }
 
-git clone --no-hardlinks --quiet "$MONO" "$TMP/x"
+# Local clone defaults to HARDLINKS — near-instant, ~zero bytes copied (the clone's object files
+# just point at the monorepo's). We only need the ~5MB reachable from tiny-lasers/; the monorepo's
+# other ~8GB of history is hardlinked, never byte-copied, and discarded by filter-repo below.
+# filter-repo rewrites only this throwaway clone; the source monorepo is never touched.
+# --single-branch --no-tags trims ref processing to just the branch we extract.
+git clone --single-branch --no-tags --quiet "$MONO" "$TMP/x"
 cd "$TMP/x"
 git filter-repo --subdirectory-filter tiny-lasers --force >/dev/null
 git remote add origin "$REMOTE"
