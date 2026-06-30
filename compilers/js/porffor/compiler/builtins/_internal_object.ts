@@ -684,6 +684,23 @@ return`;
 
 export const __Porffor_object_get_withHash = (_obj: any, key: any, hash: i32): any => {
   if (__Porffor_object_isProxy(_obj)) return __Porffor_proxy_get(_obj, key);
+
+  // host-resident object chokepoint (see __Porffor_object_get) — hash is already computed here.
+  if (Porffor.wasm`local.get ${_obj+1}` == Porffor.TYPES.object) {
+    const handle: i32 = Porffor.wasm`local.get ${_obj}
+i32.trunc_sat_f64_u`;
+    if (handle < 0) {
+      Porffor.wasm`
+local.get ${handle}
+local.get ${hash}
+call ho_get_value
+local.get ${handle}
+local.get ${hash}
+call ho_get_type
+return`;
+    }
+  }
+
   let obj: any = _obj;
   const trueType: i32 = Porffor.wasm`local.get ${obj+1}`;
   if (trueType != Porffor.TYPES.object) obj = __Porffor_object_underlying(obj);
@@ -775,6 +792,29 @@ i32.trunc_sat_f64_u
 local.get ${value}
 i32.trunc_sat_f64_u
 i32.store16 0 8`;
+      return value;
+    }
+  }
+
+  // host-resident object chokepoint (see __Porffor_object_get): route the write to the host table via
+  // ho_set (value/type by hash) + ho_regkey (original key string for enumeration), then return the value.
+  if (Porffor.wasm`local.get ${_obj+1}` == Porffor.TYPES.object) {
+    const handle: i32 = Porffor.wasm`local.get ${_obj}
+i32.trunc_sat_f64_u`;
+    if (handle < 0) {
+      const shash: i32 = __Porffor_object_hash(key);
+      Porffor.wasm`
+local.get ${handle}
+local.get ${shash}
+local.get ${value}
+local.get ${value+1}
+call ho_set
+local.get ${handle}
+local.get ${shash}
+local.get ${key}
+i32.trunc_sat_f64_u
+local.get ${key+1}
+call ho_regkey`;
       return value;
     }
   }
@@ -879,6 +919,27 @@ i32.store16 0 8`;
 
 export const __Porffor_object_set_withHash = (_obj: any, key: any, value: any, hash: i32): any => {
   if (__Porffor_object_isProxy(_obj)) return __Porffor_proxy_set(_obj, key, value);
+
+  // host-resident object chokepoint (see __Porffor_object_set) — hash is already computed here.
+  if (Porffor.wasm`local.get ${_obj+1}` == Porffor.TYPES.object) {
+    const hhandle: i32 = Porffor.wasm`local.get ${_obj}
+i32.trunc_sat_f64_u`;
+    if (hhandle < 0) {
+      Porffor.wasm`
+local.get ${hhandle}
+local.get ${hash}
+local.get ${value}
+local.get ${value+1}
+call ho_set
+local.get ${hhandle}
+local.get ${hash}
+local.get ${key}
+i32.trunc_sat_f64_u
+local.get ${key+1}
+call ho_regkey`;
+      return value;
+    }
+  }
   if (Porffor.wasm`local.get ${_obj+1}` == Porffor.TYPES.regexp) {
     if (Porffor.strcmp(key, 'lastIndex')) {
       Porffor.wasm`
@@ -983,6 +1044,28 @@ i32.store16 0 8`;
 
 export const __Porffor_object_setStrict = (_obj: any, key: any, value: any): any => {
   if (__Porffor_object_isProxy(_obj)) return __Porffor_proxy_set(_obj, key, value);
+
+  // host-resident object chokepoint (see __Porffor_object_set).
+  if (Porffor.wasm`local.get ${_obj+1}` == Porffor.TYPES.object) {
+    const shandle: i32 = Porffor.wasm`local.get ${_obj}
+i32.trunc_sat_f64_u`;
+    if (shandle < 0) {
+      const sshash: i32 = __Porffor_object_hash(key);
+      Porffor.wasm`
+local.get ${shandle}
+local.get ${sshash}
+local.get ${value}
+local.get ${value+1}
+call ho_set
+local.get ${shandle}
+local.get ${sshash}
+local.get ${key}
+i32.trunc_sat_f64_u
+local.get ${key+1}
+call ho_regkey`;
+      return value;
+    }
+  }
   if (Porffor.wasm`local.get ${_obj+1}` == Porffor.TYPES.regexp) {
     if (Porffor.strcmp(key, 'lastIndex')) {
       Porffor.wasm`
@@ -1272,6 +1355,21 @@ export const __Porffor_object_delete = (obj: any, key: any): boolean => {
   if (__Porffor_object_isProxy(obj)) return __Porffor_proxy_deleteProperty(obj, key);
   if (Porffor.wasm`local.get ${obj}` == 0) throw new TypeError('Cannot delete property of null');
 
+  // host-resident object chokepoint — route the delete to the host table.
+  if (Porffor.wasm`local.get ${obj+1}` == Porffor.TYPES.object) {
+    const dhandle: i32 = Porffor.wasm`local.get ${obj}
+i32.trunc_sat_f64_u`;
+    if (dhandle < 0) {
+      const dhash: i32 = __Porffor_object_hash(key);
+      Porffor.wasm`
+local.get ${dhandle}
+local.get ${dhash}
+call ho_delete
+drop`;
+      return true;
+    }
+  }
+
   if (Porffor.wasm`local.get ${obj+1}` != Porffor.TYPES.object) {
     obj = __Porffor_object_underlying(obj);
     if (Porffor.wasm`local.get ${obj+1}` != Porffor.TYPES.object) return true;
@@ -1322,6 +1420,21 @@ memory.copy 0 0`;
 export const __Porffor_object_deleteStrict = (obj: any, key: any): boolean => {
   if (__Porffor_object_isProxy(obj)) return __Porffor_proxy_deleteProperty(obj, key);
   if (Porffor.wasm`local.get ${obj}` == 0) throw new TypeError('Cannot delete property of null');
+
+  // host-resident object chokepoint — route the delete to the host table.
+  if (Porffor.wasm`local.get ${obj+1}` == Porffor.TYPES.object) {
+    const dshandle: i32 = Porffor.wasm`local.get ${obj}
+i32.trunc_sat_f64_u`;
+    if (dshandle < 0) {
+      const dshash: i32 = __Porffor_object_hash(key);
+      Porffor.wasm`
+local.get ${dshandle}
+local.get ${dshash}
+call ho_delete
+drop`;
+      return true;
+    }
+  }
 
   if (Porffor.wasm`local.get ${obj+1}` != Porffor.TYPES.object) {
     obj = __Porffor_object_underlying(obj);
