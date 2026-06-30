@@ -112,28 +112,3 @@ For lane 3 to count as "done correctly," an emulator has to clear all of these:
    batch builds).
 6. Tolerable performance for the **build lane** (batch). Must be measured on a real build.
 7. Deterministic where byte-exact output matters (controlled clock/rand/env).
-
-## Open research (do before migrating anything)
-
-- **R1 (make-or-break):** Does blink compile to WASM/WASI cleanly, and does the WASM build
-  keep fork/clone/threads/mmap? Justine's work targets native portability (APE), not WASM —
-  this is unproven and may be a blocker. **v86 / TinyEMU already run as WASM** (boot Linux
-  in the browser) and are the proven fallback if blink doesn't.
-- **R2:** Perf. Run a real native binary under the chosen emulator-on-Washy; measure the
-  slowdown vs. an acceptable build-lane threshold.
-- **R3:** Evaluate v86 / TinyEMU / QEMU-wasm as lane-3 engines alongside blink.
-- **R4:** Scope the fuller-POSIX layer for Washy (the lane-2 path): which syscalls beyond
-  WASI (threads, fork/exec, sockets-gated, fs→Store) and recompile-feasibility per language.
-- **R5:** Decide the lane split — enumerate which prebuilt binaries are *truly* unavoidable
-  (and thus actually need lane 3).
-
-## Status
-
-- **Lane 1 (JS→BEAM gate): proven.** Confinement holds against static + dynamic (eval) code,
-  with a mechanical bytecode gate (`dangerous_refs`). Currently lives in the monorepo at
-  `nexus/lib/nexus/guest_gate/` + `nexus/test/guest_gate_*redteam_test.exs` (commits
-  `b5b400d8`, `1f89b58b`) — to migrate here deliberately, after the research above.
-- Lanes 2–3: research stage (R1–R5).
-
-> Docs here are Markdown for now; migrate to `.work` once the reactor is bootstrapped in
-> this repo.
