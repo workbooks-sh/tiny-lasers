@@ -312,7 +312,10 @@ defmodule TinyLasers.Wasm.TranspileAsm do
 
   # Unpack a TOP-FIRST result list (in x0) of `n` elements onto operand slots [base, base+n): the head
   # (top) goes to the HIGHEST slot base+n-1, the tail's last (bottom) to base. Walk the cons cells.
-  defp unpack_result_list(s, n, base) do
+  # Public so the Tables op-group (`{:call_indirect, …}` multi-value lowering) reuses the SAME unpack —
+  # bit-identical result-list → operand-slot dance as the direct `{:call, …}` step.
+  @doc false
+  def unpack_result_list(s, n, base) do
     {lbad, s} = new_label(s)
     {lcont, s} = new_label(s)
     s = emit(s, [{:move, {:x, 0}, {:x, 1}}])
@@ -709,16 +712,16 @@ defmodule TinyLasers.Wasm.TranspileAsm do
   # ── values / locals ──
   defp step({:i32_const, v}, s), do: push(emit(s, [{:move, {:integer, v &&& @mask32}, yd(s, s.d)}]))
 
-  defp step({:local_get, i}, s), do: push(emit(s, [{:move, {:y, i}, {:x, 0}}, {:move, {:x, 0}, yd(s, s.d)}]))
+  defp step({:local_get, i}, s), do: push(emit(s, [{:move, {:y, i}, yd(s, s.d)}]))
 
   defp step({:local_set, i}, s) do
     if s.d < 1, do: throw(:unsupported)
-    %{emit(s, [{:move, yd(s, s.d - 1), {:x, 0}}, {:move, {:x, 0}, {:y, i}}]) | d: s.d - 1}
+    %{emit(s, [{:move, yd(s, s.d - 1), {:y, i}}]) | d: s.d - 1}
   end
 
   defp step({:local_tee, i}, s) do
     if s.d < 1, do: throw(:unsupported)
-    emit(s, [{:move, yd(s, s.d - 1), {:x, 0}}, {:move, {:x, 0}, {:y, i}}])
+    emit(s, [{:move, yd(s, s.d - 1), {:y, i}}])
   end
 
   defp step({:drop}, s) do

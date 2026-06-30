@@ -14,6 +14,7 @@ defmodule TinyLasers.Application do
     children =
       [
         TinyLasers.Wasm.ModulePool,
+        TinyLasers.Wasm.Transpile.AsyncCompiler,
         TinyLasers.Wasm.JitCache
       ] ++ TinyLasers.Wasm.Actor.child_specs()
 

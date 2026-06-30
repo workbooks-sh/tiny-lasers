@@ -348,43 +348,19 @@ defmodule TinyLasers.Wasm.Transpile do
   end
 
   @doc """
-  Compile `gfidx` in the BACKGROUND (fire-and-forget Task) — used by the async tier mode so a guest run
+  Compile `gfidx` in the BACKGROUND (fire-and-forget) — used by the async tier mode so a guest run
   never blocks on a compile storm. The result lands in the persistent cache (`compile_one` caches it),
   where the in-flight run picks it up via `cached_one/2` on a later call. Only meaningful for modules
-  with an `id` (so the cache is keyed + retrievable); cheap no-op spawn otherwise.
+  with an `id` (so the cache is keyed + retrievable); a no-op-ish spawn otherwise.
+
+  Routes through `TinyLasers.Wasm.Transpile.AsyncCompiler` — a bounded QUEUE (up to
+  `@max_inflight` concurrent compiles) that NEVER drops a hot function: excess compiles wait their
+  turn instead of being silently discarded (the old `:atomics`-gate dropped them, leaving hot
+  dispatchers `:pending` → interpreted for every call). CPU is still bounded so compilation never
+  starves the interpreter.
   """
-  # at most this many background compiles run at once, so compilation never starves the interpreter of
-  # CPU (a single compile can be heavy). Excess hot functions stay interpreted until a slot frees.
-  @max_inflight_compiles 2
-
   def compile_one_async(mod, gfidx) do
-    ctr = inflight_counter()
-
-    if :atomics.add_get(ctr, 1, 1) <= @max_inflight_compiles do
-      Task.start(fn ->
-        try do
-          compile_one(mod, gfidx)
-        after
-          :atomics.sub(ctr, 1, 1)
-        end
-      end)
-    else
-      :atomics.sub(ctr, 1, 1)
-    end
-
-    :ok
-  end
-
-  defp inflight_counter do
-    case :persistent_term.get({__MODULE__, :inflight}, nil) do
-      nil ->
-        ref = :atomics.new(1, signed: true)
-        :persistent_term.put({__MODULE__, :inflight}, ref)
-        ref
-
-      ref ->
-        ref
-    end
+    TinyLasers.Wasm.Transpile.AsyncCompiler.enqueue(mod, gfidx)
   end
 
   # Complexity ceiling: above this many (flattened) instructions a function's generated Erlang form is
@@ -544,6 +520,13 @@ defmodule TinyLasers.Wasm.Transpile do
       fidx when fidx >= ni -> [fidx]
       _ -> []
     end
+  end
+
+  @doc "Transitive closure of local function indices reachable from export `entry` (default `\"m\"`)."
+  def reachable_gfidxs(mod, entry \\ "m") do
+    ni = length(mod.imports)
+    roots = entry_fidx(mod, entry, ni)
+    reach(mod, ni, roots, MapSet.new()) |> MapSet.to_list() |> Enum.sort()
   end
 
   defp fn_arity(mod, ni, fidx), do: (function_body(mod, fidx, ni) |> elem(0))

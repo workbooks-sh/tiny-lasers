@@ -14,13 +14,15 @@
  *    param) AND have `__this` in env. Catches: nested-arrow `__this` not threaded (the "this is not defined"
  *    bug); param-default capture; any "env.N is not defined".
  *
- *  INV-LOOP-FRESH     — (HEURISTIC; over-reports) a per-iteration write `__env_<id>.name = …` inside a loop
- *    where `__env_<id>` is allocated only OUTSIDE the loop. This is the per-iteration body-const bug shape,
- *    BUT the output AST cannot distinguish a per-iteration block-scoped DECLARATION (bug) from a MUTATION of
- *    an outer `let` (correct — one shared cell IS the semantics). The SOUND version lives where binding
- *    provenance exists — closure_convert under `CC_INVARIANTS` asserts every captured `const`/`let` declared
- *    in a loop body is owned by a per-iteration loop env (decidable there via b.kind + b.declStmt). Use this
- *    heuristic as a cheap smoke signal; trust the construction-time assertion as the gate.
+ *  INV-LOOP-FRESH     — (HEURISTIC; over-reports → NON-BLOCKING WARNING) a per-iteration write
+ *    `__env_<id>.name = …` inside a loop where `__env_<id>` is allocated only OUTSIDE the loop. This is the
+ *    per-iteration body-const bug shape, BUT the output AST cannot distinguish a per-iteration block-scoped
+ *    DECLARATION (bug) from a MUTATION of an outer `let` (correct — one shared cell IS the semantics). The
+ *    SOUND version lives where binding provenance exists — closure_convert under `CC_INVARIANTS` asserts
+ *    every captured `const`/`let` declared in a loop body is owned by a per-iteration loop env (decidable
+ *    there via b.kind + b.declStmt) and THROWS at transform time. This heuristic is surfaced as a WARNING
+ *    only (never blocks compilation) — blocking it false-positives correct programs (e.g. marked 4.3.0,
+ *    byte-identical to node). Trust the construction-time assertion as the gate.
  *
  * Usage: node cc_invariants.cjs <file.js>   → prints violations, exit 1 if any.
  *        require('./cc_invariants').check(src) → { ok, violations: [{inv, where, detail}] }
@@ -91,12 +93,37 @@ function boxParts(obj) {
 // `this`/`__this`, but env-id refs are fine to gather across all nested scopes since they'd be rebound).
 function refs(fnBody) {
   const envIds = new Set(); let usesThis = false;
-  (function w(n, lexical) {
+  // Collect `__env_<id>` that are LOCALLY allocated inside a nested arrow (`const __env_<id> = {}` /
+  // `var __env_<id> = {}` at the arrow's top level). A nested arrow is its own scope: its local env alloc
+  // is NOT a free ref of the enclosing fn, so `refs` must not collect it (else INV-CAPTURE-BOUND fires as a
+  // false positive — the enclosing fn's prelude can't bind an env that only exists inside the arrow). We
+  // still descend into the arrow for lexical `__this` and for ANCESTOR `__env_<id>` refs (reads of envs the
+  // enclosing fn genuinely must bind); only the arrow's OWN allocs are excluded.
+  function localAllocsInArrow(arrowBody) {
+    const loc = new Set();
+    (function w(n){
+      if (!n || typeof n !== 'object') return;
+      if (Array.isArray(n)) { for (const c of n) w(c); return; }
+      if (typeof n.type !== 'string') return;
+      if (n.type === 'VariableDeclaration') {
+        for (const d of n.declarations) {
+          if (d.id && d.id.type === 'Identifier' && /^__env_\d+$/.test(d.id.name) &&
+              d.init && d.init.type === 'ObjectExpression') loc.add(d.id.name);
+        }
+      }
+      // don't descend into nested fns/boxes inside the arrow — only its own top-level allocs
+      if (n.type === 'FunctionExpression' || n.type === 'FunctionDeclaration' ||
+          n.type === 'ArrowFunctionExpression' || objHasClo(n)) return;
+      for (const k of Object.keys(n)) { if (k === 'type' || k[0] === '_') continue; w(n[k]); }
+    })(arrowBody);
+    return loc;
+  }
+  function w(n, lexical, skipEnv) {
     if (!n || typeof n !== 'object') return;
-    if (Array.isArray(n)) { for (const c of n) w(c, lexical); return; }
+    if (Array.isArray(n)) { for (const c of n) w(c, lexical, skipEnv); return; }
     if (typeof n.type !== 'string') return;
     if (n.type === 'Identifier') {
-      if (/^__env_\d+$/.test(n.name)) envIds.add(n.name);
+      if (/^__env_\d+$/.test(n.name) && !skipEnv.has(n.name)) envIds.add(n.name);
       if (n.name === '__this' && lexical) usesThis = true;
       return;
     }
@@ -108,17 +135,27 @@ function refs(fnBody) {
         if (p.type !== 'Property') continue;
         const kn = p.key && (p.key.name || p.key.value);
         if (kn === 'fn') continue;
-        w(p.value, lexical);
+        w(p.value, lexical, skipEnv);
       }
       return;
     }
     // A nested non-box function (helper / pool accessor) is its own scope too — skip its body.
     if (n.type === 'FunctionExpression' || n.type === 'FunctionDeclaration') return;
+    // A nested ARROW is its own scope for `__env_<id>` (its local allocs are NOT free vars here), but it
+    // keeps LEXICAL `this`, so descend for `__this` and for ancestor `__env_<id>` refs — excluding the
+    // arrow's own locally-allocated env ids.
+    if (n.type === 'ArrowFunctionExpression') {
+      const loc = localAllocsInArrow(n.body);
+      const merged = new Set([...skipEnv, ...loc]);
+      w(n.body, lexical, merged);
+      return;
+    }
     for (const k of Object.keys(n)) {
       if (k === 'type' || k[0] === '_') continue;
-      w(n[k], lexical); // arrows keep lexical `this`
+      w(n[k], lexical, skipEnv); // arrows keep lexical `this`
     }
-  })(fnBody, true);
+  }
+  w(fnBody, true, new Set());
   return { envIds, usesThis };
 }
 
@@ -148,6 +185,14 @@ function preludeBinds(fnNode) {
 function check(src) {
   const ast = parse(src);
   const violations = [];
+  // WARNINGS: non-blocking signals. INV-LOOP-FRESH lives here because the output AST CANNOT distinguish a
+  // per-iteration block-scoped DECLARATION (real bug) from a MUTATION of an outer `let` (correct JS — one
+  // shared cell IS the semantics). The SOUND, decidable version is the construction-time assertion in
+  // closure_convert.cjs (CC_INVARIANTS), which uses binding provenance (b.kind + b.declStmt) and fires
+  // during the transform. This heuristic OVER-REPORTS (e.g. marked's correct shared-`let`-in-loop-closure
+  // pattern, which is byte-identical to node), so it must NOT block compilation — surface it as a warning
+  // and trust the construction-time gate for the real bug class.
+  const warnings = [];
 
   // ── INV-CAPTURE-BOUND ──
   walk(ast, (node) => {
@@ -176,9 +221,11 @@ function check(src) {
   });
 
   // ── INV-LOOP-FRESH ──
-  // Map each `__env_<id>` to the set of loop-depths at which it is ALLOCATED (`var __env_<id> = {…}` /
-  // `__env_<id> = {…}`), per function. Then find closure boxes created inside a loop (loopDepth>0) that
-  // capture (via env literal `eK: __env_K`) an env whose every allocation sits at loopDepth 0 → not fresh.
+  // The real last-value-wins bug: a closure BOX created INSIDE a loop captures an env `__env_N` (via env
+  // literal `eN: __env_N`) that is ALLOCATED ONLY OUTSIDE any loop. Each iteration's box then shares one
+  // cell, so every closure observes the final value. The earlier "per-iteration write" heuristic over-reported
+  // function-level envs that are written inside a loop but never captured by a loop-created closure (e.g. a
+  // shared accumulator correctly hoisted). This precise form fires ONLY when such a box actually exists.
   const allocDepths = new Map(); // envId -> Set(depth)
   walk(ast, (node, _parent, loopDepth) => {
     let id = null, isObjInit = false;
@@ -195,23 +242,40 @@ function check(src) {
       allocDepths.get(id).add(loopDepth);
     }
   });
-  // The precise violation is a PER-ITERATION property write into a SHARED env: an assignment
-  // `__env_N.prop = …` that executes INSIDE a loop body where `__env_N` is allocated only OUTSIDE any loop.
-  // That puts each iteration's value into one cell every closure shares → last-value-wins. (Capturing a
-  // function-level env inside a loop is FINE as long as it's only WRITTEN outside the loop — e.g. a hoisted
-  // `__env_1.obj = param` shared correctly across iterations; that must NOT be flagged.)
+  // Find box env literals built inside a loop and check each captured env's alloc depths.
+  // Also map per-iteration WRITES into each env (a write `__env_N.prop = …` at loopDepth>0). The real
+  // last-value-wins bug requires BOTH: a loop-created box captures `__env_N` AND `__env_N` is per-iteration
+  // written inside a loop AND `__env_N` is allocated only outside any loop. Capturing a function-level env
+  // that is only set up OUTSIDE the loop is fine (every closure correctly sees the same state).
+  const loopWrites = new Set(); // envIds with at least one in-loop `.prop = …` write
   walk(ast, (node, _parent, loopDepth) => {
     if (loopDepth === 0) return;
     if (node.type !== 'AssignmentExpression' || node.operator !== '=') return;
     const lhs = node.left;
     if (!lhs || lhs.type !== 'MemberExpression' || lhs.computed) return;
-    if (!lhs.object || lhs.object.type !== 'Identifier' || !/^__env_\d+$/.test(lhs.object.name)) return;
-    const env = lhs.object.name;
-    const depths = allocDepths.get(env);
-    if (depths && depths.size > 0 && ![...depths].some(d => d > 0)) {
-      violations.push({ inv: 'INV-LOOP-FRESH', where: env,
-        detail: `per-iteration write \`${env}.${lhs.property.name || '?'} = …\` executes inside a loop, but ` +
-                `${env} is allocated only outside any loop → all iterations share one cell (capture not fresh)` });
+    if (lhs.object && lhs.object.type === 'Identifier' && /^__env_\d+$/.test(lhs.object.name))
+      loopWrites.add(lhs.object.name);
+  });
+  walk(ast, (node, _parent, loopDepth) => {
+    if (loopDepth === 0) return;
+    if (!objHasClo(node)) return;
+    const { envKeys, fn } = boxParts(node);
+    if (!fn || envKeys == null) return;
+    for (const key of envKeys) {
+      // env literal keys are `e<id>` (captured scope id) or `__this`.
+      if (key === '__this' || !key.startsWith('e')) continue;
+      const env = '__env_' + key.slice(1);
+      const depths = allocDepths.get(env);
+      // only flag if this env is allocated ONLY outside any loop AND is per-iteration written inside a loop.
+      if (loopWrites.has(env) && depths && depths.size > 0 && ![...depths].some(d => d > 0)) {
+        // WARNING, not a violation — see the `warnings` doc above. The output AST can't tell a per-iteration
+        // declaration (bug) from an outer-`let` mutation (correct); the sound CC_INVARIANTS check in
+        // closure_convert.cjs is the real gate. Blocking here false-positives correct programs (e.g. marked).
+        warnings.push({ inv: 'INV-LOOP-FRESH', where: env,
+          detail: `a closure box created inside a loop captures ${env}, but ${env} is allocated only outside ` +
+                  "any loop and is per-iteration written inside a loop → every iteration's closure shares one " +
+                  "cell (capture not fresh)" });
+      }
     }
   });
 
@@ -231,9 +295,13 @@ function check(src) {
   const boxedFns = new Set();
   walk(ast, (node) => { if (objHasClo(node)) { const { fn } = boxParts(node); if (fn) boxedFns.add(fn); } });
 
-  // collect declarations per function scope, with loop-body marking
+  // collect declarations per function scope, with loop-body marking. Also track CLASS-declared names: a
+  // native fn capturing a class CONSTRUCTOR from an enclosing scope is fine in Porffor (classes are hoisted
+  // as wasm globals / native class refs resolve across scopes), so those captures must NOT be flagged — the
+  // NO-NATIVE-CAPTURE check is about Porffor's broken native closures for ORDINARY bindings, not class refs.
   function declaredNames(fnNode) {
     const names = new Set();
+    const classNames = new Set();
     const body = fnNode.type === 'Program' ? fnNode.body : (fnNode.body && fnNode.body.type === 'BlockStatement' ? fnNode.body.body : [fnNode.body]);
     if (fnNode.params) for (const p of fnNode.params) collectPatternNames(p, names);
     (function w(n) {
@@ -243,11 +311,11 @@ function check(src) {
       if (isFunc(n) && n !== fnNode) { if (n.id && n.id.name) names.add(n.id.name); return; } // nested fn name only
       if (n.type === 'VariableDeclarator' && n.id) collectPatternNames(n.id, names);
       if (n.type === 'FunctionDeclaration' && n.id) names.add(n.id.name);
-      if (n.type === 'ClassDeclaration' && n.id) names.add(n.id.name);
+      if (n.type === 'ClassDeclaration' && n.id) { names.add(n.id.name); classNames.add(n.id.name); }
       if (n.type === 'CatchClause' && n.param) collectPatternNames(n.param, names);
       for (const k of Object.keys(n)) { if (k === 'type' || k[0] === '_') continue; w(n[k]); }
     })({ type: 'Block', body });
-    return names;
+    return { names, classNames };
   }
   function collectPatternNames(p, out) {
     if (!p) return;
@@ -265,8 +333,8 @@ function check(src) {
     if (typeof node.type !== 'string') return;
     const isScope = isFunc(node) || node.type === 'Program';
     if (isScope) {
-      const myNames = declaredNames(node);
-      const newChain = [...chain, { node, names: myNames, isProgram: node.type === 'Program' }];
+      const { names: myNames, classNames: myClassNames } = declaredNames(node);
+      const newChain = [...chain, { node, names: myNames, classNames: myClassNames, isProgram: node.type === 'Program' }];
       if (isFunc(node) && !boxedFns.has(node)) {
         // gather identifiers referenced in this fn's body (not descending into nested fns)
         const free = new Set();
@@ -288,6 +356,8 @@ function check(src) {
           for (let i = chain.length - 1; i >= 0; i--) {
             const sc = chain[i];
             if (!sc.names.has(v)) continue;
+            // A class CONSTRUCTOR captured natively is fine (Porffor resolves class refs across scopes); skip.
+            if (sc.classNames && sc.classNames.has(v)) break; // resolved as class ref = ok
             if (!sc.isProgram) {
               violations.push({ inv: 'INV-NO-NATIVE-CAPTURE', where: (node.id && node.id.name) || '<anon fn>',
                 detail: `native (unboxed) function captures \`${v}\` from an enclosing function scope — Porffor ` +
@@ -304,16 +374,20 @@ function check(src) {
   }
   fnScopes(ast, []);
 
-  // de-dup
+  // de-dup (violations block; warnings surface but never block — see `warnings` doc in check()).
   const seen = new Set(); const uniq = [];
   for (const v of violations) { const k = v.inv + '|' + v.where + '|' + v.detail; if (!seen.has(k)) { seen.add(k); uniq.push(v); } }
-  return { ok: uniq.length === 0, violations: uniq };
+  const wseen = new Set(); const wuniq = [];
+  for (const w of warnings) { const k = w.inv + '|' + w.where + '|' + w.detail; if (!wseen.has(k)) { wseen.add(k); wuniq.push(w); } }
+  return { ok: uniq.length === 0, violations: uniq, warnings: wuniq };
 }
 
 function run() {
   const src = require('fs').readFileSync(process.argv[2], 'utf8');
   let res;
   try { res = check(src); } catch (e) { console.error('cc_invariants: ' + e.message); process.exit(2); }
+  for (const w of res.warnings) console.error(`[warn ${w.inv}] ${w.where}: ${w.detail}`);
+  if (res.warnings.length) console.error(`cc_invariants: ${res.warnings.length} warning(s) (non-blocking — trust CC_INVARIANTS construction-time gate)`);
   if (res.ok) { console.log('cc_invariants: OK (no violations)'); return; }
   for (const v of res.violations) console.error(`[${v.inv}] ${v.where}: ${v.detail}`);
   console.error(`cc_invariants: ${res.violations.length} violation(s)`);

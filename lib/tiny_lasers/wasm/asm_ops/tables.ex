@@ -21,9 +21,15 @@ defmodule TinyLasers.Wasm.AsmOps.Tables do
       `:indirect_call_type_mismatch` traps, same `call_fn` dispatch on the shared `:tl_rt`). That is
       the cleanest bit-identical path — one seam, the interpreter's exact dispatch + trap behaviour.
 
-      Scope: i32-only params/results, ≤1 result (matches the direct-`call` step's gate).
+      Scope: scalar (i32/i64/f32/f64) params/results, ≤ @max_block_results results — a MULTI-result
+      `call_indirect` (Porffor's `[f64, i32]` value pair ⇒ nr=2) returns a TOP-FIRST list from
+      `call_indirect_dyn/3`, unpacked onto the operand slots via the SAME `TranspileAsm.unpack_result_list`
+      the direct `{:call, …}` step uses — bit-identical to the interpreter's `push_results/3` boundary.
   """
   import TinyLasers.Wasm.AsmCtx
+
+  @max_block_results 16
+  @scalar [124, 125, 126, 127]
 
   @doc "Op-group handler. `{:ok, s}` if handled, `:unsupported` otherwise."
   def handle({:br_table, labels, default}, s), do: br_table(labels, default, s)
@@ -167,9 +173,10 @@ defmodule TinyLasers.Wasm.AsmOps.Tables do
     nr = length(results)
 
     cond do
-      # any scalar (i32/i64/f32/f64) args/result, ≤1 result — values cross call_indirect_dyn as Erlang
-      # terms regardless of wasm type, so only the arity matters (matches the relaxed direct-call gate).
-      not (Enum.all?(params, &(&1 in [124, 125, 126, 127])) and Enum.all?(results, &(&1 in [124, 125, 126, 127])) and nr <= 1) ->
+      # any scalar (i32/i64/f32/f64) args/result — values cross call_indirect_dyn as Erlang terms
+      # regardless of wasm type, so only the arity matters (matches the relaxed direct-call gate).
+      # nr ≤ @max_block_results: a multi-result callee returns a top-first list, unpacked like {:call, …}.
+      not (Enum.all?(params, &(&1 in @scalar)) and Enum.all?(results, &(&1 in @scalar)) and nr <= @max_block_results) ->
         :unsupported
 
       s.d < np + 1 ->
@@ -194,13 +201,23 @@ defmodule TinyLasers.Wasm.AsmOps.Tables do
       {:call_ext, 3, {:extfunc, tinylasers(), :call_indirect_dyn, 3}}
     ]
 
-    # pop the index AND the np args
+    # pop the index AND the np args; results (if any) land at slot s2.d upward.
     s2 = %{s | d: s.d - 1 - np}
+    s2 = emit(s2, build ++ call)
 
-    if nr == 1 do
-      {:ok, push(emit(s2, build ++ call ++ [{:move, {:x, 0}, yd(s2, s2.d)}]))}
-    else
-      {:ok, emit(s2, build ++ call)}
+    cond do
+      nr == 0 ->
+        {:ok, s2}
+
+      nr == 1 ->
+        {:ok, push(emit(s2, [{:move, {:x, 0}, yd(s2, s2.d)}]))}
+
+      true ->
+        # multi-result: call_indirect_dyn returned a TOP-FIRST list in x0 — unpack onto slots
+        # [s2.d, s2.d+nr) via the shared unpacker (identical to the direct {:call, …} step), bump depth.
+        base = s2.d
+        s3 = TinyLasers.Wasm.TranspileAsm.unpack_result_list(s2, nr, base)
+        {:ok, %{s3 | d: base + nr, maxd: max(s3.maxd, base + nr)}}
     end
   end
 
