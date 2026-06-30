@@ -573,6 +573,27 @@ return`;
 
 export const __Porffor_object_get = (_obj: any, key: any): any => {
   if (__Porffor_object_isProxy(_obj)) return __Porffor_proxy_get(_obj, key);
+
+  // KEYSTONE (host-resident objects, externref ABI): a TYPES.object value whose i32 handle has the host tag
+  // bit (sign bit) lives in the host table, not linear memory — route the read to ho_get_value/ho_get_type
+  // instead of the linear-memory scan. This is the single chokepoint that makes EVERY builtin reading an
+  // object (assign/defineProperties/JSON/enumeration) host-safe without per-call-site materialize wraps.
+  if (Porffor.wasm`local.get ${_obj+1}` == Porffor.TYPES.object) {
+    const handle: i32 = Porffor.wasm`local.get ${_obj}
+i32.trunc_sat_f64_u`;
+    if (handle < 0) {
+      const hhash: i32 = __Porffor_object_hash(key);
+      Porffor.wasm`
+local.get ${handle}
+local.get ${hhash}
+call ho_get_value
+local.get ${handle}
+local.get ${hhash}
+call ho_get_type
+return`;
+    }
+  }
+
   let obj: any = _obj;
   const trueType: i32 = Porffor.wasm`local.get ${obj+1}`;
   if (trueType != Porffor.TYPES.object) obj = __Porffor_object_underlying(obj);

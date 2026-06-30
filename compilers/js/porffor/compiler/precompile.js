@@ -8,6 +8,23 @@ createImport('printChar', 1, 0);
 createImport('time', 0, 1);
 createImport('timeOrigin', 0, 1);
 
+// Host-resident object imports (externref ABI) — registered here too so a precompiled builtin can call
+// them by NAME (e.g. __Porffor_object_get routing a host-tagged handle to ho_get_value). precompile records
+// builtin→import calls by name; codegen relocates them to the real indices at user-compile time, so the
+// names (not the precompile-time indices) are what must match wrap.js. Param/return shapes mirror wrap.js.
+{
+  const f64 = Valtype.f64, i32 = Valtype.i32;
+  createImport('ho_new', [], [ i32 ]);
+  createImport('ho_set', [ i32, i32, f64, i32 ], []);
+  createImport('ho_get_value', [ i32, i32 ], [ f64 ]);
+  createImport('ho_get_type', [ i32, i32 ], [ i32 ]);
+  createImport('ho_has', [ i32, i32 ], [ i32 ]);
+  createImport('ho_delete', [ i32, i32 ], [ i32 ]);
+  createImport('ho_regkey', [ i32, i32, i32, i32 ], []);
+  createImport('ho_count', [ i32 ], [ i32 ]);
+  createImport('ho_key_at', [ i32, i32, i32 ], [ i32 ]);
+}
+
 import process from 'node:process';
 globalThis.process = process;
 
