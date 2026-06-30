@@ -95,6 +95,10 @@ defmodule TinyLasers.HostObjectsCodegenTest do
     {"hasOwnProperty after write", "function f(){ var o={x:1}; o.y=2; return (o.hasOwnProperty('y')?1:0) + (o.hasOwnProperty('q')?1:0); } f();"},
     {"Object.assign into fresh", "function f(){ var o={a:1,b:2}; var t=Object.assign({}, o); return t.a+t.b; } f();"},
     {"Object.assign merge", "function f(){ var a={x:1}; var b={y:2}; var t=Object.assign({}, a, b); return t.x*10+t.y; } f();"},
+    # Object.assign with a SPREAD of host-object sources: the call-site materialize wrap can't reach a
+    # SpreadElement, so __Object_assign reads host sources itself via __Porffor_object_fromHost.
+    {"Object.assign spread sources", "function f(){ var a={x:1}; var b={y:2}; var arr=[a,b]; var t=Object.assign({}, ...arr); return t.x*10+t.y; } f();"},
+    {"Object.assign spread single", "function f(){ var a={x:3,y:4}; var arr=[a]; var t=Object.assign({}, ...arr); return t.x+t.y; } f();"},
     {"Object.create proto read", "function f(){ var p={greet:7}; var o=Object.create(p); return o.greet; } f();"},
     {"getOwnPropertyNames length", "function f(){ var o={a:1,b:2,c:3}; return Object.getOwnPropertyNames(o).length; } f();"},
     # Phase C reflection: Reflect.* on host objects

@@ -216,13 +216,69 @@ export const __Porffor_object_instanceof = (obj: any, constr: any, checkProto: a
 };
 
 
+export const __Porffor_object_fromHost = (handle: i32): any => {
+  const out: object = {};
+  const n: i32 = Porffor.wasm`local.get ${handle}
+call ho_count`;
+  if (n > 0) {
+    const buf: i32 = Porffor.malloc(16376);
+    let cur: i32 = buf;
+    let i: i32 = 0;
+    while (i < n) {
+      Porffor.wasm`
+local.get ${handle}
+local.get ${i}
+local.get ${cur}
+call ho_key_at
+drop`;
+      let key: any = 0;
+      Porffor.wasm`
+local.get ${cur}
+f64.convert_i32_u
+local.set ${key}
+i32.const 195
+local.set ${key+1}`;
+      const h: i32 = __Porffor_object_hash(key);
+      let val: any = 0;
+      Porffor.wasm`
+local.get ${handle}
+local.get ${h}
+call ho_get_value
+local.set ${val}
+local.get ${handle}
+local.get ${h}
+call ho_get_type
+local.set ${val+1}`;
+      __Porffor_object_set(out, key, val);
+      const len: i32 = Porffor.wasm.i32.load(cur, 0, 0);
+      cur = (cur + 4 + len + 3) & -4;
+      if (cur >= buf + 16368) cur = buf;
+      i += 1;
+    }
+  }
+  return out;
+};
+
 export const __Object_assign = (target: any, ...sources: any[]): any => {
   if (target == null) throw new TypeError('Argument is nullish, expected object');
 
   for (let src of sources) {
     if (src == null) continue;
 
-    
+    // host-resident source (externref handle): materialize a fresh in-memory copy so the scan reads valid
+    // memory. Explicit signed-LT — Porffor compiles `i32 < 0` as UNSIGNED, which never sees the tag bit.
+    let __isHost: i32 = 0;
+    Porffor.wasm`local.get ${src}
+i32.trunc_sat_f64_u
+i32.const 0
+i32.lt_s
+local.set ${__isHost}`;
+    if (__isHost) {
+      const sh: i32 = Porffor.wasm`local.get ${src}
+i32.trunc_sat_f64_u`;
+      src = __Porffor_object_fromHost(sh);
+    }
+
     src = __Porffor_object_underlying(src);
     if (Porffor.type(src) == Porffor.TYPES.object) {
       let ptr: i32 = Porffor.wasm`local.get ${src}` + 8;
