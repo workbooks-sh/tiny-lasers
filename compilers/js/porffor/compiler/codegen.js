@@ -3176,54 +3176,92 @@ const knownValue = (scope, node) => {
 };
 
 const brTable = (input, bc, returns) => {
+  // `bc` is an array of [key, value] pairs from `typeSwitch` (`Object.entries` on the case object).
+  // Keys: numeric type-tag, an ARRAY of tags (shared body), or `'default'`. Values: wasm arrays or
+  // `() => wasm` closures. Case closures are NOT idempotent — they allocate locals and mutate codegen
+  // state — so they must run at most once, deferred via `[null, fn]` until the end-of-codegen callback
+  // pass (same as the if-chain path). Calling them all eagerly here was the root cause of malformed
+  // `--typeswitch-brtable` wasm (`wasm-tools validate`: "expected f64 but nothing on stack").
+  const bodyOf = (v) => (typeof v === 'function' ? v() : v);
+  const synthZero = () => (returns !== Blocktype.void ? [ number(0, returns) ] : []);
+
+  let defaultEntry = null;
+  let hasDefault = false;
+  const numCases = []; // { types: number[], bodyThunk }
+
+  for (const entry of bc) {
+    if (entry[0] === 'default') {
+      if (!hasDefault) { defaultEntry = entry; hasDefault = true; }
+      continue;
+    }
+    const types = Array.isArray(entry[0]) ? entry[0].slice() : [ entry[0] ];
+    // Match the if-chain gate: omit cases for type tags the function never uses — they fall through to
+    // default at runtime; emitting them eagerly produced empty/conflicting bodies.
+    if (!globalThis.precompile && !types.some(t => usedTypes.has(t))) continue;
+    numCases.push({ types, bodyThunk: () => bodyOf(entry[1]) });
+  }
+  numCases.sort((a, b) => Math.min(...a.types) - Math.min(...b.types));
+
+  const defaultBodyThunk = hasDefault ? () => bodyOf(defaultEntry[1]) : synthZero;
+
+  // Build ordered case thunks: slot 0 is always the default / fallthrough (synthesized push-0 when absent).
+  let orderedThunks;
+  if (numCases.length === 0) {
+    orderedThunks = [ defaultBodyThunk ];
+  } else if (hasDefault) {
+    orderedThunks = [ defaultBodyThunk, ...numCases.map(c => c.bodyThunk) ];
+  } else if (numCases.length === 1) {
+    orderedThunks = [ numCases[0].bodyThunk ];
+  } else {
+    orderedThunks = [ synthZero, ...numCases.map(c => c.bodyThunk) ];
+  }
+
+  const n = orderedThunks.length;
+
+  if (n === 1) {
+    return [ [ null, orderedThunks[0] ] ];
+  }
+
+  if (n === 2) {
+    const trueCase = numCases[0];
+    const trueThunk = trueCase.bodyThunk;
+    const falseThunk = defaultBodyThunk;
+    return [ [ null, () => {
+      const cond = [];
+      for (let j = 0; j < trueCase.types.length; j++) {
+        cond.push(...input, number(trueCase.types[j], Valtype.i32), [ Opcodes.i32_eq ]);
+        if (j > 0) cond.push([ Opcodes.i32_or ]);
+      }
+      return [
+        ...cond,
+        [ Opcodes.if, returns ],
+        ...trueThunk(),
+        [ Opcodes.else ],
+        ...falseThunk(),
+        [ Opcodes.end ]
+      ];
+    } ] ];
+  }
+
+  // n >= 3: labeled-switch via br_table. DEFAULT at label 0 (br_table default + gap indices); typed
+  // cases at labels 1..n-1. Bodies are deferred — expanded once during the end-of-codegen callback pass.
+  const labelOf = new Map();
+  labelOf.set('default', 0);
+  numCases.forEach((c, k) => { for (const t of c.types) labelOf.set(t, k + 1); });
+
   const out = [];
-  const keys = Object.keys(bc);
-  const count = keys.length;
-
-  if (count === 1) {
-    // return [
-    //   ...input,
-    //   ...bc[keys[0]]
-    // ];
-    return bc[keys[0]];
-  }
-
-  if (count === 2) {
-    // just use if else
-    const other = keys.find(x => x !== 'default');
-    return [
-      ...input,
-      number(other, Valtype.i32),
-      [ Opcodes.i32_eq ],
-      [ Opcodes.if, returns ],
-      ...bc[other],
-      [ Opcodes.else ],
-      ...bc.default,
-      [ Opcodes.end ]
-    ];
-  }
-
-  for (let i = 0; i < count; i++) {
+  for (let i = 0; i < n; i++) {
     if (i === 0) out.push([ Opcodes.block, returns ]);
       else out.push([ Opcodes.block, Blocktype.void ]);
   }
 
-  const nums = keys.filter(x => +x >= 0);
-  const offset = Math.min(...nums);
-  const max = Math.max(...nums);
+  const allTags = numCases.flatMap(c => c.types);
+  const offset = allTags.length ? Math.min(...allTags) : 0;
+  const max = allTags.length ? Math.max(...allTags) : -1;
 
   const table = [];
-  let br = 0;
-
   for (let i = offset; i <= max; i++) {
-    // if branch for this num, go to that block
-    if (bc[i]) {
-      table.push(br++);
-      continue;
-    }
-
-    // else default
-    table.push(0);
+    table.push(labelOf.has(i) ? labelOf.get(i) : 0);
   }
 
   out.push(
@@ -3236,22 +3274,20 @@ const brTable = (input, bc, returns) => {
     [ Opcodes.br_table, ...encodeVector(table), 0 ]
   );
 
-  // sort the wrong way and then reverse
-  // so strings ('default') are at the start before any numbers
-  const orderedBc = keys.sort((a, b) => b - a).reverse();
-
-  br = count - 1;
-  for (const x of orderedBc) {
+  let br = n - 1;
+  for (const bodyThunk of orderedThunks) {
+    const brVal = br;
     out.push(
       [ Opcodes.end ],
-      ...bc[x],
-      ...(br === 0 ? [] : [ [ Opcodes.br, br ] ])
+      [ null, () => [
+        ...bodyThunk(),
+        ...(brVal === 0 ? [] : [ [ Opcodes.br, brVal ] ])
+      ] ]
     );
     br--;
   }
 
   out.push([ Opcodes.end ]);
-
   return out;
 };
 
