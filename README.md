@@ -1,4 +1,12 @@
+<p align="center">
+  <img src="assets/laser.gif" width="72" alt="pew pew" />
+  <br />
+  <em><sub>a "pew-pew" type sandbox</sub></em>
+</p>
+
 # tiny-lasers
+
+**Run untrusted code from any language, safely, on the BEAM — without ever letting it touch the real CPU.**
 
 Isolated, multi-language execution + build sandbox on the BEAM. Home for the
 "confine on the BEAM" architecture work (migrated here carefully, after research).
@@ -8,35 +16,51 @@ Kept as a **subtree** inside the `workbooks` monorepo; mirrors to
 
 ---
 
+## Why does this exist?
+
+You want to run other people's code — JS, Rust, Go, C, C++, even whole `npm install`
+build pipelines — and you want it to behave *exactly* like it would natively. But you
+also can't trust a line of it. So you give it a playground it can't escape: every "pew"
+of computation happens inside a sandbox, never on the host.
+
+Two rules make that real, and everything below is just the consequence of taking them
+seriously:
+
+1. **Many languages, behaving natively.** Not just JS. Rust/Go/C/C++ are in scope — that
+   was the original pull toward WebAssembly, since every one of them has a WASM target.
+2. **Nothing untrusted runs on the real CPU.** No NIFs, no native execution, ever.
+   Isolation comes from the BEAM (per-process) + the execution sandbox.
+
+Rule 2 is the load-bearing one. It means **untrusted execution must be either BEAM
+bytecode or WASM-on-Washy** — there is no third substrate. Keep that in your pocket; it
+explains every design choice that follows.
+
 ## The goal
 
 Run **untrusted code in many languages** (JS, Rust, Go, C, C++) — including a real
 build pipeline (the npm/Rollup supply chain, native toolchains) — **isolated,
 byte-identical to native**, denser than containers/microVMs.
 
-## The two hard constraints (these drive every decision)
-
-1. **Multi-language native.** Not just JS. Rust/Go/C/C++ are in scope — that was the
-   original pull toward WebAssembly (every one of them has a WASM target).
-2. **No NIFs / no native execution.** Untrusted code may **never** run on the real host
-   CPU. Isolation comes from the BEAM (per-process) + the execution sandbox.
-
-Constraint 2 is the load-bearing one. It means: **untrusted execution must be either
-BEAM bytecode or WASM-on-Washy.** There is no third substrate.
-
 ## The decisive logic
 
-> To run a **native binary** under "no native execution," you must **emulate a CPU**, and
+Here's the bit that surprises people. What happens when the code is a **prebuilt native
+binary** — no source, can't recompile?
+
+> To run a native binary under "no native execution," you must **emulate a CPU**, and
 > that emulator must itself run as **WASM-on-Washy**. Every *faster* option
 > (WSL1, User-Mode-Linux, gVisor, an emulator-as-native-NIF) runs native code on the host
 > CPU — forbidden by constraint 2. So the slowness of CPU emulation is **irreducible**:
 > it is the cost of emulating a CPU *because you are not allowed to use the real one*.
 
+In other words: the slowness isn't a bug to optimize away, it's the price of admission.
 This is why "is blink it?" has a precise answer: a CPU-emulator-compiled-to-WASM is the
 **only possible shape** for the run-a-prebuilt-native-binary lane. blink is one candidate
 engine for that lane — not the architecture.
 
 ## "Linux emulation" is two different things — don't conflate them
+
+People say "Linux emulation" to mean two very different amounts of work. They cost wildly
+different things:
 
 | | (i) Linux **ABI** on WASM | (ii) Linux **machine** on WASM |
 |---|---|---|
@@ -52,6 +76,9 @@ closed binaries, npm native addons we didn't compile, tools with no usable sourc
 
 ## The architecture: three lanes by speed
 
+The trick is not to pick one substrate, but to route each workload to the cheapest lane
+that can run it. Fastest first:
+
 1. **JS → BEAM capability gate** — *fastest, JS only.* No WASM at all. Native BEAM,
    confined by a handle-gate, free GC. (Spike proven: see status below.)
 2. **Recompile → WASM** against a fuller-POSIX layer in Washy (the **(i)** path) — *fast,
@@ -64,13 +91,15 @@ fallback for what can't be recompiled.
 
 ## Why an emulator-as-WASM is coherent (and a security upgrade)
 
-blink is explicitly **not** a security sandbox ("meant to run *trusted* binaries").
-Compiling it to WASM **neutralizes that weakness**: a blink-WASM module can only call the
-imports Washy grants it, so even a blink bug cannot escape Washy. The untrusted x86 guest
-is doubly contained (blink emulates it; Washy confines blink). **The trusted core is Washy
-+ the import layer, not blink.**
+There's a neat twist here. blink is explicitly **not** a security sandbox ("meant to run
+*trusted* binaries"). Compiling it to WASM **neutralizes that weakness**: a blink-WASM
+module can only call the imports Washy grants it, so even a blink bug cannot escape Washy.
+The untrusted x86 guest is doubly contained — blink emulates it; Washy confines blink.
+**The trusted core is Washy + the import layer, not blink.**
 
 ## Requirements for "Linux emulation done correctly" for us
+
+For lane 3 to count as "done correctly," an emulator has to clear all of these:
 
 1. Compiles to WASM/WASI and runs on Washy (no NIF).
 2. Emulates syscalls **internally**, so we redirect them via Washy imports:
