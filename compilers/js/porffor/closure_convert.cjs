@@ -843,7 +843,11 @@ function transform(src) {
         if (st.type==='VariableDeclaration' && !st._envInit && st._wasFuncDecl) {
           const nm = st._wasFuncDecl;
           if (names.has(nm) && isOwnedHere(nm, sid)) {
-            container[i] = { type:'ExpressionStatement', expression:{
+            // A CAPTURED boxed function declaration: its name lives in env, so `var z = <box>` becomes
+            // `__env_sid.z = <box>`. Keep the _wasFuncDecl marker so the hoisting pass moves it to scope top
+            // (a function declaration hoists; a use before the textual decl — bignumber's `__env.z.prototype=`
+            // before `function z(){}` — must see the bound function, not undefined).
+            container[i] = { type:'ExpressionStatement', _wasFuncDecl: nm, expression:{
               type:'AssignmentExpression', operator:'=',
               left:{type:'MemberExpression',computed:false,optional:false,
                 object:{type:'Identifier',name:'__env_'+sid},
@@ -914,6 +918,58 @@ function transform(src) {
     arr.unshift(envDecl, ...paramAssigns, ...funcDeclAssigns);
   }
   if (bail) return src;
+
+  // ── Function-declaration hoisting for BOXED inner functions ──
+  // A `function z(){}` that captured enclosing scope was rewritten by replaceFuncs into `var z = <box>` left
+  // at its ORIGINAL position. But a function declaration HOISTS to the top of its scope, so a use BEFORE the
+  // textual declaration must see the bound function — a plain `var` leaves it `undefined` until the line runs.
+  // (bignumber's clone(): `var ...,P=z.prototype={constructor:z,...}; ...; function z(){...}` reads z 300
+  // chars before its decl.) Move each `_wasFuncDecl` var to just after the leading env preludes — its box only
+  // references the `__env_N` OBJECT those create (the captured slots are read lazily when z is called), so this
+  // is safe and restores exactly the hoisting the plain (unboxed) path keeps.
+  const hoistBoxedFuncDecls = (arr) => {
+    if (!Array.isArray(arr)) return;
+    const hoisted = [];
+    for (let i = 0; i < arr.length; i++) {
+      const st = arr[i];
+      // Both forms of a boxed function declaration: `var z = <box>` (non-captured name) and
+      // `__env_sid.z = <box>` (captured name, an ExpressionStatement marked _wasFuncDecl above).
+      if (st && !st._envInit && st._wasFuncDecl &&
+          (st.type === 'VariableDeclaration' || st.type === 'ExpressionStatement')) {
+        hoisted.push(st);
+        arr.splice(i, 1);
+        i--;
+      }
+    }
+    if (!hoisted.length) return;
+    // Insert AFTER every leading env prelude, because the hoisted box references the __env_N objects those
+    // bind. The leading region (boxed fn) is: `const __env_N = {}` (owning, _envInit), param/funcdecl seeds
+    // `__env_N.x = <identifier>`, and `const __env_N = __env.eN` rebindings — in some order. A box must follow
+    // ALL of them (esp. the rebindings, which may sit AFTER the param seeds → the TDZ this skip prevents).
+    const startsEnv = (id) => id && id.type === 'Identifier' && id.name.startsWith('__env_');
+    const isEnvPrelude = (st) => {
+      if (!st) return false;
+      if (st._envInit) return true;
+      // const __env_N = ... (owning {} or rebinding __env.eN)
+      if (st.type === 'VariableDeclaration' && st.declarations.length > 0 &&
+          st.declarations.every((d) => startsEnv(d.id))) return true;
+      // __env_N.x = <Identifier> — a param/captured-funcdecl seed (bare-name RHS, no env dependency); a
+      // hoisted box assignment (object/box RHS, or _wasFuncDecl) is NOT this, so it won't be skipped over.
+      if (st.type === 'ExpressionStatement' && !st._wasFuncDecl && st.expression &&
+          st.expression.type === 'AssignmentExpression' &&
+          st.expression.left && st.expression.left.type === 'MemberExpression' &&
+          startsEnv(st.expression.left.object) &&
+          st.expression.right && st.expression.right.type === 'Identifier') return true;
+      return false;
+    };
+    let at = 0;
+    while (at < arr.length && isEnvPrelude(arr[at])) at++;
+    arr.splice(at, 0, ...hoisted);
+  };
+  for (const sm of scopeMeta.values()) {
+    const b = bodyArrayOf(sm.funcNode);
+    if (b) hoistBoxedFuncDecls(b);
+  }
 
   // ── Per-iteration for-let env seeding ──
   // At the TOP of every loop body: `var __env_L = { i: i, ... }` (fresh object each turn, seeded from the
@@ -1093,21 +1149,36 @@ function transform(src) {
       const assign = { type:'AssignmentExpression', operator:'=', left: ctId(), right: callee.object };
       const test = { type:'LogicalExpression', operator:'&&', left: assign,
         right:{ type:'MemberExpression', computed:false, object: ctId(), property:{ type:'Identifier', name:'__clo' } } };
-      const restArgs = node.arguments.slice(1); // drop thisArg (boxed closures don't use `this`)
-      let boxCall;
+      const thisArg = node.arguments[0];
+      const restArgs = node.arguments.slice(1); // drop thisArg (plain boxed closures don't use `this`)
+      // A METHOD box (tagged `__method`) takes the receiver as `__this` after env, so `.call(thisArg, …)`
+      // / `.apply(thisArg, […])` MUST thread thisArg into that slot — dropping it (the plain-box path) loses
+      // `this` and shifts every real arg by one (acorn's `update.call(this, prevType)` broke here: the parser
+      // method box got `prevType` as `__this` and lost its real arg). Branch on the tag at runtime.
+      let methodBoxCall, plainBoxCall;
       if (isApply) {
-        // box.fn.apply(undefined, [box.env].concat(argsArr ?? []))
         const argsArr = node.arguments[1] || { type:'ArrayExpression', elements: [] };
-        boxCall = { type:'CallExpression', optional:false, _skipWrap:true,
+        const argsArrSafe = { type:'LogicalExpression', operator:'||', left: argsArr, right:{ type:'ArrayExpression', elements: [] } };
+        const methodArr = { type:'CallExpression', optional:false, _skipWrap:true,
+          callee:{ type:'MemberExpression', computed:false, object:{ type:'ArrayExpression', elements:[ ctDot('env'), thisArg ] }, property:{ type:'Identifier', name:'concat' } },
+          arguments:[ argsArrSafe ] };
+        const plainArr = { type:'CallExpression', optional:false, _skipWrap:true,
+          callee:{ type:'MemberExpression', computed:false, object:{ type:'ArrayExpression', elements:[ ctDot('env') ] }, property:{ type:'Identifier', name:'concat' } },
+          arguments:[ argsArrSafe ] };
+        const applyCallee = { type:'MemberExpression', computed:false, object: ctDot('fn'), property:{ type:'Identifier', name:'apply' } };
+        methodBoxCall = { type:'CallExpression', optional:false, _skipWrap:true, callee: applyCallee,
+          arguments:[ { type:'Identifier', name:'undefined' }, methodArr ] };
+        plainBoxCall = { type:'CallExpression', optional:false, _skipWrap:true,
           callee:{ type:'MemberExpression', computed:false, object: ctDot('fn'), property:{ type:'Identifier', name:'apply' } },
-          arguments:[ { type:'Identifier', name:'undefined' },
-            { type:'CallExpression', optional:false, _skipWrap:true,
-              callee:{ type:'MemberExpression', computed:false, object:{ type:'ArrayExpression', elements:[ ctDot('env') ] }, property:{ type:'Identifier', name:'concat' } },
-              arguments:[ { type:'LogicalExpression', operator:'||', left: argsArr, right:{ type:'ArrayExpression', elements: [] } } ] } ] };
+          arguments:[ { type:'Identifier', name:'undefined' }, plainArr ] };
       } else {
-        boxCall = { type:'CallExpression', optional:false, _skipWrap:true,
+        methodBoxCall = { type:'CallExpression', optional:false, _skipWrap:true,
+          callee: ctDot('fn'), arguments:[ ctDot('env'), thisArg, ...restArgs ] };
+        plainBoxCall = { type:'CallExpression', optional:false, _skipWrap:true,
           callee: ctDot('fn'), arguments:[ ctDot('env'), ...restArgs ] };
       }
+      const boxCall = { type:'ConditionalExpression',
+        test: ctDot('__method'), consequent: methodBoxCall, alternate: plainBoxCall };
       const nativeCall = { type:'CallExpression', optional:false, _skipWrap:true,
         callee:{ type:'MemberExpression', computed:false, object: ctId(), property:{ type:'Identifier', name: callee.property.name } },
         arguments: node.arguments };
@@ -1553,6 +1624,7 @@ function transform(src) {
   // negated forms → `!__isFn(X)`), where __isFn also accepts boxes. Runs before helper injection so the
   // injected helpers (which test `typeof f === 'object'`) are untouched.
   let usesIsFn = false;
+  let usesIsFnHelper = false; // only the non-identifier path needs the __isFn helper (identifiers inline)
   const isTypeofFn = (n) => n && n.type === 'BinaryExpression' &&
     (n.operator === '===' || n.operator === '==' || n.operator === '!==' || n.operator === '!=') &&
     (() => {
@@ -1564,11 +1636,31 @@ function transform(src) {
   const mkIsFn = (n) => {
     const typof = (x) => x && x.type === 'UnaryExpression' && x.operator === 'typeof';
     const arg = typof(n.left) ? n.left.argument : n.right.argument;
-    const call = { type: 'CallExpression', optional: false,
-      callee: { type: 'Identifier', name: '__isFn' }, arguments: [ arg ] };
-    return (n.operator === '!==' || n.operator === '!=')
-      ? { type: 'UnaryExpression', operator: '!', prefix: true, argument: call }
-      : call;
+    const negated = (n.operator === '!==' || n.operator === '!=');
+    let expr;
+    if (arg.type === 'Identifier') {
+      // A BARE identifier may be an UNDEFINED GLOBAL (UMD: `typeof define`/`typeof module`). `__isFn(arg)`
+      // would evaluate arg as a call argument → ReferenceError; native `typeof` never throws on an undefined
+      // identifier. Inline a typeof-FIRST check so arg is only read as a value once typeof confirms it's an
+      // object:  typeof X === 'function' || (typeof X === 'object' && X !== null && X.__clo === 1)
+      const A = () => ({ type: 'Identifier', name: arg.name });
+      const tof = (lit) => ({ type: 'BinaryExpression', operator: '===',
+        left: { type: 'UnaryExpression', operator: 'typeof', prefix: true, argument: A() },
+        right: { type: 'Literal', value: lit } });
+      expr = { type: 'LogicalExpression', operator: '||', left: tof('function'),
+        right: { type: 'LogicalExpression', operator: '&&',
+          left: { type: 'LogicalExpression', operator: '&&', left: tof('object'),
+            right: { type: 'BinaryExpression', operator: '!==', left: A(), right: { type: 'Literal', value: null } } },
+          right: { type: 'BinaryExpression', operator: '===',
+            left: { type: 'MemberExpression', computed: false, optional: false, object: A(),
+              property: { type: 'Identifier', name: '__clo' } },
+            right: { type: 'Literal', value: 1 } } } };
+    } else {
+      usesIsFnHelper = true;
+      expr = { type: 'CallExpression', optional: false,
+        callee: { type: 'Identifier', name: '__isFn' }, arguments: [ arg ] };
+    }
+    return negated ? { type: 'UnaryExpression', operator: '!', prefix: true, argument: expr } : expr;
   };
   (function rewriteTypeofFn(node) {
     if (!node || typeof node !== 'object') return;
@@ -1583,7 +1675,7 @@ function transform(src) {
       else rewriteTypeofFn(v);
     }
   })(ast);
-  if (usesIsFn) helpers.push(
+  if (usesIsFnHelper) helpers.push(
     `function __isFn(x){ return typeof x === 'function' || (x != null && typeof x === 'object' && x.__clo === 1); }`);
 
   const helperAst = parse(helpers.join('\n'));
