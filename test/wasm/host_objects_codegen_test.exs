@@ -117,7 +117,14 @@ defmodule TinyLasers.HostObjectsCodegenTest do
     {"symbol not enumerated", "function f(){ var s=Symbol('h'); var o={a:1}; o[s]=2; var n=0; for(var k in o){n++;} return n; } f();"},
     {"accessor getter", "function f(){ var o={ get x(){ return 9; } }; return o.x; } f();"},
     {"accessor setter", "function f(){ var hit=0; var o={ set x(v){ hit=v; } }; o.x=5; return hit; } f();"},
-    {"accessor get+set", "function f(){ var o={ _v:0, get x(){return this._v;}, set x(v){this._v=v;} }; o.x=11; return o.x; } f();"}
+    {"accessor get+set", "function f(){ var o={ _v:0, get x(){return this._v;}, set x(v){this._v=v;} }; o.x=11; return o.x; } f();"},
+    # Phase F coherence: defineProperty descriptor literals are data-bag host-objectable, but the builtin reads
+    # them in-memory — the descriptor arg is materialized first (else OOB / wrong read). Empty `{}` targets stay
+    # in-memory (excluded) so defineProperty mutates them in place.
+    {"defineProperty accessor descriptor", "function f(){ var o={}; var base=100; Object.defineProperty(o,'a',{get:function(){return base+1;},configurable:true}); return o.a; } f();"},
+    {"defineProperty data descriptor", "function f(){ var o={}; Object.defineProperty(o,'x',{value:42,enumerable:true}); return o.x; } f();"}
+    # NOTE deeper gap (deferred): Object.defineProperties with a descriptor-map whose VALUES are themselves
+    # host objects needs DEEP materialize (shallow only rebuilds the outer map; nested descriptors stay host).
   ]
 
   for {name, src} <- @cases do

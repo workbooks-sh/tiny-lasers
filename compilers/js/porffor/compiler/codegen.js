@@ -2463,19 +2463,24 @@ const generateCall = (scope, decl, _global, _name, unusedValue = false) => {
       __Object_keys: 0, __Object_values: 0, __Object_entries: 0, __Object_getOwnPropertyNames: 0,
       __Object_getOwnPropertySymbols: 0, __Object_getOwnPropertyDescriptor: 0, __Object_getPrototypeOf: 0,
       __Object_create: 0, __JSON_stringify: 0, __Porffor_object_spread: 1,
+      // descriptor / descriptor-map args are read in-memory by the builtin — materialize a host literal first
+      __Object_defineProperty: 2, __Object_defineProperties: 1,
       __Reflect_has: 0, __Reflect_get: 0, __Reflect_ownKeys: 0, __Reflect_getOwnPropertyDescriptor: 0,
       __Reflect_getPrototypeOf: 0, __Reflect_isExtensible: 0
     };
+    // only a plain value expression can be materialized — a SpreadElement (`assign(t, ...srcs)`) is not an
+    // expression node and must pass through untouched (the builtin's own spread handling materializes nothing).
+    const wrappable = a => a && a.type !== '_HostMaterialize' && a.type !== 'SpreadElement';
     if (name in single) {
       decl._hoWrapped = true;
       const i = single[name];
-      if (decl.arguments[i] && decl.arguments[i].type !== '_HostMaterialize')
+      if (wrappable(decl.arguments[i]))
         decl.arguments[i] = { type: '_HostMaterialize', argument: decl.arguments[i] };
     } else if (name === '__Object_assign') {
       // assign(target, ...sources): materialize every arg (incl. a host-object target like {}) so the copy
       // runs entirely in memory and returns a memory object.
       decl._hoWrapped = true;
-      decl.arguments = decl.arguments.map(a => a.type === '_HostMaterialize' ? a : { type: '_HostMaterialize', argument: a });
+      decl.arguments = decl.arguments.map(a => wrappable(a) ? { type: '_HostMaterialize', argument: a } : a);
     }
   }
 
@@ -6530,11 +6535,22 @@ const propKeyName = x =>
     : (x.key?.type === 'Literal' && x.key.value != null ? String(x.key.value) : null);
 
 const hostObjectableLiteral = decl =>
-  Prefs.hostObjects && decl.properties.every(x =>
+  Prefs.hostObjects &&
+  // Empty literals (`{}`) gain nothing from the compile-time-hash fast path at creation and are
+  // disproportionately used as dynamic dictionaries / Object.defineProperty(accessor) / Object.create
+  // targets — patterns the host value/type table can't model (accessors, in-place descriptor mutation).
+  // Keep them in memory; non-empty data-bag literals (the hot member-access case) still go host-resident.
+  decl.properties.length > 0 &&
+  decl.properties.every(x =>
     x.type === 'Property' && x.kind === 'init' && !x.computed && !x.method &&
     // __proto__ in a literal sets the prototype (special semantics the host table can't model) — such a
     // literal must stay an in-memory object so the prototype chain works. Exclude it from host-objectable.
     propKeyName(x) !== '__proto__' &&
+    // Compiler-internal structures (closure boxes {__clo,env,fn}, uncurry boxes, generator/promise boxes)
+    // are read by PRECOMPILED builtins (promise.ts reaction unboxing, __callN dispatch) via raw in-memory
+    // property access — a host handle there reads garbage → OOB. Any `__`-prefixed key marks such a literal;
+    // keep it in memory (user `__`-keyed objects are rare and correct in-memory, just unaccelerated).
+    !(propKeyName(x) ?? '').startsWith('__') &&
     ctHashName(propKeyName(x)) != null);
 
 const generateHostObject = (scope, decl) => {
