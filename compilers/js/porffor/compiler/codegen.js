@@ -2448,7 +2448,9 @@ const generateCall = (scope, decl, _global, _name, unusedValue = false) => {
     const single = {
       __Object_keys: 0, __Object_values: 0, __Object_entries: 0, __Object_getOwnPropertyNames: 0,
       __Object_getOwnPropertySymbols: 0, __Object_getOwnPropertyDescriptor: 0, __Object_getPrototypeOf: 0,
-      __Object_create: 0, __JSON_stringify: 0, __Porffor_object_spread: 1
+      __Object_create: 0, __JSON_stringify: 0, __Porffor_object_spread: 1,
+      __Reflect_has: 0, __Reflect_get: 0, __Reflect_ownKeys: 0, __Reflect_getOwnPropertyDescriptor: 0,
+      __Reflect_getPrototypeOf: 0, __Reflect_isExtensible: 0
     };
     if (name in single) {
       decl._hoWrapped = true;

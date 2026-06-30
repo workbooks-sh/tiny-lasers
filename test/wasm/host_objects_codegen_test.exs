@@ -96,7 +96,13 @@ defmodule TinyLasers.HostObjectsCodegenTest do
     {"Object.assign into fresh", "function f(){ var o={a:1,b:2}; var t=Object.assign({}, o); return t.a+t.b; } f();"},
     {"Object.assign merge", "function f(){ var a={x:1}; var b={y:2}; var t=Object.assign({}, a, b); return t.x*10+t.y; } f();"},
     {"Object.create proto read", "function f(){ var p={greet:7}; var o=Object.create(p); return o.greet; } f();"},
-    {"getOwnPropertyNames length", "function f(){ var o={a:1,b:2,c:3}; return Object.getOwnPropertyNames(o).length; } f();"}
+    {"getOwnPropertyNames length", "function f(){ var o={a:1,b:2,c:3}; return Object.getOwnPropertyNames(o).length; } f();"},
+    # Phase C reflection: Reflect.* on host objects
+    {"Reflect.has present", "function f(){ var o={x:1}; return Reflect.has(o,'x')?1:0; } f();"},
+    {"Reflect.has absent", "function f(){ var o={x:1}; return Reflect.has(o,'y')?1:0; } f();"},
+    {"Reflect.get value", "function f(){ var o={x:42}; return Reflect.get(o,'x'); } f();"},
+    {"Reflect.ownKeys length", "function f(){ var o={a:1,b:2,c:3}; return Reflect.ownKeys(o).length; } f();"},
+    {"JSON roundtrip", "function f(){ var o={a:1,b:2}; var p=JSON.parse(JSON.stringify(o)); return p.a+p.b; } f();"}
   ]
 
   for {name, src} <- @cases do
