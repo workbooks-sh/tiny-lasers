@@ -102,7 +102,15 @@ defmodule TinyLasers.HostObjectsCodegenTest do
     {"Reflect.has absent", "function f(){ var o={x:1}; return Reflect.has(o,'y')?1:0; } f();"},
     {"Reflect.get value", "function f(){ var o={x:42}; return Reflect.get(o,'x'); } f();"},
     {"Reflect.ownKeys length", "function f(){ var o={a:1,b:2,c:3}; return Reflect.ownKeys(o).length; } f();"},
-    {"JSON roundtrip", "function f(){ var o={a:1,b:2}; var p=JSON.parse(JSON.stringify(o)); return p.a+p.b; } f();"}
+    {"JSON roundtrip", "function f(){ var o={a:1,b:2}; var p=JSON.parse(JSON.stringify(o)); return p.a+p.b; } f();"},
+    # Phase A exotic: symbol keys + accessor getters/setters (accessor literals stay in-memory by design)
+    {"symbol key roundtrip", "function f(){ var s=Symbol('k'); var o={}; o[s]=7; return o[s]; } f();"},
+    {"symbol key in", "function f(){ var s=Symbol('k'); var o={}; o[s]=1; return (s in o)?1:0; } f();"},
+    {"well-known toStringTag", "function f(){ var o={}; o[Symbol.toStringTag]='X'; return o[Symbol.toStringTag].length; } f();"},
+    {"symbol not enumerated", "function f(){ var s=Symbol('h'); var o={a:1}; o[s]=2; var n=0; for(var k in o){n++;} return n; } f();"},
+    {"accessor getter", "function f(){ var o={ get x(){ return 9; } }; return o.x; } f();"},
+    {"accessor setter", "function f(){ var hit=0; var o={ set x(v){ hit=v; } }; o.x=5; return hit; } f();"},
+    {"accessor get+set", "function f(){ var o={ _v:0, get x(){return this._v;}, set x(v){this._v=v;} }; o.x=11; return o.x; } f();"}
   ]
 
   for {name, src} <- @cases do

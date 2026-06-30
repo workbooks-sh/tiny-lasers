@@ -6518,6 +6518,9 @@ const propKeyName = x =>
 const hostObjectableLiteral = decl =>
   Prefs.hostObjects && decl.properties.every(x =>
     x.type === 'Property' && x.kind === 'init' && !x.computed && !x.method &&
+    // __proto__ in a literal sets the prototype (special semantics the host table can't model) — such a
+    // literal must stay an in-memory object so the prototype chain works. Exclude it from host-objectable.
+    propKeyName(x) !== '__proto__' &&
     ctHashName(propKeyName(x)) != null);
 
 const generateHostObject = (scope, decl) => {
