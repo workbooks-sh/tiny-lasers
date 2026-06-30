@@ -355,9 +355,14 @@ const generate = (scope, decl, global = false, name = undefined, valueUnused = f
     case 'NewExpression':
       return cacheAst(decl, generateCall(scope, decl, global, name, valueUnused));
 
-    case '_HostMaterialize':
-      // --host-objects enumeration helper (see hostMaterialize): rebuild a memory object from a host handle
-      return hostMaterialize(scope, generate(scope, decl.argument));
+    case '_HostMaterialize': {
+      // --host-objects enumeration helper (see hostMaterialize): rebuild a memory object from a host handle.
+      // When the inner is statically `object`, the fast single-value object-typed path is used; otherwise the
+      // value passes through with its real runtime type (ANY) so primitive-aware consumers stay correct.
+      const innerType = getNodeType(scope, decl.argument);
+      const innerKnownObject = knownType(scope, innerType) === TYPES.object;
+      return hostMaterialize(scope, generate(scope, decl.argument), innerKnownObject ? false : innerType);
+    }
 
     case 'ThisExpression':
       return cacheAst(decl, generateThis(scope, decl));
@@ -1926,8 +1931,17 @@ const getNodeType = (scope, node) => {
       return getType(scope, node.name);
     }
 
-    if (node.type === 'ObjectExpression' || node.type === 'Super' || node.type === '_HostMaterialize') {
+    if (node.type === 'ObjectExpression' || node.type === 'Super') {
       return TYPES.object;
+    }
+
+    if (node.type === '_HostMaterialize') {
+      // A host handle materializes to an in-memory object; a non-host value passes through with its real
+      // runtime type. So this is statically `object` only when the inner is already statically `object`;
+      // otherwise it is ANY (runtime #last_type), so consumers like JSON.stringify dispatch on the real
+      // type at runtime instead of being lied to as `object` (which serialized primitives as `{}`).
+      const inner = getNodeType(scope, node.argument);
+      return knownType(scope, inner) === TYPES.object ? TYPES.object : getLastType(scope);
     }
 
     if (node.type === 'CallExpression' || node.type === 'NewExpression') {
@@ -6564,11 +6578,16 @@ const generateHostObject = (scope, decl) => {
 // __Porffor_object_set; if not tagged it passes the original value through untouched. Returns wasm leaving
 // the (memory-object | original) value on the stack; the type stays object either way. NOT on the hot path
 // — only at enumeration sites, so the per-call rebuild cost is irrelevant.
-const hostMaterialize = (scope, objWasm) => {
+// anyMode: false → statically-object fast path (single value, object-typed). Otherwise anyMode carries the
+// inner's static type (a number type-id or `getLastType` bytecode); the result is ANY-typed and #last_type
+// is published at runtime (object when a host handle materialized, else the inner's real type).
+const hostMaterialize = (scope, objWasm, anyMode = false) => {
+  const innerTypeExpr = anyMode === false ? null : (typeof anyMode === 'number' ? [ number(anyMode, Valtype.i32) ] : anyMode);
   scope.usesImports = true;
   const u = uniqId();
   const vtmp = localTmp(scope, '#hm_v' + u);                 // f64 receiver value (eval once)
   const rtmp = localTmp(scope, '#hm_r' + u, Valtype.i32);    // i32 handle
+  const lt = localTmp(scope, '#hm_lt' + u, Valtype.i32);     // saved inner runtime type (ANY mode)
   const otmp = localTmp(scope, '#hm_o' + u, Valtype.i32);    // fresh memory object ptr
   const mn = localTmp(scope, '#hm_n' + u, Valtype.i32);      // key count
   const mc = localTmp(scope, '#hm_c' + u, Valtype.i32);      // loop counter
@@ -6581,7 +6600,12 @@ const hostMaterialize = (scope, objWasm) => {
   const buf = allocPage(scope, '#hm_keybuf' + u);
   const bufCap = pageSize - 8; // wrap before the page end (degrades gracefully for >page-of-keys objects)
   return [
-    ...objWasm, [ Opcodes.local_tee, vtmp ], Opcodes.i32_to_u, [ Opcodes.local_tee, rtmp ],
+    ...objWasm,
+    // ANY mode: capture the inner value's runtime type so a passed-through primitive keeps its real type;
+    // the materialized branch overrides it to `object` below. Uses the inner's static type id when known,
+    // else `getLastType` bytecode (valid here — objWasm just set #last_type).
+    ...(anyMode ? [ ...innerTypeExpr, [ Opcodes.local_set, lt ] ] : []),
+    [ Opcodes.local_tee, vtmp ], Opcodes.i32_to_u, [ Opcodes.local_tee, rtmp ],
     number(HOST_OBJ_TAG, Valtype.i32), [ Opcodes.i32_and ],
     [ Opcodes.if, valtypeBinary ],
       // fresh empty memory object (malloc + capacity-class stamp, same as generateObject)
@@ -6623,9 +6647,12 @@ const hostMaterialize = (scope, objWasm) => {
         [ Opcodes.end ],
       [ Opcodes.end ],
       [ Opcodes.local_get, otmp ], Opcodes.i32_from_u,
+      ...(anyMode ? [ number(TYPES.object, Valtype.i32), [ Opcodes.local_set, lt ] ] : []),
     [ Opcodes.else ],
       [ Opcodes.local_get, vtmp ],
-    [ Opcodes.end ]
+    [ Opcodes.end ],
+    // ANY mode: publish the result's runtime type (object if materialized, else the inner's real type).
+    ...(anyMode ? setLastType(scope, [ [ Opcodes.local_get, lt ] ]) : [])
   ];
 };
 

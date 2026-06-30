@@ -3289,11 +3289,21 @@ defmodule TinyLasers.Wasm do
   defp call_host(_rt, {m, name, _t}, args) do
     tbl = Process.get(:tl_imports, %{})
 
-    case Map.get(tbl, {m, name}) || Map.get(tbl, name) do
+    case Map.get(tbl, {m, name}) || Map.get(tbl, name) || host_objects_builtin(name) do
       fun when is_function(fun, 1) -> fun.(args)
       _ -> raise("tinylasers: unimplemented host import '#{m}'.'#{name}'")
     end
   end
+
+  # Host-resident objects (`--host-objects`, default-on) are a first-class runtime capability: any module
+  # that uses object literals emits `ho_*` imports, so they must always resolve without per-run setup. The
+  # per-handle table lives in this run process's dict (TinyLasers.Js.HostObjects), so it is naturally
+  # isolated and starts empty for each fresh guest process. Explicit `:tl_imports` entries still win.
+  defp host_objects_builtin("ho_" <> _ = name) do
+    Map.get(TinyLasers.Js.HostObjects.imports(), name)
+  end
+
+  defp host_objects_builtin(_), do: nil
 
   @doc "Write `bin` byte-for-byte into the packed memory `mem` at `addr` (little-endian, same layout the guest sees)."
   def write_bytes(mem, addr, bin) do

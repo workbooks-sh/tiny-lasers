@@ -103,6 +103,13 @@ defmodule TinyLasers.HostObjectsCodegenTest do
     {"Reflect.get value", "function f(){ var o={x:42}; return Reflect.get(o,'x'); } f();"},
     {"Reflect.ownKeys length", "function f(){ var o={a:1,b:2,c:3}; return Reflect.ownKeys(o).length; } f();"},
     {"JSON roundtrip", "function f(){ var o={a:1,b:2}; var p=JSON.parse(JSON.stringify(o)); return p.a+p.b; } f();"},
+    # JSON.stringify on NON-object args: the materialize wrap must not force object-typing (primitives must
+    # keep their real runtime type via ANY-mode, else they serialize as "{}"). Compare string lengths.
+    {"JSON.stringify number len", "function f(){ return JSON.stringify(3).length; } f();"},
+    {"JSON.stringify array len", "function f(){ return JSON.stringify([1,2,3]).length; } f();"},
+    {"JSON.stringify bool len", "function f(){ return JSON.stringify(true).length; } f();"},
+    {"JSON.stringify string len", "function f(){ return JSON.stringify('hi').length; } f();"},
+    {"JSON.stringify call-result", "function g(){ return 7; } function f(){ return JSON.stringify(g()).length; } f();"},
     # Phase A exotic: symbol keys + accessor getters/setters (accessor literals stay in-memory by design)
     {"symbol key roundtrip", "function f(){ var s=Symbol('k'); var o={}; o[s]=7; return o[s]; } f();"},
     {"symbol key in", "function f(){ var s=Symbol('k'); var o={}; o[s]=1; return (s in o)?1:0; } f();"},
