@@ -355,6 +355,10 @@ const generate = (scope, decl, global = false, name = undefined, valueUnused = f
     case 'NewExpression':
       return cacheAst(decl, generateCall(scope, decl, global, name, valueUnused));
 
+    case '_HostMaterialize':
+      // --host-objects enumeration helper (see hostMaterialize): rebuild a memory object from a host handle
+      return hostMaterialize(scope, generate(scope, decl.argument));
+
     case 'ThisExpression':
       return cacheAst(decl, generateThis(scope, decl));
 
@@ -1545,7 +1549,7 @@ const generateBinaryExp = (scope, decl) => {
   }
 
   if (decl.operator === 'in') {
-    return generate(scope, {
+    const memoryIn = generate(scope, {
       type: 'CallExpression',
       callee: {
         type: 'Identifier',
@@ -1556,6 +1560,28 @@ const generateBinaryExp = (scope, decl) => {
         decl.left
       ]
     });
+
+    // --host-objects: `key in obj` on a tagged handle → ho_has(handle, object_hash(key)). Else the builtin.
+    if (Prefs.hostObjects) {
+      scope.usesImports = true;
+      const htmp = localTmp(scope, '#hin' + uniqId(), Valtype.i32);
+      return [
+        ...generate(scope, decl.right), Opcodes.i32_to_u, [ Opcodes.local_tee, htmp ],
+        number(HOST_OBJ_TAG, Valtype.i32), [ Opcodes.i32_and ],
+        [ Opcodes.if, valtypeBinary ],
+          [ Opcodes.local_get, htmp ],
+          ...toPropertyKey(scope, generate(scope, decl.left), getNodeType(scope, decl.left), true, true),
+          [ Opcodes.call, includeBuiltin(scope, '__Porffor_object_hash').index ],
+          [ Opcodes.call, importedFuncs.ho_has ],
+          Opcodes.i32_from_u,
+          ...setLastType(scope, TYPES.boolean),
+        [ Opcodes.else ],
+          ...memoryIn,
+        [ Opcodes.end ]
+      ];
+    }
+
+    return memoryIn;
   }
 
   // opt: == null|undefined -> nullish
@@ -1900,7 +1926,7 @@ const getNodeType = (scope, node) => {
       return getType(scope, node.name);
     }
 
-    if (node.type === 'ObjectExpression' || node.type === 'Super') {
+    if (node.type === 'ObjectExpression' || node.type === 'Super' || node.type === '_HostMaterialize') {
       return TYPES.object;
     }
 
@@ -2411,6 +2437,23 @@ const generateCall = (scope, decl, _global, _name, unusedValue = false) => {
   if (isFuncType(decl.callee.type)) {
     const [ func ] = generateFunc(scope, decl.callee, true);
     name = func.name;
+  }
+
+  // --host-objects: enumeration builtins (Object.keys/values/entries/assign/getOwnPropertyNames, spread,
+  // JSON.stringify) only understand in-memory objects. Wrap their object argument(s) in _HostMaterialize so a
+  // tagged host handle is rebuilt into a memory object first; non-tagged values pass through untouched. Done
+  // once here (not per-builtin) and idempotent (the marker isn't itself a target name).
+  if (Prefs.hostObjects && !decl._hoWrapped && name && decl.arguments?.length) {
+    const single = { __Object_keys: 0, __Object_values: 0, __Object_entries: 0, __Object_getOwnPropertyNames: 0, __JSON_stringify: 0, __Porffor_object_spread: 1 };
+    if (name in single) {
+      decl._hoWrapped = true;
+      const i = single[name];
+      if (decl.arguments[i] && decl.arguments[i].type !== '_HostMaterialize')
+        decl.arguments[i] = { type: '_HostMaterialize', argument: decl.arguments[i] };
+    } else if (name === '__Object_assign') {
+      decl._hoWrapped = true;
+      decl.arguments = decl.arguments.map((a, i) => i === 0 || a.type === '_HostMaterialize' ? a : { type: '_HostMaterialize', argument: a });
+    }
   }
 
   if (!decl._funcIdx && !decl._new && (name === 'eval' || (decl.callee.type === 'SequenceExpression' && decl.callee.expressions.at(-1)?.name === 'eval'))) {
@@ -4539,7 +4582,8 @@ const generateAssign = (scope, decl, _global, _name, valueUnused = false) => {
 
         [TYPES.undefined]: () => internalThrow(scope, 'TypeError', `Cannot set property ${decl.left && decl.left.property && !decl.left.computed && decl.left.property.name ? `'${decl.left.property.name}' ` : ''}of undefined`, !valueUnused),
 
-        default: () => [
+        default: () => {
+        const memorySet = [
           objectGet,
           Opcodes.i32_to,
           ...(op === '=' ? [] : [ [ Opcodes.local_tee, localTmp(scope, '#objset_object', Valtype.i32) ] ]),
@@ -4582,7 +4626,62 @@ const generateAssign = (scope, decl, _global, _name, valueUnused = false) => {
           [ Opcodes.drop ],
           ...(valueUnused ? [ [ Opcodes.drop ] ] : [])
           // ...setLastType(scope, getNodeType(scope, decl)),
-        ]
+        ];
+
+        // --host-objects: `obj.key <op>= v` on a tagged handle → ho_set(handle, hash, newValue, type).
+        // Runtime branch on the tag covers dynamically-typed receivers. Static key uses the compile-time
+        // hash; computed key derives it at runtime (toPropertyKey then __Porffor_object_hash). For compound
+        // assignment (op !== '='), the new value is performOp(op, ho_get_value(old), rhs) — read-modify-write
+        // entirely host-side.
+        if (Prefs.hostObjects && (hash != null || decl.left.computed)) {
+          scope.usesImports = true;
+          const hov = localTmp(scope, '#howval' + uniqId());
+          const hoh = localTmp(scope, '#howhash' + uniqId(), Valtype.i32);
+          const computeHash = hash != null
+            ? [ number(hash, Valtype.i32) ]
+            : [
+                ...toPropertyKey(scope, [ propertyGet ], getNodeType(scope, property), decl.left.computed, true),
+                [ Opcodes.call, includeBuiltin(scope, '__Porffor_object_hash').index ]
+              ];
+          const newValue = op === '='
+            ? generate(scope, decl.right)
+            : performOp(scope, op, [
+                objectGet, Opcodes.i32_to_u, [ Opcodes.local_get, hoh ],
+                [ Opcodes.call, importedFuncs.ho_get_value ],
+                ...setLastType(scope, [
+                  objectGet, Opcodes.i32_to_u, [ Opcodes.local_get, hoh ],
+                  [ Opcodes.call, importedFuncs.ho_get_type ]
+                ])
+              ], generate(scope, decl.right), getLastType(scope), getNodeType(scope, decl.right));
+          const newType = op === '=' ? getNodeType(scope, decl.right) : getNodeType(scope, decl);
+          return [
+            objectGet, Opcodes.i32_to_u,
+            number(HOST_OBJ_TAG, Valtype.i32), [ Opcodes.i32_and ],
+            [ Opcodes.if, valueUnused ? Blocktype.void : valtypeBinary ],
+              ...computeHash, [ Opcodes.local_set, hoh ],
+              objectGet, Opcodes.i32_to_u, [ Opcodes.local_get, hoh ],
+              ...newValue, [ Opcodes.local_tee, hov ],
+              ...newType,
+              [ Opcodes.call, importedFuncs.ho_set ],
+              // register the original key for enumeration (static keys; computed-write regkey = follow-up)
+              ...(!decl.left.computed && decl.left.property?.name ? (() => {
+                const kn = decl.left.property.name, bs = byteStringable(kn);
+                return [
+                  objectGet, Opcodes.i32_to_u, [ Opcodes.local_get, hoh ],
+                  ...makeString(scope, kn, bs), Opcodes.i32_to_u,
+                  number(bs ? TYPES.bytestring : TYPES.string, Valtype.i32),
+                  [ Opcodes.call, importedFuncs.ho_regkey ]
+                ];
+              })() : []),
+              ...(valueUnused ? [] : [ [ Opcodes.local_get, hov ] ]),
+            [ Opcodes.else ],
+              ...memorySet,
+            [ Opcodes.end ]
+          ];
+        }
+
+        return memorySet;
+        }
       }, valueUnused ? Blocktype.void : valtypeBinary),
       ...optional(number(UNDEFINED), valueUnused)
     ];
@@ -4781,6 +4880,27 @@ const generateUnary = (scope, decl) => {
           [ Opcodes.call, includeBuiltin(scope, scope.strict ? '__Porffor_object_deleteStrict' : '__Porffor_object_delete').index ],
           Opcodes.i32_from_u
         ];
+
+        // --host-objects: `delete obj.key` on a tagged handle → ho_delete(handle, object_hash(key)). Else
+        // the in-memory delete. (No COCTC inline-cache path for host objects.)
+        if (Prefs.hostObjects && coctc === 0) {
+          scope.usesImports = true;
+          const htmp = localTmp(scope, '#hdel' + uniqId(), Valtype.i32);
+          return [
+            ...generate(scope, object), Opcodes.i32_to_u, [ Opcodes.local_tee, htmp ],
+            number(HOST_OBJ_TAG, Valtype.i32), [ Opcodes.i32_and ],
+            [ Opcodes.if, valtypeBinary ],
+              [ Opcodes.local_get, htmp ],
+              ...toPropertyKey(scope, generate(scope, property), getNodeType(scope, property), decl.argument.computed, true),
+              [ Opcodes.call, includeBuiltin(scope, '__Porffor_object_hash').index ],
+              [ Opcodes.call, importedFuncs.ho_delete ],
+              Opcodes.i32_from_u,
+              ...setLastType(scope, TYPES.boolean),
+            [ Opcodes.else ],
+              ...out,
+            [ Opcodes.end ]
+          ];
+        }
 
         if (coctc > 0) {
           // set COCTC
@@ -5759,6 +5879,42 @@ const generateForIn = (scope, decl) => {
   }, Blocktype.void);
 
   final.push(number(UNDEFINED));
+
+  // --host-objects: branch on the receiver tag at runtime. A tagged handle iterates host-side — loop
+  // ho_count, ho_key_at(i) writes the i-th key as a Porffor bytestring into a scratch page, bind the loop
+  // var to it, run the body. Else the in-memory iteration above. (break/continue in the body target the
+  // memory path's depth; host-loop break/continue = follow-up.)
+  if (Prefs.hostObjects) {
+    const rtmp = localTmp(scope, '#forin_recv' + count, Valtype.i32);
+    const hn = localTmp(scope, '#forin_hn' + count, Valtype.i32);
+    const hc = localTmp(scope, '#forin_hc' + count, Valtype.i32);
+    const buf = allocPage(scope, '#forin_keybuf' + count);
+    return [
+      ...generate(scope, decl.right), Opcodes.i32_to_u, [ Opcodes.local_tee, rtmp ],
+      number(HOST_OBJ_TAG, Valtype.i32), [ Opcodes.i32_and ],
+      [ Opcodes.if, valtypeBinary ],
+        [ Opcodes.local_get, rtmp ], [ Opcodes.call, importedFuncs.ho_count ], [ Opcodes.local_tee, hn ],
+        [ Opcodes.if, Blocktype.void ],
+          number(0, Valtype.i32), [ Opcodes.local_set, hc ],
+          [ Opcodes.loop, Blocktype.void ],
+            // write the hc-th key into the scratch page; the buffer IS a valid Porffor bytestring
+            [ Opcodes.local_get, rtmp ], [ Opcodes.local_get, hc ], number(buf, Valtype.i32),
+            [ Opcodes.call, importedFuncs.ho_key_at ], [ Opcodes.drop ],
+            number(buf, Valtype.i32), [ Opcodes.local_set, tmp ],
+            ...setType(scope, tmpName, [ number(TYPES.bytestring, Valtype.i32) ]),
+            ...setVar,
+            ...generate(scope, decl.body), [ Opcodes.drop ],
+            [ Opcodes.local_get, hc ], number(1, Valtype.i32), [ Opcodes.i32_add ], [ Opcodes.local_tee, hc ],
+            [ Opcodes.local_get, hn ], [ Opcodes.i32_ne ], [ Opcodes.br_if, 0 ],
+          [ Opcodes.end ],
+        [ Opcodes.end ],
+        number(UNDEFINED),
+      [ Opcodes.else ],
+        ...final,
+      [ Opcodes.end ]
+    ];
+  }
+
   return final;
 };
 
@@ -6318,7 +6474,142 @@ const toPropertyKey = (scope, wasm, type, computed = false, i32Conv = false) => 
 // exactly — override-safe (works whether the object was malloc'd at 16KB or 64KB), no baked pageSize constant.
 const objCapClass = (bytes) => Math.max(1, Math.min(15, Math.floor(Math.log2(bytes)) - 8));
 
+// ── host-objects (--host-objects, externref ABI handle realization) ───────────────────────────────
+// A JS object lives host-side (TinyLasers.Js.HostObjects); the value slot holds an i32 handle (carried
+// as f64 like every object pointer). Property access is a typed `ho_*` host import keyed by Porffor's
+// compile-time property hash (ctHash) instead of a linear-memory pointer-chase + 20-branch type dispatch.
+// Conservative: only plain static-key object literals / member reads take this path; everything else
+// (computed/optional/spread/method/getter, non-object receivers, `.length`, prototype) falls back to the
+// in-memory model. Gated behind Prefs.hostObjects (default off) until oracle-matched on the real corpus.
+// High tag bit set on host-object handles (must match TinyLasers.Js.HostObjects.tag). A TYPES.object
+// VALUE with this bit set is a host handle (read/written via ho_*); without it, a real memory pointer
+// (the in-memory object model). The member typeSwitch branches on this bit at runtime, so dynamically
+// -typed receivers (loop vars, function params) dispatch correctly without static type info.
+const HOST_OBJ_TAG = 0x80000000;
+
+const ctHashName = keyName =>
+  typeof keyName === 'string'
+    ? ctHash({ computed: false, optional: false, property: { type: 'Identifier', name: keyName } })
+    : null;
+
+const propKeyName = x =>
+  x.key?.type === 'Identifier' ? x.key.name
+    : (x.key?.type === 'Literal' && x.key.value != null ? String(x.key.value) : null);
+
+const hostObjectableLiteral = decl =>
+  Prefs.hostObjects && decl.properties.every(x =>
+    x.type === 'Property' && x.kind === 'init' && !x.computed && !x.method &&
+    ctHashName(propKeyName(x)) != null);
+
+const generateHostObject = (scope, decl) => {
+  scope.usesImports = true; // ho_* are wasm imports — flag so assemble's import treeshake keeps + remaps them
+  const htmp = localTmp(scope, '#hobj' + uniqId(), Valtype.i32);
+  const out = [
+    [ Opcodes.call, importedFuncs.ho_new ],
+    [ Opcodes.local_set, htmp ]
+  ];
+
+  for (const x of decl.properties) {
+    let { value, method } = x;
+    if (method) value._method = true;
+    const keyName = propKeyName(x);
+    const hash = ctHashName(keyName);
+    const bs = byteStringable(keyName);
+    out.push(
+      [ Opcodes.local_get, htmp ],
+      number(hash, Valtype.i32),
+      ...generate(scope, value),
+      ...getNodeType(scope, value),
+      [ Opcodes.call, importedFuncs.ho_set ],
+      // register the original key string (insertion order) for enumeration
+      [ Opcodes.local_get, htmp ],
+      number(hash, Valtype.i32),
+      ...makeString(scope, keyName, bs), Opcodes.i32_to_u,
+      number(bs ? TYPES.bytestring : TYPES.string, Valtype.i32),
+      [ Opcodes.call, importedFuncs.ho_regkey ]
+    );
+  }
+
+  // leave the handle in the value slot (i32 → f64, exactly like an object pointer); type set by caller.
+  out.push([ Opcodes.local_get, htmp ], Opcodes.i32_from_u);
+  return out;
+};
+
+// --host-objects: rebuild an in-memory Porffor object from a host handle so the EXISTING enumeration
+// builtins (Object.keys/values/entries, spread, JSON.stringify) work unchanged. Takes the receiver's
+// value+type wasm; evaluates it ONCE; if tagged it loops the host table (ho_count + ho_key_at into a
+// scratch page, ho_get_value/ho_get_type by hash) copying every property into a fresh memory object via
+// __Porffor_object_set; if not tagged it passes the original value through untouched. Returns wasm leaving
+// the (memory-object | original) value on the stack; the type stays object either way. NOT on the hot path
+// — only at enumeration sites, so the per-call rebuild cost is irrelevant.
+const hostMaterialize = (scope, objWasm) => {
+  scope.usesImports = true;
+  const u = uniqId();
+  const vtmp = localTmp(scope, '#hm_v' + u);                 // f64 receiver value (eval once)
+  const rtmp = localTmp(scope, '#hm_r' + u, Valtype.i32);    // i32 handle
+  const otmp = localTmp(scope, '#hm_o' + u, Valtype.i32);    // fresh memory object ptr
+  const mn = localTmp(scope, '#hm_n' + u, Valtype.i32);      // key count
+  const mc = localTmp(scope, '#hm_c' + u, Valtype.i32);      // loop counter
+  const mh = localTmp(scope, '#hm_h' + u, Valtype.i32);      // per-key hash (host read)
+  const kcur = localTmp(scope, '#hm_kc' + u, Valtype.i32);   // cursor into the key scratch page
+  const capTmp = localTmp(scope, '#hm_cap' + u, Valtype.i32);
+  // generous multi-page scratch: __Porffor_object_set stores each key by POINTER (writeKey), so every key
+  // must live at its own stable address — a single reused buffer would collapse all keys to the last one.
+  // The cursor walks forward through this region, one bytestring per key.
+  const buf = allocPage(scope, '#hm_keybuf' + u);
+  const bufCap = pageSize - 8; // wrap before the page end (degrades gracefully for >page-of-keys objects)
+  return [
+    ...objWasm, [ Opcodes.local_tee, vtmp ], Opcodes.i32_to_u, [ Opcodes.local_tee, rtmp ],
+    number(HOST_OBJ_TAG, Valtype.i32), [ Opcodes.i32_and ],
+    [ Opcodes.if, valtypeBinary ],
+      // fresh empty memory object (malloc + capacity-class stamp, same as generateObject)
+      number(pageSize, Valtype.i32),
+      [ Opcodes.call, includeBuiltin(scope, '__Porffor_malloc').index ],
+      [ Opcodes.local_tee, capTmp ],
+      [ Opcodes.local_get, capTmp ],
+      number(objCapClass(pageSize) << 4, Valtype.i32),
+      [ Opcodes.i32_store8, 0, 2 ],
+      [ Opcodes.local_set, otmp ],
+      number(buf, Valtype.i32), [ Opcodes.local_set, kcur ],
+      [ Opcodes.local_get, rtmp ], [ Opcodes.call, importedFuncs.ho_count ], [ Opcodes.local_tee, mn ],
+      [ Opcodes.if, Blocktype.void ],
+        number(0, Valtype.i32), [ Opcodes.local_set, mc ],
+        [ Opcodes.loop, Blocktype.void ],
+          // materialize the mc-th key as a bytestring at the current cursor
+          [ Opcodes.local_get, rtmp ], [ Opcodes.local_get, mc ], [ Opcodes.local_get, kcur ],
+          [ Opcodes.call, importedFuncs.ho_key_at ], [ Opcodes.drop ],
+          // hash = object_hash(key) — for the host value/type read
+          ...toPropertyKey(scope, [ [ Opcodes.local_get, kcur ], Opcodes.i32_from_u ], [ number(TYPES.bytestring, Valtype.i32) ], false, true),
+          [ Opcodes.call, includeBuiltin(scope, '__Porffor_object_hash').index ],
+          [ Opcodes.local_set, mh ],
+          // __Porffor_object_set(memObj, object, key=kcur bytestring, value=ho_get_value, type=ho_get_type)
+          [ Opcodes.local_get, otmp ], number(TYPES.object, Valtype.i32),
+          [ Opcodes.local_get, kcur ], number(TYPES.bytestring, Valtype.i32),
+          [ Opcodes.local_get, rtmp ], [ Opcodes.local_get, mh ], [ Opcodes.call, importedFuncs.ho_get_value ],
+          [ Opcodes.local_get, rtmp ], [ Opcodes.local_get, mh ], [ Opcodes.call, importedFuncs.ho_get_type ],
+          [ Opcodes.call, includeBuiltin(scope, '__Porffor_object_set').index ],
+          [ Opcodes.drop ],
+          // advance the cursor past this key: kcur += align4(4 + len); wrap if it would overrun the page
+          [ Opcodes.local_get, kcur ],
+          number(4, Valtype.i32), [ Opcodes.local_get, kcur ], [ Opcodes.i32_load, 0, 0 ], [ Opcodes.i32_add ],
+          number(3, Valtype.i32), [ Opcodes.i32_add ], number(-4, Valtype.i32), [ Opcodes.i32_and ],
+          [ Opcodes.i32_add ], [ Opcodes.local_set, kcur ],
+          [ Opcodes.local_get, kcur ], number(buf + bufCap, Valtype.i32), [ Opcodes.i32_ge_u ],
+          [ Opcodes.if, Blocktype.void ], number(buf, Valtype.i32), [ Opcodes.local_set, kcur ], [ Opcodes.end ],
+          [ Opcodes.local_get, mc ], number(1, Valtype.i32), [ Opcodes.i32_add ], [ Opcodes.local_tee, mc ],
+          [ Opcodes.local_get, mn ], [ Opcodes.i32_ne ], [ Opcodes.br_if, 0 ],
+        [ Opcodes.end ],
+      [ Opcodes.end ],
+      [ Opcodes.local_get, otmp ], Opcodes.i32_from_u,
+    [ Opcodes.else ],
+      [ Opcodes.local_get, vtmp ],
+    [ Opcodes.end ]
+  ];
+};
+
 const generateObject = (scope, decl, global = false, name = '$undeclared') => {
+  if (hostObjectableLiteral(decl)) return generateHostObject(scope, decl);
+
   const capTmp = localTmp(scope, '#objcap' + uniqId(), Valtype.i32);
   const out = [
     number(pageSize, Valtype.i32),
@@ -6811,28 +7102,67 @@ const generateMember = (scope, decl, _global, _name) => {
       ? [ number(UNDEFINED), ...setLastType(scope, TYPES.undefined) ]
       : internalThrow(scope, 'TypeError', `Cannot read property ${decl.property && !decl.computed && decl.property.name ? `'${decl.property.name}' ` : ''}of undefined${Prefs.namedReceiver ? ` [recv: ${(function d(n){ if (!n) return '?'; if (n.type === 'Identifier') return n.name; if (n.type === 'ThisExpression') return 'this'; if (n.type === 'MemberExpression') return d(n.object) + '.' + (n.computed ? '[c]' : (n.property && n.property.name) || '?'); if (n.type === 'CallExpression') return d(n.callee) + '()'; if (n.type === 'AssignmentExpression') return d(n.right); if (n.type === 'LogicalExpression' || n.type === 'BinaryExpression') return d(n.right); if (n.type === 'ConditionalExpression') return d(n.consequent); return n.type; })(decl.object)}]` : ''}`, true),
 
-    default: () => [
-      ...(coctc > 0 && known === TYPES.object ? [
-        [ Opcodes.local_get, coctcObjTmp ],
-        number(TYPES.object, Valtype.i32)
-      ] : [
-        objectGet,
-        Opcodes.i32_to,
-        ...type
-      ]),
+    default: () => {
+      const memoryGet = [
+        ...(coctc > 0 && known === TYPES.object ? [
+          [ Opcodes.local_get, coctcObjTmp ],
+          number(TYPES.object, Valtype.i32)
+        ] : [
+          objectGet,
+          Opcodes.i32_to,
+          ...type
+        ]),
 
-      ...toPropertyKey(scope, [ propertyGet ], [ [ Opcodes.local_get, propertyTypeTmp ] ], decl.computed, true),
+        ...toPropertyKey(scope, [ propertyGet ], [ [ Opcodes.local_get, propertyTypeTmp ] ], decl.computed, true),
 
-      ...(hash != null ? [
-        number(hash, Valtype.i32),
-        number(TYPES.number, Valtype.i32),
-        [ Opcodes.call, includeBuiltin(scope, '__Porffor_object_get_withHash').index ]
-      ] : [
-        [ Opcodes.call, includeBuiltin(scope, '__Porffor_object_get').index ]
-      ]),
-      ...setLastType(scope),
-      ...(valtypeBinary === Valtype.i32 ? [ Opcodes.i32_trunc_sat_f64_s ] : [])
-    ],
+        ...(hash != null ? [
+          number(hash, Valtype.i32),
+          number(TYPES.number, Valtype.i32),
+          [ Opcodes.call, includeBuiltin(scope, '__Porffor_object_get_withHash').index ]
+        ] : [
+          [ Opcodes.call, includeBuiltin(scope, '__Porffor_object_get').index ]
+        ]),
+        ...setLastType(scope),
+        ...(valtypeBinary === Valtype.i32 ? [ Opcodes.i32_trunc_sat_f64_s ] : [])
+      ];
+
+      // --host-objects: branch on the handle tag bit. Tagged receiver = host object → ho_get_value (value)
+      // + ho_get_type (type) keyed by the property hash; else the in-memory get. Runtime branch → works
+      // for dynamically-typed receivers (loop vars, params). Static keys use the compile-time hash;
+      // computed keys (o[k]) derive the hash the SAME way the memory path does — toPropertyKey then
+      // __Porffor_object_hash (same xxh32 as ctHash) — into a temp reused by get_value + get_type.
+      // ctHash returns null for optional members (the `prop.optional` guard), so recover a compile-time
+      // hash from the static property name directly (ctHashName ignores optional) — keeps `o?.x` on the
+      // host path instead of trapping on the in-memory get.
+      const staticHash = hash != null ? hash : (!decl.computed ? ctHashName(decl.property?.name) : null);
+      if (Prefs.hostObjects && (staticHash != null || decl.computed)) {
+        scope.usesImports = true;
+        const htmp = localTmp(scope, '#hgeth' + uniqId(), Valtype.i32);
+        const computeHash = staticHash != null
+          ? [ number(staticHash, Valtype.i32) ]
+          : [
+              ...toPropertyKey(scope, [ propertyGet ], [ [ Opcodes.local_get, propertyTypeTmp ] ], decl.computed, true),
+              [ Opcodes.call, includeBuiltin(scope, '__Porffor_object_hash').index ]
+            ];
+        return [
+          objectGet, Opcodes.i32_to_u,
+          number(HOST_OBJ_TAG, Valtype.i32), [ Opcodes.i32_and ],
+          [ Opcodes.if, valtypeBinary ],
+            ...computeHash, [ Opcodes.local_set, htmp ],
+            objectGet, Opcodes.i32_to_u, [ Opcodes.local_get, htmp ],
+            [ Opcodes.call, importedFuncs.ho_get_value ],
+            ...setLastType(scope, [
+              objectGet, Opcodes.i32_to_u, [ Opcodes.local_get, htmp ],
+              [ Opcodes.call, importedFuncs.ho_get_type ]
+            ]),
+          [ Opcodes.else ],
+            ...memoryGet,
+          [ Opcodes.end ]
+        ];
+      }
+
+      return memoryGet;
+    },
 
     ...extraBC
   });

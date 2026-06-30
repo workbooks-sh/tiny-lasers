@@ -97,6 +97,38 @@ WASM→BEAM lowering more native/efficient, migrating off it only where it truly
   is the inherent Porffor value-model tax (tagged [value,type] pairs in linear memory; ~686k f64 loads
   per micro-parse). Next levers: inline the f64/i32 load fast path + fuel charge into BEAM asm (drop the
   `call_ext`), and/or strip the rollup bundle's dead watcher stack before the daily gate run.
+- **fload/fstore fast path.** `fload`/`fstore` initially used a per-byte loop for float memory
+  access, even aligned ones. Added aligned fast paths using `:atomics.get`/`:atomics.put`
+  directly (one `atomics` op vs 8 byte ops for aligned f64, 4-byte for f32). Bit-identical to
+  the byte loop (backing is signed:false 8-byte slots, LE). Verified by `asm_memory_test`
+  f32/f64 oracle cases covering aligned (0/8/4088), 4-aligned (4), and unaligned (1/7/13)
+  addresses + nonfinite. **acorn rung: tier-async 29.5s→26s (13% faster), eager-asm 26s→24s (8% faster).**
+  Cumulative session win on acorn: **tier-async 84s→26s (3.2x), eager-asm 117s→24s (4.9x).**
+- **Deep-instrumented the cost model (validated the instrument first).** A microbench of every host
+  seam gave TRUE per-op costs (not estimates): `charge_fuel` 13.6ns, `guest_fload` aligned 50.7ns /
+  unaligned 238.9ns, `guest_load` 30.8ns, `guest_fcmp` 12.3ns, `wtrunc_sat` 7.4ns, bare `call_ext`
+  ~7ns. Then wired `bench_tick` into ALL seams + a `wtrunc_sat` counter for true dynamic counts on a
+  25s acorn run: **charge_fuel 25.0M (0.35s), guest_fcmp 22.8M (0.28s), guest_fload 22.6M (1.15s),
+  guest_load 2.6M (0.08s), guest_farith 645k, call_local 332k, guest_store 295k, trunc_sat only 424k.**
+  **Seams total ≈ 2.9s of the 25s.** The other **~22s is ~6.3B cheap BEAM ops (move/gc_bif/test) —
+  Porffor emits ~19M WASM ops/token.** The per-op cost is already near-native (BeamAsm); the **op COUNT
+  is the wall.** This confirms the "compilation is inefficient" hypothesis: the lever is Porffor codegen
+  (f64 pointer model → trunc_sat per address; [value,type] tagged pairs → 2 ops/value; polymorphic
+  20-branch type-dispatch if-chains per property access; no CSE → redundant local_get/trunc), NOT more
+  runtime inlining. (Also debunked a false lead: a static×callcount histogram suggested ~417M trunc_sats
+  → 21s, but the true count was 424k — the loop-multiplier isn't uniform across ops.)
+- **Two asm-lane wins locked (bit-identical, 87 asm tests green).**
+  (1) **Eliminated redundant x0 round-trips in `local_get`/`local_set`/`local_tee`** (each emitted
+  `move y→x0; move x0→y` → now a single `move y→y`). BEAM's `beam_clean` already folds these at compile
+  time, so the runtime effect is tiny — but the **emitted asm is ~half the size → faster BEAM compile**,
+  which materially helps eager-asm (compiles every fn upfront).
+  (2) **Inlined `guest_fcmp`'s finite-float fast path into BEAM asm** (`AsmOps.Floats.fcompare`): an
+  `is_float`×2 guard + a BEAM `test` (`is_eq`/`is_ne`/`is_lt`/`is_ge`) yields 0/1 directly — no
+  `call_ext`. Nonfinite `{:nonfinite,…}` operands fall back to `guest_fcmp` (bit-identical NaN-unordered
+  semantics). `is_eq`/`is_ne` (not `_exact`) so `-0.0 == 0.0` matches the interp. Confirmed: only 164 of
+  22.8M compares hit the slow path. ~5× per-op faster (12.3ns→~3ns).
+  **acorn rung: tier-async 26s→23.9s (8%), eager-asm 24s→20.0s (17%).** Cumulative session:
+  **tier-async 84s→23.9s (3.5x), eager-asm 117s→20.0s (5.9x).**
 
 ## Next (ordered, proof-gated)
 
@@ -119,11 +151,18 @@ WASM→BEAM lowering more native/efficient, migrating off it only where it truly
    layer with a proper POSIX/syscall surface (fs→pluggable backend, gated net, clock/rand, no
    host exec) — this is what lets recompiled Rust/Go/C/C++ (lane 2) and emulated binaries
    (lane 3) run. The `TinyLasers.Store` stub and the host_* modules are placeholders for this.
-3. **Native-speed lever (R0) — in progress.** Measure how close `TinyLasers.Wasm`'s WASM→BEAM
-   lowering gets to native BeamAsm on a compute kernel; improve it. **First win: f32/f64 asm memory
-   ops (acorn 3-4.5×).** Next: inline the f64/i32 load + fuel-charge fast paths into BEAM asm to drop
-   the ~51M/run remote `call_ext` seam calls; strip the rollup bundle's dead watcher stack for the
-   daily gate. This is the differentiating PoC.
+3. **Native-speed lever (R0) — in progress; the wall is now Porffor op-count, not runtime seams.**
+   Measure how close `TinyLasers.Wasm`'s WASM→BEAM lowering gets to native BeamAsm; improve it.
+   **Wins so far: f32/f64 asm memory ops (acorn 3-4.5×), fload/fstore aligned fast path (+8-13%),
+   redundant-move elimination + inlined fcmp finite fast path (eager-asm 24s→20.0s, 17%).** Cumulative
+   acorn: tier-async 84s→23.9s (3.5×), eager-asm 117s→20.0s (5.9×). **Deep instrumentation proved the
+   remaining ~22s is ~6.3B cheap BEAM ops (Porffor emits ~19M WASM ops/token) — the per-op cost is
+   already near-native; the op COUNT is the wall.** Next levers (long-term, Porffor codegen):
+   (a) cut the polymorphic 20-branch type-dispatch if-chain per property access (inline cache / hidden
+   classes — likely ~3s of the run is pure dispatch overhead); (b) CSE redundant `local_get`/`trunc_sat`
+   on the same f64 pointer (Porffor re-truncs the same address per use); (c) evaluate dropping the f64
+   pointer representation. Smaller runtime lever remaining: inline the `guest_fload` aligned fast path
+   (1.15s, ~0.5s achievable) — complex/risky, deprioritized vs the op-count work.
 4. **Fix inherited bugs** — the asm EH-op fallback (the skipped test), as the transpile lane
    matures.
 5. **Full rebrand (optional cleanup).** Internal runtime atoms are still `:washy_*` (ETS / pdict

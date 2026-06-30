@@ -30,8 +30,6 @@ defmodule TinyLasers.Js.PorfforHost do
   write the result region of the running module directly.
   """
 
-  alias TinyLasers.Wasm
-
   @doc """
   The `e` import handler. Receives the 6 f64 args (pointers/lengths as floats), reads the op + request
   out of guest memory, dispatches, writes the result back into the caller's region, returns the byte
@@ -64,11 +62,26 @@ defmodule TinyLasers.Js.PorfforHost do
   # Raw byte echo (the request bytes straight back) — proves the buffer-back path with no transform.
   defp dispatch("echo", req), do: {:ok, req}
 
-  # The rollup ops (rollup_parse / rollup_parse_b64 / rollup_xxhash_*) route to a Rust-parser WASM module
-  # via the (not-yet-migrated) HostRollup bridge. Stubbed to :error for now — the live-compile lane needs
-  # only echo, and a guest that needs rollup_parse fails loudly rather than crashing the host. Un-stub by
-  # bringing HostRollup over (the rollup conformance chunk).
+  defp dispatch("rollup_parse", req) do
+    %{"ok" => true, "b64" => b64} = TinyLasers.Wasm.HostRollup.call("rollup_parse", [req, false, false])
+    {:ok, Base.decode64!(b64)}
+  end
+
+  defp dispatch("rollup_parse_b64", req) do
+    %{"ok" => true, "b64" => b64} = TinyLasers.Wasm.HostRollup.call("rollup_parse", [req, false, false])
+    {:ok, b64}
+  end
+
+  defp dispatch("rollup_xxhash_b64url", req), do: xxhash(req, "b64url")
+  defp dispatch("rollup_xxhash_b36", req), do: xxhash(req, "b36")
+  defp dispatch("rollup_xxhash_b16", req), do: xxhash(req, "b16")
+
   defp dispatch(_unknown, _req), do: :error
+
+  defp xxhash(b64_input, kind) do
+    %{"h" => h} = TinyLasers.Wasm.HostRollup.call("rollup_xxhash", [b64_input, kind])
+    {:ok, h}
+  end
 
   # Porffor passes pointers/lengths as f64; truncate to integer addresses.
   defp t(v) when is_float(v), do: trunc(v)

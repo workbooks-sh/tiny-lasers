@@ -22,6 +22,17 @@ defmodule TinyLasers.Js.Debug do
 
   CLI: `mix porffor.debug <file.js> [--fuel N] [--top N] [--transpile] [--prelude P]`.
 
+  ## Predictive conformance stack (cheap gates before test262/bundles)
+
+  Use `mix porffor.check [file.js]` for the full tiered workflow, or individual tools:
+
+    * `mix porffor.preflight <file.js>` — AST seam scanner (`TinyLasers.Js.Preflight`)
+    * `mix porffor.census [--compare]` — feature probe matrix vs node (`TinyLasers.Js.Census`)
+    * `mix porffor.coverage <file.js>` — WASM→ASM native % (`TinyLasers.Js.AsmCoverage`)
+    * `TinyLasers.Js.Porffor.check_invariants/1` — closure-conversion invariant gate
+
+  See `conformance/README.work` for CI posture and tier ordering.
+
   ## Methodology — how to debug the Porffor→TinyLasers.Wasm lane fast (read before grinding)
 
   The wall-clock killer is **serial guess-and-rerun**. The fixes that made this lane tractable:
@@ -119,7 +130,9 @@ defmodule TinyLasers.Js.Debug do
     # `report_error: true` makes Porffor.compile surface the raw compiler stderr on failure
     # (`{:error, {:compile_error, msg}}`) instead of the opaque `:unsupported`, so the test262 harness can
     # classify a parse-phase SyntaxError (a spec-correct rejection) distinctly. Off by default.
-    compile_opts = [debug: true] ++ Keyword.take(opts, [:report_error])
+    # `skip_invariants: true` bypasses the cc_invariants gate — for probing whether a flagged shape is a REAL
+    # miscompile (run + compare) or a false positive, without weakening the production gate.
+    compile_opts = [debug: true] ++ Keyword.take(opts, [:report_error, :skip_invariants])
 
     with {:ok, wasm} <- Porffor.compile(js, root, compile_opts),
          {:ok, mod} <- TinyLasers.Wasm.decode_cached(wasm) do

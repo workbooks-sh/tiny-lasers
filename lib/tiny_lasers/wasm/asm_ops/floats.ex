@@ -213,8 +213,11 @@ defmodule TinyLasers.Wasm.AsmOps.Floats do
   end
 
   # ── float compares (pop 2, push 0/1) ───────────────────────────────────────────────────────────────
-  # Route through TinyLasers.Wasm.guest_fcmp (IEEE: NaN is unordered, so only `ne` is true on NaN) — the SAME
-  # fcmp the interpreter uses. (BEAM term order would mis-rank a NaN `{:nonfinite,…}` tuple vs the interp.)
+  # Fast path: BOTH operands finite Erlang floats (the common case — Porffor f64 compares are on
+  # pointers/positions, never ±Inf/NaN) → a BEAM `test` directly yields 0/1, no call_ext. Slow path: either
+  # operand is a `{:nonfinite,…}` tuple (is_float fails) → fall back to guest_fcmp (IEEE NaN-unordered, the
+  # SAME fcmp the interp uses; BEAM term order would mis-rank a nonfinite tuple vs the interp). Bit-identical
+  # because an Erlang float (is_float true) is always finite here — decode_f boxes Inf/NaN as tuples.
   defp compares do
     %{
       0x61 => :eq, 0x62 => :ne, 0x63 => :lt, 0x64 => :gt, 0x65 => :le, 0x66 => :ge,
@@ -222,19 +225,45 @@ defmodule TinyLasers.Wasm.AsmOps.Floats do
     }
   end
 
+  # fcmp op → {BEAM test, swap-args?}. `is_eq`/`is_ne` (not _exact) so -0.0 == 0.0 matches the interp's
+  # fcompare({:fin,-0.0},{:fin,0.0})==0 → :eq true. gt/le via is_lt/is_ge with swapped operands.
+  defp fcmp_test(:eq), do: {:is_eq, false}
+  defp fcmp_test(:ne), do: {:is_ne, false}
+  defp fcmp_test(:lt), do: {:is_lt, false}
+  defp fcmp_test(:gt), do: {:is_lt, true}
+  defp fcmp_test(:le), do: {:is_ge, true}
+  defp fcmp_test(:ge), do: {:is_ge, false}
+
   defp fcompare(opcode, s) do
     if s.d < 2, do: throw(:unsupported)
     op = compares()[opcode]
+    {test_op, swap?} = fcmp_test(op)
+    l_slow = s.lbl
+    l_fail = s.lbl + 1
+    l_end = s.lbl + 2
+    args = if swap?, do: [{:x, 1}, {:x, 0}], else: [{:x, 0}, {:x, 1}]
 
     ops = [
       {:move, yd(s, s.d - 2), {:x, 0}},
       {:move, yd(s, s.d - 1), {:x, 1}},
+      # guard: both operands must be finite floats; a {:nonfinite,…} tuple → slow path
+      {:test, :is_float, {:f, l_slow}, [{:x, 0}]},
+      {:test, :is_float, {:f, l_slow}, [{:x, 1}]},
+      # fast: test_op falls through on TRUE → 1, jumps to l_fail on FALSE → 0
+      {:test, test_op, {:f, l_fail}, args},
+      {:move, {:integer, 1}, {:x, 0}},
+      {:jump, {:f, l_end}},
+      {:label, l_fail},
+      {:move, {:integer, 0}, {:x, 0}},
+      {:jump, {:f, l_end}},
+      {:label, l_slow},
       {:move, {:atom, op}, {:x, 2}},
       {:call_ext, 3, {:extfunc, @tinylasers, :guest_fcmp, 3}},
+      {:label, l_end},
       {:move, {:x, 0}, yd(s, s.d - 2)}
     ]
 
-    %{emit(s, ops) | d: s.d - 1}
+    %{emit(s, ops) | d: s.d - 1} |> bump_labels(3)
   end
 
   # f32 single-precision rounding via Transpile.f32r/1 (clobbers x0, Live=1 transient input).

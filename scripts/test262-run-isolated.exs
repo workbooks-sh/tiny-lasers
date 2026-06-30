@@ -18,6 +18,24 @@ files =
   |> Enum.reject(&String.ends_with?(&1, "_FIXTURE.js"))
   |> Enum.sort()
 
+sig_filter = System.get_env("SIG")
+
+files =
+  if sig_filter do
+    cache = TinyLasers.Js.Test262.load_signature_cache()
+    rels = Map.get(cache, sig_filter, [])
+
+    if rels == [] do
+      IO.puts("# SIG=#{sig_filter}: no cached rels — running all files in #{dir}")
+      files
+    else
+      rel_set = MapSet.new(rels)
+      Enum.filter(files, fn f -> MapSet.member?(rel_set, Path.relative_to(f, absdir)) end)
+    end
+  else
+    files
+  end
+
 start = System.get_env("START")
 batch = String.to_integer(System.get_env("BATCH", "20"))
 

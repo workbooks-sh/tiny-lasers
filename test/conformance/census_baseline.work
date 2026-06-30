@@ -1,0 +1,6 @@
+# Porffor conformance census baseline (reporting gate).
+# Update pass/total after verified improvements via: mix porffor.census --compare
+#
+pass: 57
+total: 57
+asm_native_pct: 0.0

@@ -1,0 +1,39 @@
+Predictive conformance methodology for the Porffor JS lane in tiny-lasers.
+
+Run cheap gates first, expensive conformance last. CI posture is **tiered**: hard-fail on
+invariants + closure corpus; reporting-only for census, preflight, and ASM coverage until
+baselines are locked.
+
+manifest :predictive_tiers do
+  tier 0, name: "preflight + invariants", cost: "seconds",
+    tools: "mix porffor.preflight, Porffor.check_invariants/1, check_invariants.cjs",
+    ci: "invariants hard-fail"
+
+  tier 1, name: "transform oracle + combinatorial matrices",
+    cost: "seconds",
+    tools: "cc_generate.cjs, async_generate.cjs, generator_generate.cjs, destructure_generate.cjs, transform_oracle.cjs",
+    ci: "combinatorial smoke hard-fail"
+
+  tier 2, name: "census + ASM coverage + closure corpus",
+    cost: "minutes",
+    tools: "mix porffor.census, mix porffor.coverage, closure corpus ExUnit",
+    ci: "closure corpus hard-fail; census/coverage report"
+
+  tier 3, name: "test262 + npm bundle gate",
+    cost: "minutes+",
+    tools: "mix test262 --slice, scripts/test262-run-isolated.exs, SIG= filter",
+    ci: "test262 report (isolated batches)"
+end
+
+workflow :developer do
+  step "Start with mix porffor.check [file.js] for a one-page summary"
+  step "Fix invariant failures before running test262"
+  step "Use mix test262 --slice --write-cache after a full slice run"
+  step "Re-run only affected signatures: SIG=wrong_error mix run scripts/test262-run-isolated.exs"
+end
+
+sources :manifests do
+  path "conformance/capabilities.work", role: "known gaps and denylist oracle"
+  path "test/conformance/census_baseline.work", role: "census reporting baseline"
+  path "test/conformance/test262/last_run.work", role: "signature cache for selective re-runs"
+end

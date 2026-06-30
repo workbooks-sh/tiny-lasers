@@ -1,0 +1,38 @@
+manifest :porffor_capabilities do
+  region "hard_unsupported",
+    why: "eval() and new Function() cannot work on an AOT compiler — preflight hard-blocks"
+
+  region "module",
+    why: "ES module loading not wired into the single-program lane yet"
+
+  region "async_bail",
+    why: "await in expression position — async_transform.cjs bails to blocking Porffor async"
+
+  region "generator_bail",
+    why: "yield in value position or infinite generators — generator_transform eager expansion bails"
+
+  region "temporal",
+    why: "Temporal API referenced but not implemented (parse.js flags _usesTemporal)"
+
+  region "silent_transform_fallback",
+    why: "transform pre-passes return source unchanged on error — latent miscompile risk"
+
+  region "no_gc_sigabrt",
+    why: "cross-case memory accumulation can SIGABRT BEAM — test262 runs OS-isolated batches"
+
+  region "forms_f64_global",
+    why: "forms-lane f64-global miscompile — Porffor uses asm_only prewarm"
+end
+
+skiplist :test262_flags do
+  reason flag: :module, why: "ES module loading not wired"
+  reason flag: :async, why: "async harness needs BEAM-fiber await"
+  reason flag: :raw, why: "raw cases need cjs prelude shims"
+end
+
+baseline :census do
+  note "initial baseline — update after intentional improvements"
+  pass: 57
+  total: 57
+  asm_native_pct: 0.0
+end

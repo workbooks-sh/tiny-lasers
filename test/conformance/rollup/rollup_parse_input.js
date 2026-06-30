@@ -1,0 +1,1 @@
+const x = 1 + 2; export function f(a){ return a*x; }

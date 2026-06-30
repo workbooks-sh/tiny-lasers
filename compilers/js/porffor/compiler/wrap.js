@@ -1,4 +1,5 @@
 import { importedFuncs, createImport } from './builtins.js';
+import { Valtype } from './wasmSpec.js';
 import compile from './index.js';
 import disassemble from './disassemble.js';
 import { TYPES, TYPE_NAMES } from './types.js';
@@ -511,6 +512,27 @@ export default (source, module = undefined, print = str => process.stdout.write(
   // are f64 (Porffor valtype). On Washy the real impl lives in Nexus.Compilers.Js.Porffor; this Node-side
   // stub is unused by the `wasm` compile lane (only the import SHAPE matters there).
   createImport('__host_call', 6, 1, (opPtr, opLen, reqPtr, reqLen, resPtr, resCap) => -1);
+
+  // Host-resident JS objects (`--host-objects`, externref ABI handle realization). A JS object becomes
+  // [i32 handle, TYPES.object]; the handle indexes a host-side table (TinyLasers.Js.HostObjects). Property
+  // access is a lightweight typed import (i32/f64 args, NOT the memory-exchange bridge above) keyed by
+  // Porffor's property hash. These get FULL wasm field names (ho_new/…) via the named-import support in
+  // assemble.js, so the host runtime resolves them by name. Treeshaken away when --host-objects is off.
+  // Node-side stubs are unused by the `wasm` compile lane (only the import SHAPE matters there).
+  const f64 = Valtype.f64, i32 = Valtype.i32;
+  createImport('ho_new', [], [ i32 ], () => 0);
+  createImport('ho_set', [ i32, i32, f64, i32 ], [], () => {});
+  createImport('ho_get_value', [ i32, i32 ], [ f64 ], () => 0);
+  createImport('ho_get_type', [ i32, i32 ], [ i32 ], () => 0);
+  createImport('ho_has', [ i32, i32 ], [ i32 ], () => 0);
+  createImport('ho_delete', [ i32, i32 ], [ i32 ], () => 0);
+  createImport('ho_regkey', [ i32, i32, i32, i32 ], [], () => {});
+  createImport('ho_count', [ i32 ], [ i32 ], () => 0);
+  createImport('ho_key_at', [ i32, i32, i32 ], [ i32 ], () => 0);
+  // Override the positional single-char idents with meaningful field names (named-import path).
+  for (const n of [ 'ho_new', 'ho_set', 'ho_get_value', 'ho_get_type', 'ho_has', 'ho_delete', 'ho_regkey', 'ho_count', 'ho_key_at' ]) {
+    if (importedFuncs[n]) importedFuncs[n].import = n;
+  }
 
   // Generator-fiber host imports (Washy suspension primitive). A JS generator instance runs its body on a
   // host fiber that suspends at each `yield`; these three imports drive it as PURE CONTROL-FLOW signals —

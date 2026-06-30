@@ -81,18 +81,115 @@ defmodule TinyLasers.Js.Porffor do
       else: source
   end
 
+  @transform_passes [
+    "arguments_desugar.cjs",
+    "map_desugar.cjs",
+    "spread_desugar.cjs",
+    "async_transform.cjs",
+    "generator_transform.cjs",
+    "destructure_desugar.cjs",
+    "optional_call_desugar.cjs",
+    "closure_convert.cjs"
+  ]
+
+  @doc "Run the AST pre-pass pipeline (same order as compile). Does not invoke Porffor."
+  def transform_source(source, root \\ default_root()) when is_binary(source) do
+    source
+    |> drive_async()
+    |> then(fn s ->
+      Enum.reduce(@transform_passes, s, fn script, acc ->
+        run_transform(acc, script, root, cc_invariants: cc_invariants_env?([]))
+      end)
+    end)
+  end
+
+  defp cc_invariants_env?(opts), do: Keyword.get(opts, :cc_invariants, false)
+
+  @doc """
+  Check closure-conversion invariants on source (runs transform pipeline + cc_invariants).
+  Returns `{:ok, :clean}` or `{:error, {:invariant, inv, detail}}` or `{:error, reason}`.
+  """
+  def check_invariants(source, opts \\ []) when is_binary(source) do
+    root = Keyword.get(opts, :root, default_root())
+    script = Path.expand(Path.join([root, "js", "porffor", "check_invariants.cjs"]))
+
+    unless File.regular?(script) do
+      {:error, {:invariants_missing, script}}
+    else
+      tmp = Path.join(System.tmp_dir!(), "tl_inv_#{System.unique_integer([:positive])}.js")
+
+      try do
+        transformed = transform_source(source, root)
+        File.write!(tmp, transformed)
+
+        case System.cmd("node", [@node_stack, @node_heap, script, tmp, "--transformed"], stderr_to_stdout: true) do
+          {out, 0} ->
+            parse_invariants_out(out)
+
+          {out, 1} ->
+            case parse_invariants_out(out) do
+              {:ok, :clean} -> {:error, {:invariant, :unknown, "violation reported but unparsed"}}
+              {:error, {:invariant, inv, detail}} -> {:error, {:invariant, inv, detail}}
+              other -> other
+            end
+
+          {out, _} ->
+            {:error, {:invariants_failed, String.slice(out, 0, 300)}}
+        end
+      after
+        File.rm(tmp)
+      end
+    end
+  end
+
+  defp parse_invariants_out(out) do
+    line = out |> String.trim() |> String.split("\n") |> List.last() || "{}"
+
+    cond do
+      line =~ ~s("ok":true) or line =~ ~s("ok": true) ->
+        {:ok, :clean}
+
+      true ->
+        # try first violation object in violations array
+        case Regex.run(
+               ~r/"violations"\s*:\s*\[\s*\{\s*"inv"\s*:\s*"([^"]+)"[^}]*"detail"\s*:\s*"((?:\\.|[^"\\])*)"/,
+               line
+             ) do
+          [_, inv, detail] ->
+            {:error, {:invariant, String.to_atom(inv), unescape_json(detail)}}
+
+          _ ->
+            case Regex.run(~r/"inv"\s*:\s*"([^"]+)"\s*,\s*"where"\s*:\s*"([^"]*)"\s*,\s*"detail"\s*:\s*"((?:\\.|[^"\\])*)"/, line) do
+              [_, inv, _where, detail] ->
+                {:error, {:invariant, String.to_atom(inv), unescape_json(detail)}}
+
+              _ ->
+                if line =~ ~s("ok":false) do
+                  {:error, {:invariant, :violation, String.slice(line, 0, 200)}}
+                else
+                  {:error, {:invariants_parse, line}}
+                end
+            end
+        end
+    end
+  end
+
+  defp unescape_json(s),
+    do: s |> String.replace("\\n", "\n") |> String.replace("\\\"", "\"") |> String.replace("\\\\", "\\")
+
   # Run an AST pre-pass script (compilers/js/porffor/<script>) on the host via Node. Returns the
   # transformed JS, or the original source on any error / missing script (the scripts self-fall-back too).
-  defp run_transform(source, script_name, root) do
+  defp run_transform(source, script_name, root, opts \\ []) do
     script = Path.expand(Path.join([root, "js", "porffor", script_name]))
 
     if File.regular?(script) do
       tmp = Path.join(System.tmp_dir!(), "nxc_cp_#{System.unique_integer([:positive])}.js")
+      env = if cc_invariants_env?(opts) and script_name == "closure_convert.cjs", do: [{"CC_INVARIANTS", "1"}], else: []
 
       try do
         File.write!(tmp, source)
 
-        case System.cmd("node", [@node_stack, @node_heap, script, tmp], stderr_to_stdout: false) do
+        case System.cmd("node", [@node_stack, @node_heap, script, tmp], env: env, stderr_to_stdout: false) do
           {out, 0} when byte_size(out) > 0 -> out
           _ -> source
         end
@@ -127,48 +224,72 @@ defmodule TinyLasers.Js.Porffor do
       # AST pre-pass pipeline (wb-akrf): each isolated acorn→astring transform works around a Porffor gap,
       # falling back to its input on any error (so a pass never makes things worse). Order matters —
       # generators first (may introduce closures), then closure conversion (per-instance capture).
+      cc_inv? = Keyword.get(opts, :cc_invariants, Mix.env() == :test)
+
       transformed =
         source
         |> drive_async()
-        |> run_transform("arguments_desugar.cjs", root)
-        |> run_transform("map_desugar.cjs", root)
-        |> run_transform("spread_desugar.cjs", root)
-        |> run_transform("async_transform.cjs", root)
-        |> run_transform("generator_transform.cjs", root)
-        |> run_transform("destructure_desugar.cjs", root)
-        |> run_transform("optional_call_desugar.cjs", root)
-        |> run_transform("closure_convert.cjs", root)
+        |> then(fn s ->
+          Enum.reduce(@transform_passes, s, fn script, acc ->
+            run_transform(acc, script, root, cc_invariants: cc_inv?)
+          end)
+        end)
 
-      File.write!(in_js, transformed)
+      inv_result =
+        if opts[:skip_invariants],
+          do: {:ok, :clean},
+          else: invariant_gate(check_invariants_on_transformed(transformed, root))
 
-      # `-d` makes Porffor emit the wasm "name" custom section (function names) — TinyLasers.Wasm decodes it so the
-      # profiler/tracer can report `__Porffor_malloc` instead of an opaque index. Costs ~1MB of names; only
-      # for debug runs (TinyLasers.Js.Porffor.Debug), never the shipping compile.
-      wasm_args =
-        ["wasm"] ++
-          if(opts[:debug], do: ["-d"], else: []) ++
-          (opts[:flags] || []) ++
-          [in_js, out_wasm]
+      with {:ok, :clean} <- inv_result do
+        File.write!(in_js, transformed)
 
-      try do
-        case System.cmd("node", [@node_stack, @node_heap, entry | wasm_args], stderr_to_stdout: true) do
-          {_out, 0} ->
-            if File.regular?(out_wasm) and File.stat!(out_wasm).size > 0,
-              do: {:ok, File.read!(out_wasm)},
-              else: {:error, :unsupported}
+        wasm_args =
+          ["wasm"] ++
+            if(opts[:debug], do: ["-d"], else: []) ++
+            (opts[:flags] || []) ++
+            [in_js, out_wasm]
 
-          {out, _code} ->
-            Logger.debug("porffor: unsupported — #{String.slice(out, 0, 200)}")
-            # `report_error: true` (the test262 harness) surfaces the raw compiler stderr so a *parse-phase*
-            # SyntaxError (a spec-correct rejection) can be told apart from a generic unsupported-feature gap.
-            # Default callers still get the stable `{:error, :unsupported}` shape.
-            if opts[:report_error], do: {:error, {:compile_error, String.slice(out, 0, 500)}}, else: {:error, :unsupported}
+        try do
+          case System.cmd("node", [@node_stack, @node_heap, entry | wasm_args], stderr_to_stdout: true) do
+            {_out, 0} ->
+              if File.regular?(out_wasm) and File.stat!(out_wasm).size > 0,
+                do: {:ok, File.read!(out_wasm)},
+                else: {:error, :unsupported}
+
+            {out, _code} ->
+              Logger.debug("porffor: unsupported — #{String.slice(out, 0, 200)}")
+              if opts[:report_error], do: {:error, {:compile_error, String.slice(out, 0, 500)}}, else: {:error, :unsupported}
+          end
+        rescue
+          e ->
+            Logger.debug("porffor: invoke failed — #{Exception.message(e)}")
+            {:error, :unsupported}
+        after
+          File.rm_rf(work)
         end
-      rescue
-        e -> Logger.debug("porffor: invoke failed — #{Exception.message(e)}"); {:error, :unsupported}
-      after
-        File.rm_rf(work)
       end
+    end
+  end
+
+  defp invariant_gate({:ok, :clean}), do: {:ok, :clean}
+  defp invariant_gate({:error, {:invariant, _, _} = err}), do: err
+  # checker/parse failures must not block compile — Porffor is the authority for syntax errors
+  defp invariant_gate(_), do: {:ok, :clean}
+
+  defp check_invariants_on_transformed(transformed, root) do
+    script = Path.expand(Path.join([root, "js", "porffor", "check_invariants.cjs"]))
+    tmp = Path.join(System.tmp_dir!(), "tl_inv_#{System.unique_integer([:positive])}.js")
+
+    try do
+      File.write!(tmp, transformed)
+
+      case System.cmd("node", [@node_stack, @node_heap, script, tmp, "--transformed"], stderr_to_stdout: true) do
+        {out, 0} -> parse_invariants_out(out)
+        {out, 1} -> parse_invariants_out(out)
+        {out, _} -> {:error, {:invariants_failed, String.slice(out, 0, 300)}}
+      end
+    after
+      File.rm(tmp)
     end
   end
 

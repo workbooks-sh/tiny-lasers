@@ -176,12 +176,18 @@ export default (funcs, globals, tags, pages, data, noTreeshake = false) => {
   time('type section');
 
   if (importFuncs.length > 0) {
-    section(Section.import, unsignedLEB128_length(importFuncs.length) + importFuncs.length * 5);
+    // Per import: module-name (0-len = 1 byte) + field-name (1 len byte + N name bytes) + desc (1) + typeidx (1).
+    // Single-char imports (the default `.import`, a/b/c/…) stay 5 bytes — byte-identical to before. Multi-char
+    // names (e.g. the `--host-objects` `ho_*` imports) just emit their full length, so the host runtime can
+    // resolve them by a meaningful field name instead of a positional char. (Names assumed < 128 bytes.)
+    let importSize = unsignedLEB128_length(importFuncs.length);
+    for (let i = 0; i < importFuncs.length; i++) importSize += 4 + importFuncs[i].import.length;
+    section(Section.import, importSize);
     unsigned(importFuncs.length);
     for (let i = 0; i < importFuncs.length; i++) {
       const x = importFuncs[i];
-      byte(0); byte(1);
-      byte(x.import.charCodeAt(0));
+      byte(0); byte(x.import.length);
+      for (let j = 0; j < x.import.length; j++) byte(x.import.charCodeAt(j));
       byte(ExportDesc.func);
       byte(getType(x.params, x.returns));
     }
