@@ -151,6 +151,17 @@ defmodule TinyLasers.Gate.Runtime do
 
   @doc "Property write. A cell mutates in place (shared); an immutable object returns a NEW object."
   def oput({:cell, _} = c, k, v), do: cell_put(c, k, v)
+  # `regex.lastIndex = n` updates the stateful match position and RETURNS the regex, so a member-assignment
+  # (`re.lastIndex = 0`) doesn't clobber `re` to an empty object — marked's emStrong rDelim loop relies on this.
+  def oput({:regex, _, _, _} = r, "lastIndex", v), do: (relast_set(r, trunc(to_number(v))); r)
+  def oput({:regex, _, _, _} = r, _k, _v), do: r
+
+  # assigning a function's `.prototype` (Babel `_inherits`: `Ctor.prototype = Object.create(Super.prototype)`)
+  # replaces its instance method bag, so `new Ctor()` sees the inherited chain.
+  def oput({:fn, f} = fnv, "prototype", v) do
+    Process.put(:gg_fnproto, Map.put(Process.get(:gg_fnproto, %{}), f, v))
+    fnv
+  end
 
   # functions are objects: `marked.parse = fn`, `marked.Lexer = ...`. Properties live in a per-function table
   # keyed by the closure identity (mutation is shared, like a cell). Returns the function.
@@ -169,12 +180,64 @@ defmodule TinyLasers.Gate.Runtime do
     {keys, Map.put(map, k, v)}
   end
 
+  # arrays can carry NAMED properties (JS arrays are objects): `this.tokens.links = {}` — stored in a props
+  # map alongside the elements. Numeric keys write elements; named keys write props.
+  def oput({:arr, list}, k, v), do: arr_put(list, %{}, k, v)
+  def oput({:arr, list, meta}, k, v), do: arr_put(list, meta, k, v)
   def oput(_not_obj, _k, _v), do: {[], %{}}
 
+  # write to an array: numeric key → element slot; named key → the props map (dropped from the tuple when empty).
+  defp arr_put(list, meta, k, v) do
+    case arr_index(k) do
+      nil ->
+        {:arr, list, Map.put(meta, key_str(k), v)}
+
+      idx when idx >= 0 and idx < 1_000_000 ->
+        list = if idx >= length(list), do: list ++ List.duplicate(:undefined, idx - length(list) + 1), else: list
+        list = List.replace_at(list, idx, v)
+        if meta == %{}, do: {:arr, list}, else: {:arr, list, meta}
+
+      # an out-of-sane-range index (from a NaN/huge computed key) is treated as a named prop, never a giant list.
+      idx ->
+        {:arr, list, Map.put(meta, Integer.to_string(idx), v)}
+    end
+  end
+
+  defp arr_index(i) when is_number(i), do: trunc(i)
+  defp arr_index(k) when is_binary(k), do: (case Integer.parse(k) do {n, ""} when n >= 0 -> n; _ -> nil end)
+  defp arr_index(_), do: nil
+
   @doc "Property read. Objects: by key. Arrays: numeric index + `length`. Non-objects: `:undefined`."
-  def oget({:cell, _} = c, k), do: cell_read(c) |> elem(1) |> Map.get(key_str(k), :undefined)
+  # cell property read WITH prototype-chain fallback: ES5 classes put methods on `Ctor.prototype`; a `new
+  # Ctor()` instance resolves a missing own-property from its linked prototype (see construct/2, fn_proto/1).
+  def oget({:cell, id} = c, k) do
+    key = key_str(k)
+
+    case Map.get(cell_read(c) |> elem(1), key, :__miss) do
+      :__miss ->
+        case Process.get({:gg_instproto, id}) do
+          nil -> :undefined
+          proto -> oget(proto, key)
+        end
+
+      v ->
+        v
+    end
+  end
+
+  # a function's `.prototype` is a stable per-function cell (ES5 method bag: `Ctor.prototype.m = fn`).
+  def oget({:fn, _} = fnv, "prototype"), do: fn_proto(fnv)
   def oget({:fn, f}, k), do: (Process.get(:gg_fnprops, %{}) |> Map.get(f, {[], %{}}) |> elem(1) |> Map.get(key_str(k), :undefined))
   def oget({_keys, map}, k) when is_map(map), do: Map.get(map, key_str(k), :undefined)
+  def oget({:arr, list, meta}, k) do
+    cond do
+      k == "length" -> length(list) * 1.0
+      arr_index(k) != nil -> oget({:arr, list}, k)
+      true -> Map.get(meta, key_str(k), :undefined)
+    end
+  end
+  def oget({:set, _} = st, "size"), do: length(set_list(st)) * 1.0
+  def oget({:map, _} = mp, "size"), do: length(map_pairs(mp)) * 1.0
   def oget({:arr, list}, "length"), do: length(list) * 1.0
   def oget({:arr, list}, i) when is_number(i), do: Enum.at(list, trunc(i), :undefined)
 
@@ -191,7 +254,7 @@ defmodule TinyLasers.Gate.Runtime do
   def oget({:regex, _re, _src, flags}, "global"), do: String.contains?(flags, "g")
   def oget({:regex, _re, _src, flags}, "ignoreCase"), do: String.contains?(flags, "i")
   def oget({:regex, _re, _src, flags}, "multiline"), do: String.contains?(flags, "m")
-  def oget({:regex, _re, _src, _flags}, "lastIndex"), do: 0.0
+  def oget({:regex, _, _, _} = r, "lastIndex"), do: relast_get(r) * 1.0
 
   # string properties: `.length` and index access `s[i]` (JS returns a 1-char string).
   def oget(s, "length") when is_binary(s), do: byte_size(s) * 1.0
@@ -205,8 +268,12 @@ defmodule TinyLasers.Gate.Runtime do
   def oget({:global, "Number"}, "MAX_VALUE"), do: 1.7976931348623157e308
   def oget({:global, "Number"}, "MIN_VALUE"), do: 5.0e-324
   def oget({:global, "Number"}, "MAX_SAFE_INTEGER"), do: 9_007_199_254_740_991.0
-  def oget({:global, _}, "prototype"), do: cell_new([])
+  def oget({:global, name}, "prototype"), do: {:proto, name}
   def oget({:global, _}, _), do: :undefined
+
+  def oget({:proto, _}, "toString"), do: {:protom, :tostring}
+  def oget({:proto, _}, "hasOwnProperty"), do: {:protom, :hasown}
+  def oget({:proto, _}, _), do: :undefined
 
   def oget(_not_obj, _k), do: :undefined
 
@@ -265,12 +332,8 @@ defmodule TinyLasers.Gate.Runtime do
   end
 
   @doc "Functional index/key write. Arrays grow to fit; objects add the key. Returns a NEW term."
-  def oput_idx({:arr, list}, i, v) when is_number(i) do
-    idx = trunc(i)
-    list = if idx >= length(list), do: list ++ List.duplicate(:undefined, idx - length(list) + 1), else: list
-    {:arr, List.replace_at(list, idx, v)}
-  end
-
+  def oput_idx({:arr, list}, i, v), do: arr_put(list, %{}, i, v)
+  def oput_idx({:arr, list, meta}, i, v), do: arr_put(list, meta, i, v)
   def oput_idx({:cell, _} = c, k, v), do: cell_put(c, k, v)
   def oput_idx({:globalobj}, k, v), do: oput({:globalobj}, k, v)
   def oput_idx(other, k, v), do: oput(other, k, v)
@@ -338,12 +401,37 @@ defmodule TinyLasers.Gate.Runtime do
     end
   end
 
-  def method({:regex, re, _, _}, "test", [s | _]), do: Regex.match?(re, to_str(s))
+  # `lastIndex` state is per-regex-term (structural key), so a global/sticky regex resumes across exec/test
+  # calls (marked's reflinkSearch mask loop + emStrong rDelim loop rely on this).
+  defp relast_get(r), do: Process.get({:gg_relast, r}, 0)
+  defp relast_set(r, n), do: Process.put({:gg_relast, r}, max(n, 0))
 
-  def method({:regex, re, _, _}, "exec", [s | _]) do
-    case Regex.run(re, to_str(s)) do
-      nil -> :undefined
-      caps -> {:arr, Enum.map(caps, fn c -> c || :undefined end)}
+  def method({:regex, re, _src, flags} = r, "test", [s | _]) do
+    str = to_str(s)
+    global = String.contains?(flags, "g") or String.contains?(flags, "y")
+    start = if global, do: relast_get(r), else: 0
+
+    case start <= byte_size(str) && Regex.run(re, str, offset: start, return: :index) do
+      [{ms, ml} | _] -> (if global, do: relast_set(r, ms + ml)); true
+      _ -> (if global, do: relast_set(r, 0)); false
+    end
+  end
+
+  # JS exec: stateful for global/sticky regexes (resumes from lastIndex, advances it, resets on miss). The
+  # result array carries `.index`/`.input`. Returns `:null` on no match (marked's loops check `!= null`).
+  def method({:regex, re, _src, flags} = r, "exec", [s | _]) do
+    str = to_str(s)
+    global = String.contains?(flags, "g") or String.contains?(flags, "y")
+    start = if global, do: relast_get(r), else: 0
+
+    case start <= byte_size(str) && Regex.run(re, str, offset: start, return: :index) do
+      [{ms, ml} | _] = idxs ->
+        caps = Enum.map(idxs, fn {i, l} -> if i < 0, do: :undefined, else: binary_part(str, i, l) end)
+        if global, do: relast_set(r, ms + ml)
+        {:arr, caps, %{"index" => ms * 1.0, "input" => str}}
+
+      _ ->
+        (if global, do: relast_set(r, 0)); :null
     end
   end
 
@@ -369,6 +457,29 @@ defmodule TinyLasers.Gate.Runtime do
   doesn't resolve for the receiver type is a guest `:undefined` (never a host reach). Mutating array methods
   (push/pop/…) return `{new_receiver, result}` so the lowering can rebind an identifier receiver.
   """
+  # Set
+  def method({:set, id} = st, "add", [v | _]), do: (Process.put({:gg_set, id}, Enum.uniq(set_list(st) ++ [v])); st)
+  def method({:set, _} = st, "has", [v | _]), do: Enum.any?(set_list(st), &(&1 === v))
+  def method({:set, id} = st, "delete", [v | _]), do: (had = method(st, "has", [v]); Process.put({:gg_set, id}, Enum.reject(set_list(st), &(&1 === v))); had)
+  def method({:set, id}, "clear", _), do: (Process.put({:gg_set, id}, []); :undefined)
+  def method({:set, _} = st, "forEach", [f | _]), do: (Enum.each(set_list(st), fn v -> call(f, [v, v]) end); :undefined)
+  # Map
+  def method({:map, _} = mp, "get", [k | _]), do: (case List.keyfind(map_pairs(mp), k, 0) do {_, v} -> v; _ -> :undefined end)
+  def method({:map, id} = mp, "set", [k, v | _]), do: (Process.put({:gg_map, id}, List.keystore(map_pairs(mp), 0, {k, v})); mp)
+  def method({:map, _} = mp, "has", [k | _]), do: List.keymember?(map_pairs(mp), k, 0)
+  def method({:map, id} = mp, "delete", [k | _]), do: (had = method(mp, "has", [k]); Process.put({:gg_map, id}, List.keydelete(map_pairs(mp), k, 0)); had)
+  def method({:map, id}, "clear", _), do: (Process.put({:gg_map, id}, []); :undefined)
+  def method({:map, _} = mp, "forEach", [f | _]), do: (Enum.each(map_pairs(mp), fn {k, v} -> call(f, [v, k]) end); :undefined)
+  def method({:map, _} = mp, "keys", _), do: {:arr, Enum.map(map_pairs(mp), &elem(&1, 0))}
+  def method({:map, _} = mp, "values", _), do: {:arr, Enum.map(map_pairs(mp), &elem(&1, 1))}
+  # array-with-props delegates to the plain form but PRESERVES the props map across mutations (tokens.links
+  # must survive tokens.push).
+  def method({:arr, list, meta}, name, args) do
+    case method({:arr, list}, name, args) do
+      {:mut, {:arr, nl}, ret} -> {:mut, {:arr, nl, meta}, ret}
+      other -> other
+    end
+  end
   def method({:arr, list}, "push", args), do: {:mut, {:arr, list ++ args}, (length(list) + length(args)) * 1.0}
   def method({:arr, list}, "pop", _), do: pop_last(list)
   def method({:arr, list}, "join", [sep | _]), do: list |> Enum.map(&to_str/1) |> Enum.join(to_str(sep))
@@ -425,7 +536,8 @@ defmodule TinyLasers.Gate.Runtime do
     idx = if idx < 0, do: byte_size(s) + idx, else: idx
     if idx >= 0 and idx < byte_size(s), do: binary_part(s, idx, 1), else: :undefined
   end
-  def method(s, "repeat", [n | _]) when is_binary(s), do: String.duplicate(s, max(trunc(n), 0))
+  def method(s, "repeat", [n | _]) when is_binary(s) and is_number(n), do: String.duplicate(s, min(max(trunc(n), 0), 1_000_000))
+  def method(s, "repeat", _) when is_binary(s), do: ""
   def method(s, "padStart", [len | rest]) when is_binary(s), do: str_pad(s, len, rest, :leading)
   def method(s, "padEnd", [len | rest]) when is_binary(s), do: str_pad(s, len, rest, :trailing)
   def method(s, "startsWith", [p | _]) when is_binary(s), do: String.starts_with?(s, to_str(p))
@@ -520,9 +632,25 @@ defmodule TinyLasers.Gate.Runtime do
   defp object_static("entries", [o | _]), do: {:arr, Enum.map(okeys(o), fn k -> {:arr, [k, oget(o, k)]} end)}
   defp object_static("getOwnPropertyNames", [o | _]), do: {:arr, okeys(o)}
   defp object_static("assign", [target | sources]), do: Enum.reduce(sources, target, fn s, t -> Enum.reduce(okeys(s), t, fn k, acc -> oput(acc, k, oget(s, k)) end) end)
+  # Object.create(proto): a fresh object whose prototype chain is `proto` (Babel `_inherits`).
+  defp object_static("create", [proto | _]) when proto != :undefined and proto != :null do
+    c = cell_new([])
+    {:cell, id} = c
+    Process.put({:gg_instproto, id}, proto)
+    c
+  end
+
   defp object_static("create", _), do: cell_new([])
   defp object_static("freeze", [o | _]), do: o
-  defp object_static("defineProperty", [o, k, desc | _]), do: oput(o, to_str(k), oget(desc, "value"))
+  # defineProperty: set `value` if the descriptor carries one (Babel `_createClass` method attach); a
+  # value-less descriptor (`{writable:false}` on `Ctor.prototype`) must NOT clobber the existing property.
+  defp object_static("defineProperty", [o, k, desc | _]) do
+    cond do
+      has_own(desc, "value") -> oput(o, to_str(k), oget(desc, "value"))
+      has_own(desc, "get") -> oput(o, to_str(k), invoke(oget(desc, "get"), o, []))
+      true -> o
+    end
+  end
   defp object_static("getPrototypeOf", _), do: :undefined
   defp object_static("setPrototypeOf", [o | _]), do: o
   defp object_static(_, _), do: :undefined
@@ -629,6 +757,10 @@ defmodule TinyLasers.Gate.Runtime do
     invoke(f, this, argl)
   end
 
+  def method({:protom, :tostring}, m, [x | _]) when m in ["call", "apply"], do: to_string_tag(x)
+  def method({:protom, :tostring}, m, []) when m in ["call", "apply"], do: to_string_tag(:undefined)
+  def method({:protom, :hasown}, "call", [o, k | _]), do: has_own(o, k)
+  def method({:protom, :hasown}, "apply", [o, {:arr, [k | _]} | _]), do: has_own(o, k)
   def method({:fn, _} = f, "call", [this | rest]), do: invoke(f, this, rest)
   def method({:fn, _} = f, "call", []), do: invoke(f, :undefined, [])
 
@@ -701,6 +833,19 @@ defmodule TinyLasers.Gate.Runtime do
   the guest can only invoke it via `call/2` or `invoke/3`, and no codegen path extracts and `apply`s it."
   def closure(f) when is_function(f, 2), do: {:fn, f}
 
+  # a function's prototype cell (stable per closure) — the ES5 method bag for `new Ctor()` instances.
+  defp fn_proto({:fn, f}) do
+    case Process.get(:gg_fnproto, %{}) |> Map.get(f) do
+      nil ->
+        pc = cell_new([])
+        Process.put(:gg_fnproto, Map.put(Process.get(:gg_fnproto, %{}), f, pc))
+        pc
+
+      pc ->
+        pc
+    end
+  end
+
   # top-level function registry: late binding so forward references + mutual recursion work (fn A calls fn B
   # declared after it). Functions are few and per-run, so a small process-dict table is fine (the GC concern
   # was OBJECTS, not functions). A guest can only reach these by NAME resolved at compile time to greg_get.
@@ -714,6 +859,9 @@ defmodule TinyLasers.Gate.Runtime do
   error object; `new RegExp` is handled at the codegen level."
   def construct({:fn, _} = f, args) do
     this = cell_new([])
+    {:cell, iid} = this
+    # link the instance to its constructor's prototype so method lookups resolve ES5 class methods.
+    Process.put({:gg_instproto, iid}, fn_proto(f))
 
     case invoke(f, this, args) do
       {tag, _} = obj when tag in [:cell, :arr] -> obj
@@ -727,6 +875,20 @@ defmodule TinyLasers.Gate.Runtime do
 
   def construct({:global, "Array"}, args), do: {:arr, args}
   def construct({:global, "Object"}, _), do: cell_new([])
+  def construct({:global, "Set"}, args) do
+    id = __id()
+    init = case args do [{:arr, l} | _] -> Enum.uniq(l); _ -> [] end
+    Process.put({:gg_set, id}, init)
+    {:set, id}
+  end
+
+  def construct({:global, "Map"}, args) do
+    id = __id()
+    init = case args do [{:arr, l} | _] -> Enum.map(l, fn {:arr, [k, v | _]} -> {k, v}; _ -> {:undefined, :undefined} end); _ -> [] end
+    Process.put({:gg_map, id}, init)
+    {:map, id}
+  end
+
   def construct(_not_ctor, _args), do: guest_error("not a constructor")
 
   @doc "Invoke a guest function with an explicit `this` receiver (method call). Ungranted callees error."
@@ -799,11 +961,42 @@ defmodule TinyLasers.Gate.Runtime do
   def binop(:>, a, b) when is_binary(a) and is_binary(b), do: a > b
   def binop(:"<=", a, b) when is_binary(a) and is_binary(b), do: a <= b
   def binop(:">=", a, b) when is_binary(a) and is_binary(b), do: a >= b
-  def binop(:==, a, b), do: a === b
-  def binop(:!=, a, b), do: a !== b
+  def binop(:===, a, b), do: a === b
+  def binop(:!==, a, b), do: a !== b
+  # loose equality: `null == undefined` is true; number/string/boolean coerce (marked's `x != null` idiom).
+  def binop(:==, a, b), do: loose_eq(a, b)
+  def binop(:!=, a, b), do: not loose_eq(a, b)
+  def binop(:in, k, obj), do: has_own(obj, k)
   # relational comparison with a mismatched/non-number operand (`1 < undefined`) is false in JS (NaN).
   def binop(op, _a, _b) when op in [:<, :>, :"<=", :">="], do: false
+  # arithmetic on non-number operands: JS coerces via ToNumber; a non-coercible operand yields NaN
+  # (`undefined - 2`, `[] * 3`). marked relies on NaN propagating rather than throwing.
+  def binop(:-, a, b), do: arith(a, b, &Kernel.-/2)
+  def binop(:*, a, b), do: arith(a, b, &Kernel.*/2)
+  def binop(:rem, a, b), do: arith(a, b, fn x, y -> if y == 0, do: :nan, else: x - y * Float.floor(x / y) end)
   def binop(_op, _a, _b), do: guest_error("bad operands")
+
+  defp nullish?(:null), do: true
+  defp nullish?(:undefined), do: true
+  defp nullish?(_), do: false
+
+  defp loose_eq(a, b) do
+    cond do
+      a === b -> true
+      nullish?(a) and nullish?(b) -> true
+      is_number(a) and is_binary(b) -> (n = to_number(b); is_number(n) and a === n)
+      is_binary(a) and is_number(b) -> (n = to_number(a); is_number(n) and n === b)
+      is_boolean(a) -> loose_eq((if a, do: 1.0, else: 0.0), b)
+      is_boolean(b) -> loose_eq(a, (if b, do: 1.0, else: 0.0))
+      true -> false
+    end
+  end
+
+  defp arith(a, b, f) do
+    na = to_number(a)
+    nb = to_number(b)
+    if is_number(na) and is_number(nb), do: f.(na, nb), else: :nan
+  end
 
   def truthy(false), do: false
   def truthy(:undefined), do: false
@@ -841,7 +1034,41 @@ defmodule TinyLasers.Gate.Runtime do
   def to_str({:obj, _}), do: "[object Object]"
   def to_str({:fun, _}), do: "function"
   def to_str({:host, _}), do: "function"
+  def to_str({:arr, list}), do: list |> Enum.map(&to_str/1) |> Enum.join(",")
+  def to_str({:arr, list, _}), do: to_str({:arr, list})
+  def to_str({:regex, _, src, flags}), do: "/" <> src <> "/" <> flags
   def to_str(_), do: "[unknown]"
+
+  defp set_list({:set, id}), do: Process.get({:gg_set, id}, [])
+  defp map_pairs({:map, id}), do: Process.get({:gg_map, id}, [])
+
+  defp to_string_tag(x) do
+    tag =
+      cond do
+        is_number(x) -> "Number"
+        is_binary(x) -> "String"
+        is_boolean(x) -> "Boolean"
+        x == :undefined -> "Undefined"
+        x == :null -> "Null"
+        match?({:arr, _}, x) or match?({:arr, _, _}, x) -> "Array"
+        match?({:regex, _, _, _}, x) -> "RegExp"
+        match?({:fn, _}, x) or match?({:host, _}, x) or match?({:globalfn, _}, x) -> "Function"
+        true -> "Object"
+      end
+    "[object " <> tag <> "]"
+  end
+
+  defp has_own(o, k) do
+    key = key_str(k)
+    case o do
+      {:cell, _} -> Map.has_key?(cell_read(o) |> elem(1), key)
+      {:fn, f} -> Process.get(:gg_fnprops, %{}) |> Map.get(f, {[], %{}}) |> elem(1) |> Map.has_key?(key)
+      {keys, map} when is_map(map) -> Map.has_key?(map, key)
+      {:globalobj} -> Process.get(:gg_global, {[], %{}}) |> elem(1) |> Map.has_key?(key)
+      {:arr, list} -> key == "length" or match?({n, ""} when n >= 0 and n < length(list), Integer.parse(key))
+      _ -> false
+    end
+  end
 
   @doc "A guest-level exception. NOT a host escape — the driver catches it as a guest error."
   def guest_error(reason), do: throw({:gg_guest_error, reason})
@@ -854,6 +1081,8 @@ defmodule TinyLasers.Gate.Runtime do
   def throw_val(v), do: throw({:gg_throw, v})
 
   @doc "for-of iteration items: array elements, or a string's chars (1-char binaries)."
+  def iter({:arr, list, _}), do: list
+  def iter({:set, _} = st), do: set_list(st)
   def iter({:arr, list}), do: list
   def iter(s) when is_binary(s), do: for <<c::utf8 <- s>>, do: <<c::utf8>>
   def iter(_), do: []
@@ -861,6 +1090,7 @@ defmodule TinyLasers.Gate.Runtime do
   @doc "for-in enumeration keys: object own-keys, array index strings, or none."
   def enum_keys({keys, map}) when is_map(map), do: keys
   def enum_keys({:cell, _} = c), do: elem(cell_read(c), 0)
+  def enum_keys({:arr, list, _}), do: enum_keys({:arr, list})
   def enum_keys({:arr, list}), do: Enum.map(0..(length(list) - 1)//1, &Integer.to_string/1)
   def enum_keys(_), do: []
 
@@ -876,6 +1106,7 @@ defmodule TinyLasers.Gate.Runtime do
   def typeof({:regex, _, _, _}), do: "object"
   def typeof({:global, _}), do: "function"
   def typeof({:globalfn, _}), do: "function"
+  def typeof(:null), do: "object"
   def typeof(_), do: "object"
 
   # ── DoS primitives (emitted only for the red-team's containment tests) ──

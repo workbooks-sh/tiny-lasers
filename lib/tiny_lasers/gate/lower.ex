@@ -31,7 +31,7 @@ defmodule TinyLasers.Gate.Lower do
   def program(%{"type" => "Program", "body" => body}, granted) do
     vars = collect_vars(body) |> Enum.uniq()
     boxed = boxed_set(vars, body)
-    scope0 = %{locals: Enum.reduce(vars, MapSet.new(), &MapSet.put(&2, &1)), granted: granted, funcs: MapSet.new(), boxed: boxed}
+    scope0 = %{locals: Enum.reduce(vars, MapSet.new(), &MapSet.put(&2, &1)), granted: granted, funcs: MapSet.new(), boxed: boxed, fnmap: %{}}
     {stmts, _scope} = stmts(body, scope0)
     # top-level `this` IS the global object; pre-bind hoisted vars (a boxed var gets a box — JS var hoisting).
     prelude =
@@ -59,8 +59,8 @@ defmodule TinyLasers.Gate.Lower do
     {Enum.reverse(rev), sc}
   end
 
-  defp hoist(%{"type" => "FunctionDeclaration", "id" => %{"name" => n}}, s),
-    do: %{s | funcs: MapSet.put(s[:funcs] || MapSet.new(), n)}
+  defp hoist(%{"type" => "FunctionDeclaration", "id" => %{"name" => n}} = f, s),
+    do: %{s | funcs: MapSet.put(s[:funcs] || MapSet.new(), n), fnmap: Map.put(s[:fnmap] || %{}, n, fnkey(n, f))}
 
   defp hoist(%{"type" => "VariableDeclaration", "declarations" => ds}, s) do
     Enum.reduce(ds, s, fn %{"id" => %{"name" => n}}, acc -> %{acc | locals: MapSet.put(acc.locals, n)} end)
@@ -90,8 +90,10 @@ defmodule TinyLasers.Gate.Lower do
   # top-level (and nested) function declarations register in the late-bound function registry, so forward
   # references and mutual recursion work regardless of source order.
   defp stmt(%{"type" => "FunctionDeclaration", "id" => %{"name" => n}} = f, scope) do
+    key = fnkey(n, f)
+    scope = %{scope | funcs: MapSet.put(scope[:funcs] || MapSet.new(), n), fnmap: Map.put(scope[:fnmap] || %{}, n, key)}
     fq = func(f["params"], f["body"], scope)
-    {quote(do: unquote(@runtime).greg_set(unquote(n), unquote(fq))), %{scope | funcs: MapSet.put(scope[:funcs] || MapSet.new(), n)}}
+    {quote(do: unquote(@runtime).greg_set(unquote(key), unquote(fq))), scope}
   end
 
   defp stmt(%{"type" => "ReturnStatement", "argument" => arg}, scope) do
@@ -201,7 +203,12 @@ defmodule TinyLasers.Gate.Lower do
   defp stmt(%{"type" => "TryStatement"} = n, scope) do
     handler = n["handler"]
     param = handler && handler["param"] && handler["param"]["name"]
-    hscope = if param, do: %{scope | locals: MapSet.put(scope.locals, param)}, else: scope
+    # the catch param is a FRESH plain binding (`gg_param = thrown`); if it shadows an outer boxed var of the
+    # same name, drop it from `boxed` in the handler so reads use the plain binding (not box_get on a raw value).
+    hscope =
+      if param,
+        do: %{scope | locals: MapSet.put(scope.locals, param), boxed: MapSet.delete(scope[:boxed] || MapSet.new(), param)},
+        else: scope
 
     {blockq, _} = stmt(n["block"], scope)
     {handlerq, _} = if handler, do: stmt(handler["body"], hscope), else: {:undefined, scope}
@@ -360,13 +367,12 @@ defmodule TinyLasers.Gate.Lower do
   # this.x=v and aliasing work). A pure data bag → an immutable {keys,map} term (GC'd, the H1 win). Spread
   # objects stay immutable (spread builds a fresh object).
   defp expr(%{"type" => "ObjectExpression", "properties" => props}, scope) do
+    # JS objects are REFERENCE types: aliasing + shared mutation is load-bearing (marked builds its grammar
+    # once and mutates shared sub-objects that were copied by reference via Object.assign). So every object
+    # literal is a mutable cell. Per-run process isolation reclaims the cell table when the run process dies.
     has_spread = Enum.any?(props, &(&1["type"] == "SpreadElement"))
-    has_method = Enum.any?(props, &method_prop?/1)
-    # an EMPTY {} literal is almost always a mutable accumulator/instance-to-be-filled (UMD export, builder
-    # target); a NON-empty data-bag literal is usually complete → immutable (GC'd, the H1 flood).
-    empty = props == []
 
-    if (has_method or empty) and not has_spread do
+    if not has_spread do
       pairs =
         Enum.map(props, fn p ->
           kq = if p["computed"], do: expr(p["key"], scope), else: key_of(p["key"])
@@ -375,7 +381,8 @@ defmodule TinyLasers.Gate.Lower do
 
       quote(do: unquote(@runtime).cell_new(unquote(pairs)))
     else
-      Enum.reduce(props, quote(do: unquote(@runtime).olit()), fn p, acc ->
+      # spread: start from an empty cell and merge/set each property in order.
+      Enum.reduce(props, quote(do: unquote(@runtime).cell_new([])), fn p, acc ->
         case p do
           %{"type" => "SpreadElement", "argument" => a} ->
             quote(do: unquote(@runtime).omerge(unquote(acc), unquote(expr(a, scope))))
@@ -600,7 +607,13 @@ defmodule TinyLasers.Gate.Lower do
     thisvar = Macro.var(:__ggthis, __MODULE__)
     # hoist this function's `var` declarations (JS function scope), pre-bound to :undefined.
     bodyvars = collect_vars(body) |> Enum.uniq() |> Enum.reject(&(&1 in names))
-    inner = Enum.reduce(names ++ bodyvars, scope.locals, &MapSet.put(&2, &1))
+    uses_args? = "arguments" in all_idents(body)
+    inner0 = Enum.reduce(names ++ bodyvars, scope.locals, &MapSet.put(&2, &1))
+    inner1 = if uses_args?, do: MapSet.put(inner0, "arguments"), else: inner0
+    # a function declared directly in this body binds to the registry (greg), shadowing any inherited local of
+    # the same name (babel class IIFEs: `var K = (function(){ function K(){} return K })()`).
+    fndecls = fndecl_names(body)
+    inner = MapSet.difference(inner1, fndecls)
 
     # a param/var captured by a nested function AND mutated is BOXED so the closures share the mutation.
     boxed = boxed_set(names ++ bodyvars, body)
@@ -611,6 +624,11 @@ defmodule TinyLasers.Gate.Lower do
           do: quote(do: unquote(lvar(v)) = unquote(@runtime).box(:undefined)),
           else: quote(do: unquote(lvar(v)) = :undefined)
       end)
+
+    argbind =
+      if uses_args?,
+        do: [quote(do: unquote(lvar("arguments")) = {:arr, unquote(argvar)})],
+        else: []
 
     binds =
       names
@@ -624,9 +642,9 @@ defmodule TinyLasers.Gate.Lower do
 
     # a param/var here SHADOWS an outer boxed var of the same name — the inner one is a distinct variable, so
     # drop shadowed names from the inherited boxed set before unioning this scope's boxed vars.
-    shadow = MapSet.new(names ++ bodyvars)
+    shadow = MapSet.union(MapSet.new(names ++ bodyvars), fndecls)
     inherited = MapSet.difference(scope[:boxed] || MapSet.new(), shadow)
-    bscope = %{scope | locals: inner, boxed: MapSet.union(inherited, boxed)}
+    bscope = %{scope | locals: inner, boxed: MapSet.difference(MapSet.union(inherited, boxed), fndecls)}
 
     # #6 direct-return optimization: if returns appear ONLY at the body's tail (or not at all), compile
     # without the try/catch/throw machinery — the block's value IS the result. Avoids one throw+catch per call
@@ -645,8 +663,8 @@ defmodule TinyLasers.Gate.Lower do
     if tail_return? do
       {value_stmts, _} =
         if last && last["type"] == "ReturnStatement" do
-          {init, _} = stmts(Enum.drop(stmts_list, -1), bscope)
-          {init ++ [expr(last["argument"] || %{"type" => "Literal", "value" => nil}, bscope)], bscope}
+          {init, sc} = stmts(Enum.drop(stmts_list, -1), bscope)
+          {init ++ [expr(last["argument"] || %{"type" => "Literal", "value" => nil}, sc)], sc}
         else
           {sq, sc} = stmts(stmts_list, bscope)
           {sq ++ [:undefined], sc}
@@ -654,7 +672,7 @@ defmodule TinyLasers.Gate.Lower do
 
       quote do
         unquote(@runtime).closure(fn unquote(thisvar), unquote(argvar) ->
-          unquote_splicing(hoistq ++ binds ++ value_stmts)
+          unquote_splicing(hoistq ++ binds ++ argbind ++ value_stmts)
         end)
       end
     else
@@ -663,7 +681,7 @@ defmodule TinyLasers.Gate.Lower do
       quote do
         unquote(@runtime).closure(fn unquote(thisvar), unquote(argvar) ->
           try do
-            unquote_splicing(hoistq ++ binds ++ bq)
+            unquote_splicing(hoistq ++ binds ++ argbind ++ bq)
             :undefined
           catch
             :throw, {:gg_return, v} -> v
@@ -728,7 +746,7 @@ defmodule TinyLasers.Gate.Lower do
   defp assigned_names(_), do: []
 
   # ── helpers ──
-  @globals ~w(Object Array Math JSON String Number Boolean Error TypeError RangeError SyntaxError)
+  @globals ~w(Object Array Math JSON String Number Boolean Error TypeError RangeError SyntaxError Set Map)
   @global_fns ~w(parseInt parseFloat isNaN isFinite encodeURIComponent decodeURIComponent encodeURI decodeURI)
 
   defp ident(n, scope) do
@@ -742,7 +760,8 @@ defmodule TinyLasers.Gate.Lower do
       n in @globals and not (scope[:funcs] && MapSet.member?(scope.funcs, n)) -> {:{}, [], [:global, n]}
       n in @global_fns and not (scope[:funcs] && MapSet.member?(scope.funcs, n)) -> {:{}, [], [:globalfn, n]}
       # a top-level function name resolves LATE via the registry (forward refs + mutual recursion)
-      is_map(scope) and scope[:funcs] && MapSet.member?(scope.funcs, n) -> quote(do: unquote(@runtime).greg_get(unquote(n)))
+      is_map(scope) and scope[:funcs] && MapSet.member?(scope.funcs, n) ->
+        quote(do: unquote(@runtime).greg_get(unquote((scope[:fnmap] || %{})[n] || n)))
       # a granted capability compiles to its integer handle — never a host module atom
       is_map(scope[:granted]) and Map.has_key?(scope.granted, n) -> {:{}, [], [:host, scope.granted[n]]}
       true -> :undefined
@@ -751,9 +770,24 @@ defmodule TinyLasers.Gate.Lower do
 
   defp lvar(n), do: Macro.var(String.to_atom("gg_" <> n), __MODULE__)
 
+  # a per-declaration-SITE registry key so two different functions minified to the same name (marked's classes
+  # all minify their inner constructor to `function u`) don't collide in the global late-bound registry.
+  defp fnkey(n, %{"start" => s}), do: n <> "$" <> Integer.to_string(s)
+  defp fnkey(n, _), do: n
+
   # JS `var` is FUNCTION-scoped and hoisted: collect every var name in a subtree (stopping at nested function
   # boundaries) so they can be pre-bound to :undefined at the function/program top. Fixes vars declared inside
   # nested blocks/if/switch referenced elsewhere in the same function.
+  # names of function declarations directly in a body (not descending into nested functions/blocks).
+  defp fndecl_names(%{"type" => "BlockStatement", "body" => body}), do: fndecl_names(body)
+  defp fndecl_names(list) when is_list(list) do
+    list
+    |> Enum.filter(&(is_map(&1) and &1["type"] == "FunctionDeclaration"))
+    |> Enum.map(& &1["id"]["name"])
+    |> MapSet.new()
+  end
+  defp fndecl_names(_), do: MapSet.new()
+
   defp collect_vars(nil), do: []
 
   defp collect_vars(%{"type" => t}) when t in ["FunctionExpression", "FunctionDeclaration", "ArrowFunctionExpression"],
@@ -826,7 +860,7 @@ defmodule TinyLasers.Gate.Lower do
   defp lit(v) when is_binary(v), do: v
   defp lit(true), do: true
   defp lit(false), do: false
-  defp lit(nil), do: :undefined
+  defp lit(nil), do: :null
 
   defp binop_atom("+"), do: :+
   defp binop_atom("-"), do: :-
@@ -836,10 +870,19 @@ defmodule TinyLasers.Gate.Lower do
   defp binop_atom(">"), do: :>
   defp binop_atom("<="), do: :"<="
   defp binop_atom(">="), do: :">="
-  defp binop_atom("==="), do: :==
+  defp binop_atom("==="), do: :===
   defp binop_atom("=="), do: :==
-  defp binop_atom("!=="), do: :!=
+  defp binop_atom("!=="), do: :!==
   defp binop_atom("!="), do: :!=
   defp binop_atom("%"), do: :rem
+  defp binop_atom("&"), do: :band
+  defp binop_atom("|"), do: :bor
+  defp binop_atom("^"), do: :bxor
+  defp binop_atom("<<"), do: :bsl
+  defp binop_atom(">>"), do: :bsr
+  defp binop_atom(">>>"), do: :bsru
+  defp binop_atom("**"), do: :pow
+  defp binop_atom("in"), do: :in
+  defp binop_atom("instanceof"), do: :instanceof
   defp binop_atom(_), do: :bad
 end

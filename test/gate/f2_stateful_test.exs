@@ -34,7 +34,9 @@ defmodule TinyLasers.Gate.F2StatefulTest do
     assert %{ext: [], bifs: []} = TinyLasers.Gate.dangerous_refs(bin)
   end
 
-  test "data bags stay immutable (copy-on-write) — H1 preserved for the object flood" do
-    assert %{result: {:ok, 1.0}} = Js.run("var d = { a: 1 }; var e = d; e.a = 5; d.a")
+  test "objects are REFERENCE types: aliasing shares mutation (correct JS semantics)" do
+    # JS objects are references — `e = d` aliases, so `e.a = 5` is visible through `d`. (The earlier
+    # immutable-data-bag model was abandoned for correctness; every object literal is now a mutable cell.)
+    assert %{result: {:ok, 5.0}} = Js.run("var d = { a: 1 }; var e = d; e.a = 5; d.a")
   end
 end
