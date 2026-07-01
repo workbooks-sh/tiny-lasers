@@ -120,7 +120,9 @@ defmodule TinyLasers.Gate.Runtime do
   @doc "Empty direct-term object."
   def olit, do: {[], %{}}
 
-  @doc "Functional property write on a direct-term object (insertion-ordered). Returns a NEW object."
+  @doc "Property write. A cell mutates in place (shared); an immutable object returns a NEW object."
+  def oput({:cell, _} = c, k, v), do: cell_put(c, k, v)
+
   def oput({keys, map}, k, v) do
     k = key_str(k)
     keys = if Map.has_key?(map, k), do: keys, else: keys ++ [k]
@@ -130,6 +132,7 @@ defmodule TinyLasers.Gate.Runtime do
   def oput(_not_obj, _k, _v), do: {[], %{}}
 
   @doc "Property read. Objects: by key. Arrays: numeric index + `length`. Non-objects: `:undefined`."
+  def oget({:cell, _} = c, k), do: cell_read(c) |> elem(1) |> Map.get(key_str(k), :undefined)
   def oget({_keys, map}, k) when is_map(map), do: Map.get(map, key_str(k), :undefined)
   def oget({:arr, list}, "length"), do: length(list) * 1.0
   def oget({:arr, list}, i) when is_number(i), do: Enum.at(list, trunc(i), :undefined)
@@ -160,11 +163,48 @@ defmodule TinyLasers.Gate.Runtime do
     {keys, map}
   end
 
+  def omerge({:cell, _} = c, b), do: omerge(cell_read(c), b)
+  def omerge(a, {:cell, _} = c), do: omerge(a, cell_read(c))
   def omerge(a, _non_obj), do: a
 
   @doc "Ordered own-keys of a direct-term object."
   def okeys({keys, map}) when is_map(map), do: keys
+  def okeys({:cell, _} = c), do: elem(cell_read(c), 0)
   def okeys(_), do: []
+
+  # ── MUTABLE CELL objects (stateful instances: things with methods, e.g. a Lexer/Parser). Few and long-
+  # lived, so a per-run process-dict table is fine (the GC concern is the transient object FLOOD, which stays
+  # immutable {keys,map}). A cell mutates IN PLACE, so `this.x = v` and shared-object aliasing work. The guest
+  # holds only the integer id inside {:cell, id} — still no atom/pid/fun crosses the boundary. ──
+  @doc "Allocate a mutable-cell object from ordered {key, value} pairs. Returns `{:cell, id}`."
+  def cell_new(pairs) do
+    id = cell_id()
+    {keys, map} =
+      Enum.reduce(pairs, {[], %{}}, fn {k, v}, {ks, m} ->
+        k = key_str(k)
+        if Map.has_key?(m, k), do: {ks, Map.put(m, k, v)}, else: {ks ++ [k], Map.put(m, k, v)}
+      end)
+
+    Process.put(:gg_cells, Map.put(Process.get(:gg_cells, %{}), id, {keys, map}))
+    {:cell, id}
+  end
+
+  defp cell_id do
+    n = Process.get(:gg_cell_next, 0)
+    Process.put(:gg_cell_next, n + 1)
+    n
+  end
+
+  defp cell_read({:cell, id}), do: Process.get(:gg_cells, %{}) |> Map.get(id, {[], %{}})
+
+  @doc "In-place property write on a cell. Returns the SAME handle (mutation is shared)."
+  def cell_put({:cell, id} = c, k, v) do
+    k = key_str(k)
+    {keys, map} = cell_read(c)
+    keys = if Map.has_key?(map, k), do: keys, else: keys ++ [k]
+    Process.put(:gg_cells, Map.put(Process.get(:gg_cells, %{}), id, {keys, Map.put(map, k, v)}))
+    c
+  end
 
   @doc "Functional index/key write. Arrays grow to fit; objects add the key. Returns a NEW term."
   def oput_idx({:arr, list}, i, v) when is_number(i) do
@@ -173,6 +213,7 @@ defmodule TinyLasers.Gate.Runtime do
     {:arr, List.replace_at(list, idx, v)}
   end
 
+  def oput_idx({:cell, _} = c, k, v), do: cell_put(c, k, v)
   def oput_idx(other, k, v), do: oput(other, k, v)
 
   # ── array direct-term (a tagged immutable list, GC'd) ──
@@ -311,6 +352,16 @@ defmodule TinyLasers.Gate.Runtime do
   def method({_keys, map} = o, name, args) when is_map(map) do
     case oget(o, name) do
       {:fn, _} = f -> invoke(f, o, args)
+      _ -> guest_error("not a function")
+    end
+  end
+
+  # a mutable-cell instance: `hasOwnProperty`, else a function-valued property is a method with this=the cell.
+  def method({:cell, _} = c, "hasOwnProperty", [k | _]), do: Map.has_key?(cell_read(c) |> elem(1), key_str(k))
+
+  def method({:cell, _} = c, name, args) do
+    case oget(c, name) do
+      {:fn, _} = f -> invoke(f, c, args)
       _ -> guest_error("not a function")
     end
   end
@@ -474,6 +525,7 @@ defmodule TinyLasers.Gate.Runtime do
   def typeof(:undefined), do: "undefined"
   def typeof({:fn, _}), do: "function"
   def typeof({:host, _}), do: "function"
+  def typeof({:cell, _}), do: "object"
   def typeof(_), do: "object"
 
   # ── DoS primitives (emitted only for the red-team's containment tests) ──

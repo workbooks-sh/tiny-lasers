@@ -251,17 +251,33 @@ defmodule TinyLasers.Gate.Lower do
   defp expr(%{"type" => "Identifier", "name" => n}, scope), do: ident(n, scope)
   defp expr(%{"type" => "ThisExpression"}, _scope), do: Macro.var(:__ggthis, __MODULE__)
 
+  # An object literal with a METHOD (function-valued property) is a stateful INSTANCE → a mutable cell (so
+  # this.x=v and aliasing work). A pure data bag → an immutable {keys,map} term (GC'd, the H1 win). Spread
+  # objects stay immutable (spread builds a fresh object).
   defp expr(%{"type" => "ObjectExpression", "properties" => props}, scope) do
-    Enum.reduce(props, quote(do: unquote(@runtime).olit()), fn p, acc ->
-      case p do
-        %{"type" => "SpreadElement", "argument" => a} ->
-          quote(do: unquote(@runtime).omerge(unquote(acc), unquote(expr(a, scope))))
+    has_spread = Enum.any?(props, &(&1["type"] == "SpreadElement"))
+    has_method = Enum.any?(props, &method_prop?/1)
 
-        %{"key" => k, "value" => v, "computed" => computed} ->
-          kq = if computed, do: expr(k, scope), else: key_of(k)
-          quote(do: unquote(@runtime).oput(unquote(acc), unquote(kq), unquote(expr(v, scope))))
-      end
-    end)
+    if has_method and not has_spread do
+      pairs =
+        Enum.map(props, fn p ->
+          kq = if p["computed"], do: expr(p["key"], scope), else: key_of(p["key"])
+          quote(do: {unquote(kq), unquote(expr(p["value"], scope))})
+        end)
+
+      quote(do: unquote(@runtime).cell_new(unquote(pairs)))
+    else
+      Enum.reduce(props, quote(do: unquote(@runtime).olit()), fn p, acc ->
+        case p do
+          %{"type" => "SpreadElement", "argument" => a} ->
+            quote(do: unquote(@runtime).omerge(unquote(acc), unquote(expr(a, scope))))
+
+          %{"key" => k, "value" => v, "computed" => computed} ->
+            kq = if computed, do: expr(k, scope), else: key_of(k)
+            quote(do: unquote(@runtime).oput(unquote(acc), unquote(kq), unquote(expr(v, scope))))
+        end
+      end)
+    end
   end
 
   defp expr(%{"type" => "ArrayExpression", "elements" => els}, scope) do
@@ -276,6 +292,7 @@ defmodule TinyLasers.Gate.Lower do
     argq = Enum.map(c["arguments"], &expr(&1, scope))
 
     case m["object"] do
+      # identifier receiver: rebind it if the method mutated (a.push(x))
       %{"type" => "Identifier", "name" => rn} ->
         res = Macro.var(:__ggres, __MODULE__)
 
@@ -284,6 +301,30 @@ defmodule TinyLasers.Gate.Lower do
             case unquote(@runtime).method(unquote(ident(rn, scope)), unquote(name), unquote(argq)) do
               {:mut, nr, r} -> {nr, r}
               v -> {unquote(ident(rn, scope)), v}
+            end
+
+          unquote(res)
+        end
+
+      # member receiver (this.tokens.push(x), o.arr.push(x)): write the mutated value back onto base[key] so
+      # the container sees it. On a cell base this is an in-place mutation (persists); on an immutable base it
+      # updates a fresh copy (v0 limit for deeply-nested immutable mutation).
+      %{"type" => "MemberExpression"} = recv_m ->
+        base = Macro.var(:__ggbase, __MODULE__)
+        res = Macro.var(:__ggres, __MODULE__)
+        rk = if recv_m["computed"], do: expr(recv_m["property"], scope), else: key_of(recv_m["property"])
+
+        quote do
+          unquote(base) = unquote(expr(recv_m["object"], scope))
+
+          unquote(res) =
+            case unquote(@runtime).method(unquote(@runtime).oget(unquote(base), unquote(rk)), unquote(name), unquote(argq)) do
+              {:mut, nr, r} ->
+                unquote(@runtime).oput_idx(unquote(base), unquote(rk), nr)
+                r
+
+              v ->
+                v
             end
 
           unquote(res)
@@ -473,6 +514,10 @@ defmodule TinyLasers.Gate.Lower do
   end
 
   defp lvar(n), do: Macro.var(String.to_atom("gg_" <> n), __MODULE__)
+
+  defp method_prop?(%{"method" => true}), do: true
+  defp method_prop?(%{"value" => %{"type" => t}}) when t in ["FunctionExpression", "ArrowFunctionExpression"], do: true
+  defp method_prop?(_), do: false
 
   defp key_of(%{"type" => "Identifier", "name" => n}), do: n
   defp key_of(%{"type" => "Literal", "value" => v}) when is_binary(v), do: v
