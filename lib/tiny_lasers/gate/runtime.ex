@@ -155,6 +155,13 @@ defmodule TinyLasers.Gate.Runtime do
 
   @doc "Property write. A cell mutates in place (shared); an immutable object returns a NEW object."
   def oput({:cell, _} = c, k, v), do: cell_put(c, k, v)
+  # Proxy set trap (target, keyString, value, receiver); falls back to writing the target.
+  def oput({:proxy, t, h} = px, k, v) do
+    case oget(h, "set") do
+      f when elem(f, 0) in [:fn, :host] -> invoke(f, h, [t, key_str(k), v, px]); px
+      _ -> oput(t, k, v); px
+    end
+  end
   # `regex.lastIndex = n` updates the stateful match position and RETURNS the regex, so a member-assignment
   # (`re.lastIndex = 0`) doesn't clobber `re` to an empty object — marked's emStrong rDelim loop relies on this.
   def oput({:regex, _, _, _} = r, "lastIndex", v), do: (relast_set(r, trunc(to_number(v))); r)
@@ -245,6 +252,13 @@ defmodule TinyLasers.Gate.Runtime do
   def oget({_keys, map}, k) when is_map(map), do: Map.get(map, key_str(k), :undefined)
   def oget({:set, _} = st, "size"), do: length(set_list(st)) * 1.0
   def oget({:map, _} = mp, "size"), do: length(map_pairs(mp)) * 1.0
+  # Proxy get trap (falls back to the target). The trap receives (target, keyString, receiver).
+  def oget({:proxy, t, h} = px, k) do
+    case oget(h, "get") do
+      f when elem(f, 0) in [:fn, :host] -> invoke(f, h, [t, key_str(k), px])
+      _ -> oget(t, k)
+    end
+  end
   def oget({:bytes, b}, k) when k in ["length", "byteLength"], do: byte_size(b) * 1.0
   def oget({:bytes, _}, "byteOffset"), do: 0.0
   def oget({:bytes, b}, k) when is_number(k), do: (i = trunc(k); if i >= 0 and i < byte_size(b), do: :binary.at(b, i) * 1.0, else: :undefined)
@@ -301,6 +315,8 @@ defmodule TinyLasers.Gate.Runtime do
   end
   def oget({:global, "Promise"}, k) when k in ["resolve", "reject", "all", "allSettled", "race"],
     do: closure(fn _this, args -> promise_static(k, args) end)
+  def oget({:global, "Reflect"}, k) when k in ["get", "set", "has", "ownKeys", "deleteProperty", "getPrototypeOf", "defineProperty", "construct", "apply"],
+    do: closure(fn _this, args -> reflect_static(k, args) end)
   def oget({:global, _}, _), do: :undefined
 
   def oget({:proto, _}, "toString"), do: {:protom, :tostring}
@@ -328,6 +344,13 @@ defmodule TinyLasers.Gate.Runtime do
   def okeys({keys, map}) when is_map(map), do: keys
   def okeys({:cell, _} = c), do: elem(cell_read(c), 0)
   def okeys({:globalobj}), do: Process.get(:gg_global, {[], %{}}) |> elem(0)
+  # Proxy ownKeys trap → the enumerable keys (falls back to the target's).
+  def okeys({:proxy, t, h}) do
+    case oget(h, "ownKeys") do
+      f when elem(f, 0) in [:fn, :host] -> arr_to_list(invoke(f, h, [t]))
+      _ -> okeys(t)
+    end
+  end
   def okeys(_), do: []
 
   # ── MUTABLE CELL objects (stateful instances: things with methods, e.g. a Lexer/Parser). Few and long-
@@ -789,6 +812,12 @@ defmodule TinyLasers.Gate.Runtime do
   def method({:bytes, _} = bytes, "subarray", [a0 | rest]), do: (b = bytes_bin(bytes); s = trunc(to_number(a0)); e = (case rest do [e0 | _] -> trunc(to_number(e0)); _ -> byte_size(b) end); {:bytes, binary_part(b, s, max(min(e, byte_size(b)) - s, 0))})
   def method({:bytes, _} = bytes, "slice", args), do: method(bytes, "subarray", args)
 
+  # a method call on a Proxy: get the (trapped) property, invoke with this=proxy.
+  def method({:proxy, _, _} = px, name, args), do: invoke(oget(px, name), px, args)
+
+  # Reflect: the default-passthrough operations Proxy handlers delegate to.
+  def method({:global, "Reflect"}, name, args), do: reflect_static(name, args)
+
   # ── global namespaces (Object/Array/Math/JSON/Number/String) — static methods + a few properties ──
   def method({:global, "Object"}, name, args), do: object_static(name, args)
   def method({:global, "Promise"}, name, args), do: promise_static(name, args)
@@ -831,6 +860,27 @@ defmodule TinyLasers.Gate.Runtime do
     Enum.each(okeys(descs), fn k -> object_static("defineProperty", [o, k, oget(descs, k)]) end)
     o
   end
+
+  # Reflect operations (Proxy default passthrough). Array/apply args come as a guest array.
+  defp reflect_static("get", [t, k | _]), do: oget(t, k)
+  defp reflect_static("set", [t, k, v | _]), do: (oput(t, k, v); true)
+  defp reflect_static("has", [t, k | _]), do: has_own(t, k)
+  defp reflect_static("ownKeys", [t | _]), do: avec(okeys(t))
+  defp reflect_static("deleteProperty", [t, k | _]), do: (odelete(t, k); true)
+  defp reflect_static("getPrototypeOf", _), do: :null
+  defp reflect_static("defineProperty", [t, k, d | _]), do: (object_static("defineProperty", [t, k, d]); true)
+  defp reflect_static("construct", [ctor, a | _]), do: construct(ctor, arr_to_list(a))
+  defp reflect_static("apply", [f, this, a | _]), do: invoke(f, this, arr_to_list(a))
+  defp reflect_static(_, _), do: :undefined
+
+  # delete a property from a cell (Reflect.deleteProperty / `delete o.k`).
+  defp odelete({:cell, id} = c, k) do
+    {keys, map} = cell_read(c)
+    ks = key_str(k)
+    Process.put(:gg_cells, Map.put(Process.get(:gg_cells, %{}), id, {List.delete(keys, ks), Map.delete(map, ks)}))
+    :undefined
+  end
+  defp odelete(_, _), do: :undefined
 
   defp object_static("getPrototypeOf", _), do: :undefined
   defp object_static("setPrototypeOf", [o | _]), do: o
@@ -1300,6 +1350,9 @@ defmodule TinyLasers.Gate.Runtime do
     do: cell_new([{"message", to_str(List.first(args) || "")}, {"name", err}])
 
   def construct({:global, "Array"}, args), do: avec(args)
+  # Proxy: {:proxy, target, handler}. Property get/set + method calls route through the handler's traps
+  # (falling back to the target). rollup's output bundle is a Proxy over the chunk map.
+  def construct({:global, "Proxy"}, [target, handler | _]), do: {:proxy, target, handler}
   # typed arrays are backed by a plain guest array (indexed get/set, length, subarray all work on {:arr,_}).
   # new TA(n) -> n zeros; new TA([...]) / new TA(otherTA) -> element copy.
   def construct({:global, ta}, args)
@@ -1342,7 +1395,13 @@ defmodule TinyLasers.Gate.Runtime do
   end
 
   def construct(nc, args) do
-    if System.get_env("GAPLOG"), do: IO.puts(:stderr, "GAP construct #{inspect(nc)|>String.slice(0,50)} args=#{inspect(args)|>String.slice(0,80)}")
+    if System.get_env("GAPLOG") do
+      st = if System.get_env("GAPTRACE") do
+        Process.info(self(), :current_stacktrace) |> elem(1) |> Enum.filter(fn {m,_,_,_} -> m |> to_string() =~ ~r/Guest|Runtime/ end) |> Enum.take(6) |> Enum.map_join(" <- ", fn {_,f,a,_} -> "#{f}/#{a}" end)
+      else "" end
+      akeys = args |> Enum.map(fn a -> if match?({:cell,_}, a), do: okeys(a) |> Enum.take(6), else: a end) |> inspect() |> String.slice(0, 100)
+      IO.puts(:stderr, "GAP construct #{inspect(nc)|>String.slice(0,50)} argkeys=#{akeys} #{st}")
+    end
     if System.get_env("GAPSOFT"), do: cell_new([]), else: guest_error("not a constructor")
   end
 
@@ -1639,6 +1698,7 @@ defmodule TinyLasers.Gate.Runtime do
   def typeof({:symbol, _, _}), do: "symbol"
   def typeof({:promise, _}), do: "object"
   def typeof({:bytes, _}), do: "object"
+  def typeof({:proxy, t, _}), do: typeof(t)
   def typeof(_), do: "object"
 
   # ── DoS primitives (emitted only for the red-team's containment tests) ──
