@@ -40,6 +40,16 @@ defmodule TinyLasers.Gate.F2VerticalTest do
     assert %{result: {:ok, 7.0}} = Js.run("var n = 1; var c = 0; while (n < 100) { n = n * 2; c = c + 1; } c")
   end
 
+  test "arrays: literal, index, length, push-in-loop, map/join, string + object methods" do
+    assert %{result: {:ok, 40.0}} = Js.run("var a = [10, 20, 30]; a[0] + a[2]")
+    assert %{result: {:ok, 4.0}} = Js.run("var a = [1,2,3,4]; a.length")
+    assert %{result: {:ok, 21.0}} = Js.run("var a = []; for (var i = 0; i < 5; i++) { a.push(i * i); } a[4] + a.length")
+    assert %{result: {:ok, 30.0}} = Js.run("var a = [1,2,3]; var b = a.map(function(x){ return x * 10; }); b[2]")
+    assert %{result: {:ok, "1-2-3"}} = Js.run("[1,2,3].join('-')")
+    assert %{result: {:ok, "HELLO"}} = Js.run("'hello'.toUpperCase()")
+    assert %{result: {:ok, 6.0}} = Js.run("var o = { v: 3, dbl: function(x){ return x * 2; } }; o.dbl(o.v)")
+  end
+
   test "the compiled guest references ONLY the Runtime — confinement holds (H2)" do
     src = """
     function merge(a, b) { return { x: a.x, y: b.y }; }

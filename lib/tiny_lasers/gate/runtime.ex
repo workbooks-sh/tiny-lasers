@@ -129,8 +129,18 @@ defmodule TinyLasers.Gate.Runtime do
 
   def oput(_not_obj, _k, _v), do: {[], %{}}
 
-  @doc "Property read on a direct-term object. Non-objects read as `:undefined`."
-  def oget({_keys, map}, k), do: Map.get(map, key_str(k), :undefined)
+  @doc "Property read. Objects: by key. Arrays: numeric index + `length`. Non-objects: `:undefined`."
+  def oget({_keys, map}, k) when is_map(map), do: Map.get(map, key_str(k), :undefined)
+  def oget({:arr, list}, "length"), do: length(list) * 1.0
+  def oget({:arr, list}, i) when is_number(i), do: Enum.at(list, trunc(i), :undefined)
+
+  def oget({:arr, list}, k) when is_binary(k) do
+    case Integer.parse(k) do
+      {n, ""} -> Enum.at(list, n, :undefined)
+      _ -> :undefined
+    end
+  end
+
   def oget(_not_obj, _k), do: :undefined
 
   @doc "Spread-merge b into a (Object.assign({}, a, b) shape). Returns a NEW object, b's keys last/override."
@@ -146,8 +156,101 @@ defmodule TinyLasers.Gate.Runtime do
   def omerge(a, _non_obj), do: a
 
   @doc "Ordered own-keys of a direct-term object."
-  def okeys({keys, _map}), do: keys
+  def okeys({keys, map}) when is_map(map), do: keys
   def okeys(_), do: []
+
+  @doc "Functional index/key write. Arrays grow to fit; objects add the key. Returns a NEW term."
+  def oput_idx({:arr, list}, i, v) when is_number(i) do
+    idx = trunc(i)
+    list = if idx >= length(list), do: list ++ List.duplicate(:undefined, idx - length(list) + 1), else: list
+    {:arr, List.replace_at(list, idx, v)}
+  end
+
+  def oput_idx(other, k, v), do: oput(other, k, v)
+
+  # ── array direct-term (a tagged immutable list, GC'd) ──
+  @doc "Array literal from evaluated elements."
+  def alit(elems) when is_list(elems), do: {:arr, elems}
+
+  @doc """
+  Confined METHOD dispatch: `recv.name(args)`. The dispatch table IS the builtin surface — a name that
+  doesn't resolve for the receiver type is a guest `:undefined` (never a host reach). Mutating array methods
+  (push/pop/…) return `{new_receiver, result}` so the lowering can rebind an identifier receiver.
+  """
+  def method({:arr, list}, "push", args), do: {:mut, {:arr, list ++ args}, (length(list) + length(args)) * 1.0}
+  def method({:arr, list}, "pop", _), do: pop_last(list)
+  def method({:arr, list}, "join", [sep | _]), do: list |> Enum.map(&to_str/1) |> Enum.join(to_str(sep))
+  def method({:arr, list}, "join", _), do: list |> Enum.map(&to_str/1) |> Enum.join(",")
+  def method({:arr, list}, "indexOf", [x | _]), do: (Enum.find_index(list, &(&1 === x)) || -1) * 1.0
+  def method({:arr, list}, "includes", [x | _]), do: Enum.any?(list, &(&1 === x))
+  def method({:arr, list}, "slice", [a | rest]), do: {:arr, slice_list(list, a, rest)}
+
+  def method({:arr, list}, "map", [f | _]),
+    do: {:arr, Enum.with_index(list) |> Enum.map(fn {v, i} -> call(f, [v, i * 1.0]) end)}
+
+  def method({:arr, list}, "forEach", [f | _]) do
+    Enum.with_index(list) |> Enum.each(fn {v, i} -> call(f, [v, i * 1.0]) end)
+    :undefined
+  end
+
+  def method({:arr, list}, "filter", [f | _]),
+    do: {:arr, Enum.filter(list, fn v -> truthy(call(f, [v])) end)}
+
+  def method(s, "charCodeAt", [i | _]) when is_binary(s) do
+    case :binary.at(s, trunc(i)) do
+      b when is_integer(b) -> b * 1.0
+    end
+  rescue
+    ArgumentError -> :undefined
+  end
+
+  def method(s, "length", _) when is_binary(s), do: byte_size(s) * 1.0
+  def method(s, "toUpperCase", _) when is_binary(s), do: String.upcase(s)
+  def method(s, "toLowerCase", _) when is_binary(s), do: String.downcase(s)
+  def method(s, "slice", [a | rest]) when is_binary(s), do: str_slice(s, a, rest)
+  def method(s, "indexOf", [sub | _]) when is_binary(s) do
+    case :binary.match(s, to_str(sub)) do
+      {pos, _} -> pos * 1.0
+      :nomatch -> -1.0
+    end
+  end
+
+  def method(s, "split", [sep | _]) when is_binary(s), do: {:arr, String.split(s, to_str(sep))}
+  def method({keys, map}, "hasOwnProperty", [k | _]) when is_map(map), do: Map.has_key?(map, key_str(k))
+
+  # user object with a FUNCTION-valued property: `o.f(args)` calls the stored closure (no `this` binding yet).
+  def method({_keys, map} = o, name, args) when is_map(map) do
+    case oget(o, name) do
+      {:fn, _} = f -> call(f, args)
+      _ -> guest_error("not a function")
+    end
+  end
+
+  # calling a method that doesn't resolve (incl. on `:undefined`, e.g. `os.cmd(...)`) is a guest TypeError,
+  # NOT a host escape — the receiver was never a host reference.
+  def method(_recv, _name, _args), do: guest_error("not a function")
+
+  defp pop_last([]), do: {:mut, {:arr, []}, :undefined}
+  defp pop_last(list), do: {:mut, {:arr, Enum.drop(list, -1)}, List.last(list)}
+
+  defp slice_list(list, a, rest) do
+    start = trunc(a)
+    start = if start < 0, do: max(length(list) + start, 0), else: start
+    case rest do
+      [b | _] when is_number(b) -> Enum.slice(list, start, max(trunc(b) - start, 0))
+      _ -> Enum.drop(list, start)
+    end
+  end
+
+  defp str_slice(s, a, rest) do
+    start = trunc(a)
+    start = if start < 0, do: max(byte_size(s) + start, 0), else: start
+    len = case rest do
+      [b | _] when is_number(b) -> max(trunc(b) - start, 0)
+      _ -> byte_size(s) - start
+    end
+    binary_part(s, min(start, byte_size(s)), min(len, byte_size(s) - min(start, byte_size(s))))
+  end
 
   @doc "A guest function as a DIRECTLY-HELD closure (GC'd, no table). Safe: the guest can only invoke it via
   `call/2`; no codegen path extracts and `apply`s the raw fun."

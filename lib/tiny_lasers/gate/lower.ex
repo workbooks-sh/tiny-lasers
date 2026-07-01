@@ -167,6 +167,41 @@ defmodule TinyLasers.Gate.Lower do
     end)
   end
 
+  defp expr(%{"type" => "ArrayExpression", "elements" => els}, scope) do
+    elq = Enum.map(els, fn e -> if e, do: expr(e, scope), else: :undefined end)
+    quote(do: unquote(@runtime).alit(unquote(elq)))
+  end
+
+  # method call `recv.name(args)` → confined Runtime.method dispatch. A mutating method (push/pop/…) returns
+  # `{:mut, new_recv, result}`; when the receiver is an identifier we rebind it (JS in-place mutation).
+  defp expr(%{"type" => "CallExpression", "callee" => %{"type" => "MemberExpression", "computed" => false} = m} = c, scope) do
+    name = key_of(m["property"])
+    argq = Enum.map(c["arguments"], &expr(&1, scope))
+
+    case m["object"] do
+      %{"type" => "Identifier", "name" => rn} ->
+        res = Macro.var(:__ggres, __MODULE__)
+
+        quote do
+          {unquote(lvar(rn)), unquote(res)} =
+            case unquote(@runtime).method(unquote(ident(rn, scope)), unquote(name), unquote(argq)) do
+              {:mut, nr, r} -> {nr, r}
+              v -> {unquote(ident(rn, scope)), v}
+            end
+
+          unquote(res)
+        end
+
+      other ->
+        quote do
+          case unquote(@runtime).method(unquote(expr(other, scope)), unquote(name), unquote(argq)) do
+            {:mut, _, r} -> r
+            v -> v
+          end
+        end
+    end
+  end
+
   defp expr(%{"type" => "MemberExpression"} = m, scope) do
     oq = expr(m["object"], scope)
     kq = if m["computed"], do: expr(m["property"], scope), else: key_of(m["property"])
@@ -187,11 +222,11 @@ defmodule TinyLasers.Gate.Lower do
 
         case base do
           %{"type" => "Identifier", "name" => n} ->
-            quote(do: unquote(lvar(n)) = unquote(@runtime).oput(unquote(ident(n, scope)), unquote(kq), unquote(rq)))
+            quote(do: unquote(lvar(n)) = unquote(@runtime).oput_idx(unquote(ident(n, scope)), unquote(kq), unquote(rq)))
 
           _ ->
             # nested member target (o.a.b = v): functional update without rebinding the deep base (v0 limit)
-            quote(do: unquote(@runtime).oput(unquote(expr(base, scope)), unquote(kq), unquote(rq)))
+            quote(do: unquote(@runtime).oput_idx(unquote(expr(base, scope)), unquote(kq), unquote(rq)))
         end
     end
   end
@@ -288,6 +323,11 @@ defmodule TinyLasers.Gate.Lower do
 
   defp assigned_names(%{"type" => "UpdateExpression", "argument" => %{"type" => "Identifier", "name" => name}}),
     do: [name]
+
+  # a method call on an identifier receiver may rebind it (mutating methods push/pop/… — and the lowering
+  # rebinds the identifier receiver unconditionally), so treat the receiver as assigned for loop-state threading.
+  defp assigned_names(%{"type" => "CallExpression", "callee" => %{"type" => "MemberExpression", "computed" => false, "object" => %{"type" => "Identifier", "name" => name}}} = n),
+    do: [name | Enum.flat_map(n["arguments"] || [], &assigned_names/1)]
 
   defp assigned_names(%{"type" => "VariableDeclaration", "declarations" => ds}) do
     Enum.flat_map(ds, fn d ->
