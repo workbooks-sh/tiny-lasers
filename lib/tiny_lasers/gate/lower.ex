@@ -68,15 +68,13 @@ defmodule TinyLasers.Gate.Lower do
   defp hoist(%{"type" => "ClassDeclaration", "id" => %{"name" => n}} = c, s),
     do: greg_hoist(s, n, fnkey(n, c))
 
-  # register a greg-backed declaration (function/class): add to funcs/fnmap, AND drop the name from any
-  # INHERITED boxed set — a same-named boxed var in an enclosing scope must not shadow this fresh local
-  # declaration (else references resolve to the outer box instead of the greg registry). See magic-string's
-  # `MagicString` class colliding with a program-level `var MagicString = module.exports`.
+  # register a greg-backed declaration (function/class): add to funcs/fnmap. Shadowing of an inherited
+  # same-named boxed var is handled at the function-scope level via `fndecl_names` (which now includes
+  # classes) — NOT here, so a locally boxed+reassigned function name keeps reading its box.
   defp greg_hoist(s, n, key) do
     s
     |> Map.put(:funcs, MapSet.put(s[:funcs] || MapSet.new(), n))
     |> Map.put(:fnmap, Map.put(s[:fnmap] || %{}, n, key))
-    |> Map.put(:boxed, MapSet.delete(s[:boxed] || MapSet.new(), n))
   end
 
   defp hoist(%{"type" => "VariableDeclaration", "declarations" => ds}, s) do
@@ -553,6 +551,21 @@ defmodule TinyLasers.Gate.Lower do
 
   defp expr(%{"type" => "Literal", "value" => v}, _), do: lit(v)
 
+  # a class EXPRESSION (`X = class extends Y {…}`, esbuild's minified class form) is a first-class value: run
+  # the same desugar as a class declaration under a unique greg name, then evaluate TO the constructor. The
+  # name (real or synthetic) is bound in a local scope so the class's own methods + the return resolve it.
+  defp expr(%{"type" => "ClassExpression"} = n, scope) do
+    name = (n["id"] && n["id"]["name"]) || "__ggclass$#{n["start"]}"
+    key = fnkey(name, n)
+    scope2 = greg_hoist(scope, name, key)
+    ncls = %{n | "type" => "ClassDeclaration", "id" => %{"type" => "Identifier", "name" => name, "start" => n["start"]}}
+    {setupq, _} = stmt(ncls, scope2)
+    quote do
+      unquote(block(setupq))
+      unquote(@runtime).greg_get(unquote(key))
+    end
+  end
+
   # new RegExp(source, flags) — the only constructor wired (classes/prototypes are a later phase).
   defp expr(%{"type" => "NewExpression", "callee" => %{"type" => "Identifier", "name" => "RegExp"}} = n, scope) do
     args = n["arguments"] || []
@@ -1024,7 +1037,7 @@ defmodule TinyLasers.Gate.Lower do
   defp assigned_names(_), do: []
 
   # ── helpers ──
-  @globals ~w(Object Array Math JSON String Number Boolean Error TypeError RangeError SyntaxError Set Map Uint8Array Int8Array Uint16Array Int16Array Uint32Array Int32Array Float32Array Float64Array)
+  @globals ~w(Object Array Math JSON String Number Boolean Error TypeError RangeError SyntaxError Set Map WeakSet WeakMap Symbol Uint8Array Int8Array Uint16Array Int16Array Uint32Array Int32Array Float32Array Float64Array)
   @global_fns ~w(parseInt parseFloat isNaN isFinite encodeURIComponent decodeURIComponent encodeURI decodeURI)
 
   defp ident(n, scope) do

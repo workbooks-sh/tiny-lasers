@@ -279,7 +279,21 @@ defmodule TinyLasers.Gate.Runtime do
   def oget({:global, "Number"}, "MAX_VALUE"), do: 1.7976931348623157e308
   def oget({:global, "Number"}, "MIN_VALUE"), do: 5.0e-324
   def oget({:global, "Number"}, "MAX_SAFE_INTEGER"), do: 9_007_199_254_740_991.0
+  # the Object static methods callable as first-class values (esbuild aliases `var f = Object.defineProperty`).
+  @obj_statics ~w(keys values entries getOwnPropertyNames getOwnPropertyDescriptor assign create freeze
+                  defineProperty defineProperties getPrototypeOf setPrototypeOf fromEntries)
+
+  # well-known symbols: stable, shared identities (Symbol.iterator etc. must compare equal across reads).
+  def oget({:global, "Symbol"}, k) when k in ["iterator", "asyncIterator", "hasInstance", "toPrimitive", "toStringTag"],
+    do: {:symbol, "@@" <> k, k}
+  def oget({:global, "Symbol"}, "for"), do: closure(fn _this, args -> (d = to_str(List.first(args) || ""); {:symbol, "for:" <> d, d}) end)
   def oget({:global, name}, "prototype"), do: {:proto, name}
+  # a global static method read as a first-class value: return a closure bound to the method dispatcher so
+  # `var f = Object.defineProperty; f(o,k,d)` works (esbuild wrapper pattern). Gated to known statics so
+  # `typeof Object.somethingElse` stays "undefined".
+  def oget({:global, "Object"}, k) when is_binary(k) and k not in ["prototype"] do
+    if k in @obj_statics, do: closure(fn _this, args -> object_static(k, args) end), else: :undefined
+  end
   def oget({:global, _}, _), do: :undefined
 
   def oget({:proto, _}, "toString"), do: {:protom, :tostring}
@@ -749,6 +763,18 @@ defmodule TinyLasers.Gate.Runtime do
 
   defp object_static("getPrototypeOf", _), do: :undefined
   defp object_static("setPrototypeOf", [o | _]), do: o
+  # getOwnPropertyDescriptor(o, k): a data descriptor for an own property, else undefined. esbuild's
+  # __copyProps reads `desc.enumerable`; we report own props as enumerable/writable/configurable.
+  defp object_static("getOwnPropertyDescriptor", [o, k | _]) do
+    ks = to_str(k)
+    if ks in Enum.map(okeys(o), &to_str/1),
+      do: cell_new([{"value", oget(o, ks)}, {"writable", true}, {"enumerable", true}, {"configurable", true}]),
+      else: :undefined
+  end
+  defp object_static("fromEntries", [o | _]) do
+    pairs = for e <- okeys(o) |> Enum.map(&oget(o, &1)) || [], do: {to_str(oget(e, 0.0)), oget(e, 1.0)}
+    cell_new(pairs)
+  end
   defp object_static(_, _), do: :undefined
 
   defp array_static("isArray", [x | _]), do: match?({:arr, _}, x)
@@ -786,6 +812,12 @@ defmodule TinyLasers.Gate.Runtime do
   def call({:global, "Array"}, args), do: avec(args)
   def call({:global, "Object"}, args), do: List.first(args) || olit()
   def call({:global, err}, args) when err in ["Error", "TypeError", "RangeError", "SyntaxError"], do: construct({:global, err}, args)
+  # Symbol(desc): a fresh unique symbol. Represented as {:symbol, id, desc}; identity is the id, so two
+  # Symbol("x") differ. Usable as an object key (key_str tags it uniquely).
+  def call({:global, "Symbol"}, args) do
+    desc = case args do [d | _] when d != :undefined -> to_str(d); _ -> "" end
+    {:symbol, __id(), desc}
+  end
   def call({:global, _}, _args), do: :undefined
 
   def call({:globalfn, "parseInt"}, [x | _]), do: parse_int(x)
@@ -865,12 +897,14 @@ defmodule TinyLasers.Gate.Runtime do
   def method({:fn, _} = f, "bind", [this | bound]) do
     closure(fn _ignored_this, args -> invoke(f, this, bound ++ args) end)
   end
+  # `.bind()` with no args: bind `this` to undefined (marked: `Object.assign.bind()`).
+  def method({:fn, _} = f, "bind", []), do: closure(fn _ignored_this, args -> invoke(f, :undefined, args) end)
 
   # a property call on a function object: `marked.parse(md)` — look up the function-valued property + invoke.
   def method({:fn, _} = fnv, name, args) do
     case oget(fnv, name) do
       {:fn, _} = g -> invoke(g, fnv, args)
-      _ -> guest_error("not a function")
+      other -> if System.get_env("GAPLOG"), do: IO.puts(:stderr, "GAP fnmeth #{inspect(name)} -> #{inspect(other)|>String.slice(0,30)}"); guest_error("not a function")
     end
   end
 
@@ -878,7 +912,7 @@ defmodule TinyLasers.Gate.Runtime do
   # NOT a host escape — the receiver was never a host reference.
   def method(r, nm, _a) do
     if System.get_env("GAPLOG"), do: IO.puts(:stderr, "GAP method #{inspect(nm)} on #{inspect(r) |> String.slice(0, 40)}")
-    guest_error("not a function")
+    if System.get_env("GAPSOFT"), do: :undefined, else: guest_error("not a function")
   end
 
 
@@ -1002,21 +1036,24 @@ defmodule TinyLasers.Gate.Runtime do
     end
   end
   def construct({:global, "Object"}, _), do: cell_new([])
-  def construct({:global, "Set"}, args) do
+  def construct({:global, s}, args) when s in ["Set", "WeakSet"] do
     id = __id()
     init = case args do [{:arr, _} = av | _] -> Enum.uniq(al(av)); _ -> [] end
     Process.put({:gg_set, id}, init)
     {:set, id}
   end
 
-  def construct({:global, "Map"}, args) do
+  def construct({:global, m}, args) when m in ["Map", "WeakMap"] do
     id = __id()
     init = case args do [{:arr, _} = av | _] -> Enum.map(al(av), fn e -> case (if match?({:arr,_},e), do: al(e), else: []) do [k, v | _] -> {k, v}; _ -> {:undefined, :undefined} end end); _ -> [] end
     Process.put({:gg_map, id}, init)
     {:map, id}
   end
 
-  def construct(_not_ctor, _args), do: guest_error("not a constructor")
+  def construct(nc, args) do
+    if System.get_env("GAPLOG"), do: IO.puts(:stderr, "GAP construct #{inspect(nc)|>String.slice(0,50)} args=#{inspect(args)|>String.slice(0,80)}")
+    if System.get_env("GAPSOFT"), do: cell_new([]), else: guest_error("not a constructor")
+  end
 
   @doc "Invoke a guest function with an explicit `this` receiver (method call). Ungranted callees error."
   def invoke({:fn, f}, this, args) when is_function(f, 2), do: f.(this, args)
@@ -1051,9 +1088,9 @@ defmodule TinyLasers.Gate.Runtime do
   end
 
   def call({:host, cap_id}, args), do: host_call(cap_id, args)
-  def call(nc, _args) do
-    if System.get_env("GAPLOG"), do: IO.puts(:stderr, "GAP call on #{inspect(nc) |> String.slice(0, 40)}")
-    guest_error("not a function")
+  def call(nc, args) do
+    if System.get_env("GAPLOG"), do: IO.puts(:stderr, "GAP call on #{inspect(nc) |> String.slice(0, 60)} args=#{inspect(args) |> String.slice(0, 80)}")
+    if System.get_env("GAPSOFT"), do: :undefined, else: guest_error("not a function")
   end
 
   @doc """
@@ -1186,6 +1223,8 @@ defmodule TinyLasers.Gate.Runtime do
   defp key_str(false), do: "false"
   defp key_str(:undefined), do: "undefined"
   defp key_str(:null), do: "null"
+  # a symbol used as a property key: tag uniquely by its identity so distinct symbols don't collide.
+  defp key_str({:symbol, id, _desc}), do: "@@sym:" <> to_string(id)
   defp key_str(_), do: "[object]"
 
   @doc "Stringify a guest value for output (spike formatting; byte-exact dtoa is a separate layer)."
@@ -1201,6 +1240,7 @@ defmodule TinyLasers.Gate.Runtime do
   def to_str(false), do: "false"
   def to_str(:undefined), do: "undefined"
   def to_str(:null), do: "null"
+  def to_str({:symbol, _, desc}), do: "Symbol(" <> desc <> ")"
   def to_str({:obj, _}), do: "[object Object]"
   def to_str({:fun, _}), do: "function"
   def to_str({:host, _}), do: "function"
@@ -1284,6 +1324,7 @@ defmodule TinyLasers.Gate.Runtime do
   def typeof(:neg_infinity), do: "number"
   def typeof(:nan), do: "number"
   def typeof(:null), do: "object"
+  def typeof({:symbol, _, _}), do: "symbol"
   def typeof(_), do: "object"
 
   # ── DoS primitives (emitted only for the red-team's containment tests) ──
