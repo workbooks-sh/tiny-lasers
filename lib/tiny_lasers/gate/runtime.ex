@@ -622,6 +622,20 @@ defmodule TinyLasers.Gate.Runtime do
   end
   defp to_number(_), do: :undefined
 
+  # Function.prototype.apply/call/bind (marked + minified helpers use these heavily).
+  def method({:fn, _} = f, "apply", args) do
+    this = List.first(args) || :undefined
+    argl = case args do [_, {:arr, l} | _] -> l; _ -> [] end
+    invoke(f, this, argl)
+  end
+
+  def method({:fn, _} = f, "call", [this | rest]), do: invoke(f, this, rest)
+  def method({:fn, _} = f, "call", []), do: invoke(f, :undefined, [])
+
+  def method({:fn, _} = f, "bind", [this | bound]) do
+    closure(fn _ignored_this, args -> invoke(f, this, bound ++ args) end)
+  end
+
   # a property call on a function object: `marked.parse(md)` — look up the function-valued property + invoke.
   def method({:fn, _} = fnv, name, args) do
     case oget(fnv, name) do
