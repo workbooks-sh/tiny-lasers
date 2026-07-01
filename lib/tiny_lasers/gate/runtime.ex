@@ -357,6 +357,11 @@ defmodule TinyLasers.Gate.Runtime do
   @doc "Array literal from evaluated elements."
   def alit(elems) when is_list(elems), do: avec(elems)
 
+  @doc "Array literal WITH spread elements: parts are `{:one, v}` | `{:spread, iterable}`."
+  def aspread(parts) do
+    avec(Enum.flat_map(parts, fn {:spread, v} -> iter(v); {:one, v} -> [v] end))
+  end
+
   # ── regex as a CAPABILITY (backed by Elixir Regex, returns guest values, stays confined). A regex is a
   # guest-safe term `{:regex, compiled, source, flags}`; the guest can only pass it to the regex methods. ──
   @doc "Compile a guest regex. JS flags i/m/s/u/x map to Elixir opts; g is applied at match/replace time."
@@ -670,10 +675,10 @@ defmodule TinyLasers.Gate.Runtime do
     items = iter_any(x)
     case rest do
       [{:fn, _} = f | _] -> avec(Enum.with_index(items) |> Enum.map(fn {v, i} -> call(f, [v, i * 1.0]) end))
-      _ -> {:arr, items}
+      _ -> avec(items)
     end
   end
-  defp array_static("of", args), do: {:arr, args}
+  defp array_static("of", args), do: avec(args)
   defp array_static(_, _), do: :undefined
 
   defp iter_any({:arr, _} = a), do: al(a)
@@ -795,22 +800,25 @@ defmodule TinyLasers.Gate.Runtime do
 
 
   defp slice_list(list, a, rest) do
-    start = trunc(a)
-    start = if start < 0, do: max(length(list) + start, 0), else: start
-    case rest do
-      [b | _] when is_number(b) -> Enum.slice(list, start, max(trunc(b) - start, 0))
-      _ -> Enum.drop(list, start)
+    n = length(list)
+    start = trunc(num(a))
+    start = if start < 0, do: max(n + start, 0), else: min(start, n)
+    stop = case rest do
+      [b | _] when b != :undefined -> e = trunc(num(b)); if e < 0, do: max(n + e, 0), else: min(e, n)
+      _ -> n
     end
+    Enum.slice(list, start, max(stop - start, 0))
   end
 
   defp str_slice(s, a, rest) do
-    start = trunc(a)
-    start = if start < 0, do: max(byte_size(s) + start, 0), else: start
-    len = case rest do
-      [b | _] when is_number(b) -> max(trunc(b) - start, 0)
-      _ -> byte_size(s) - start
+    n = byte_size(s)
+    start = trunc(num(a))
+    start = if start < 0, do: max(n + start, 0), else: min(start, n)
+    stop = case rest do
+      [b | _] when b != :undefined -> e = trunc(num(b)); if e < 0, do: max(n + e, 0), else: min(e, n)
+      _ -> n
     end
-    binary_part(s, min(start, byte_size(s)), min(len, byte_size(s) - min(start, byte_size(s))))
+    binary_part(s, start, max(stop - start, 0))
   end
 
   # substring(a,b): clamps to [0,len], swaps if a>b (JS semantics), no negatives.

@@ -404,8 +404,19 @@ defmodule TinyLasers.Gate.Lower do
   end
 
   defp expr(%{"type" => "ArrayExpression", "elements" => els}, scope) do
-    elq = Enum.map(els, fn e -> if e, do: expr(e, scope), else: :undefined end)
-    quote(do: unquote(@runtime).alit(unquote(elq)))
+    if Enum.any?(els, &(&1 && &1["type"] == "SpreadElement")) do
+      parts =
+        Enum.map(els, fn
+          %{"type" => "SpreadElement", "argument" => a} -> quote(do: {:spread, unquote(expr(a, scope))})
+          nil -> quote(do: {:one, :undefined})
+          e -> quote(do: {:one, unquote(expr(e, scope))})
+        end)
+
+      quote(do: unquote(@runtime).aspread(unquote(parts)))
+    else
+      elq = Enum.map(els, fn e -> if e, do: expr(e, scope), else: :undefined end)
+      quote(do: unquote(@runtime).alit(unquote(elq)))
+    end
   end
 
   # method call `recv.name(args)` → confined Runtime.method dispatch. A mutating method (push/pop/…) returns
