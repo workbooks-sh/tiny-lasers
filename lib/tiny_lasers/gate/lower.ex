@@ -465,31 +465,29 @@ defmodule TinyLasers.Gate.Lower do
         quote(do: unquote(lvar(n)) = unquote(rq))
 
       %{"type" => "MemberExpression"} = m ->
-        base = m["object"]
-        kq = if m["computed"], do: expr(m["property"], scope), else: key_of(m["property"])
-
-        # JS assignment evaluates to the ASSIGNED VALUE (v), not the container — critical for `a = o.x = v`
-        # and the UMD `(e=g).marked = {}` (whose value must be the new object). Bind rq once, then return it.
+        # JS assignment evaluates to the ASSIGNED VALUE. `assign_to` rebuilds the member chain and rebinds the
+        # root identifier, so DEEP assignments (w.emStrong.rDelimAst = …) propagate even on immutable nested
+        # objects — marked's grammar building relies on this.
         v = Macro.var(:__ggav, __MODULE__)
 
-        case base do
-          %{"type" => "Identifier", "name" => n} ->
-            quote do
-              unquote(v) = unquote(rq)
-              unquote(lvar(n)) = unquote(@runtime).oput_idx(unquote(ident(n, scope)), unquote(kq), unquote(v))
-              unquote(v)
-            end
-
-          _ ->
-            # in-place on a cell/global base; on an immutable base the update is on a fresh copy (v0 limit)
-            quote do
-              unquote(v) = unquote(rq)
-              unquote(@runtime).oput_idx(unquote(expr(base, scope)), unquote(kq), unquote(v))
-              unquote(v)
-            end
+        quote do
+          unquote(v) = unquote(rq)
+          unquote(assign_to(m, v, scope))
+          unquote(v)
         end
     end
   end
+
+  # assign `valq` to a target (Identifier or MemberExpression), rebuilding the chain up to the root identifier.
+  defp assign_to(%{"type" => "Identifier", "name" => n}, valq, scope), do: quote(do: unquote(lvar(n)) = unquote(valq))
+
+  defp assign_to(%{"type" => "MemberExpression"} = m, valq, scope) do
+    kq = if m["computed"], do: expr(m["property"], scope), else: key_of(m["property"])
+    new_base = quote(do: unquote(@runtime).oput_idx(unquote(expr(m["object"], scope)), unquote(kq), unquote(valq)))
+    assign_to(m["object"], new_base, scope)
+  end
+
+  defp assign_to(other, valq, scope), do: quote(do: unquote(@runtime).oput_idx(unquote(expr(other, scope)), "0", unquote(valq)))
 
   defp expr(%{"type" => "BinaryExpression", "operator" => op} = n, scope) do
     quote(do: unquote(@runtime).binop(unquote(binop_atom(op)), unquote(expr(n["left"], scope)), unquote(expr(n["right"], scope))))
