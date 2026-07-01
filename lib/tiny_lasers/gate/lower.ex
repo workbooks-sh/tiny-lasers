@@ -531,13 +531,39 @@ defmodule TinyLasers.Gate.Lower do
     quote(do: unquote(@runtime).binop(unquote(binop_atom(op)), unquote(expr(n["left"], scope)), unquote(expr(n["right"], scope))))
   end
 
+  # `a && b` / `a || b`: the RIGHT side runs conditionally and may ASSIGN variables (minified short-circuit
+  # `cond && (x = …)`). Elixir `if` doesn't export inner bindings, so thread the right side's mutated vars out
+  # (like IfStatement) — otherwise the assignment is silently lost.
   defp expr(%{"type" => "LogicalExpression", "operator" => op} = n, scope) do
     lq = expr(n["left"], scope)
     rq = expr(n["right"], scope)
+    mutated = assigned_names(n["right"]) |> Enum.uniq() |> not_boxed(scope)
 
-    case op do
-      "&&" -> quote(do: (fn v -> if unquote(@runtime).truthy(v), do: unquote(rq), else: v end).(unquote(lq)))
-      "||" -> quote(do: (fn v -> if unquote(@runtime).truthy(v), do: v, else: unquote(rq) end).(unquote(lq)))
+    cond do
+      mutated == [] and op == "&&" -> quote(do: (fn v -> if unquote(@runtime).truthy(v), do: unquote(rq), else: v end).(unquote(lq)))
+      mutated == [] and op == "||" -> quote(do: (fn v -> if unquote(@runtime).truthy(v), do: v, else: unquote(rq) end).(unquote(lq)))
+      true -> cond_thread(quote(do: unquote(@runtime).truthy(__gglv)), rq, quote(do: __gglv), mutated, scope, quote(do: __gglv = unquote(lq)), op == "||")
+    end
+  end
+
+  # thread `mutated` vars out of a conditional whose value is `cons_q`(true)/`alt_q`(false). `pre` runs first
+  # (binds the discriminant); `swap` flips branches (for `||`, where the "run right" branch is the false one).
+  defp cond_thread(test_q, cons_q, alt_q, mutated, scope, pre, swap) do
+    statevars = Enum.map(mutated, &lvar/1)
+    inits = for v <- mutated, not MapSet.member?(scope.locals, v), do: quote(do: unquote(lvar(v)) = :undefined)
+    res = Macro.var(:__ggcv, __MODULE__)
+    bv = Macro.var(:__ggbv, __MODULE__)
+    tuple = {:{}, [], [res | statevars]}
+    # a branch runs its expression (binding mutated vars via block sequencing), THEN captures the state tuple —
+    # a tuple literal does NOT thread bindings, so the assignment must be sequenced before the capture.
+    branch = fn q -> quote(do: (unquote(bv) = unquote(q); unquote({:{}, [], [bv | statevars]}))) end
+    {tb, fb} = if swap, do: {branch.(alt_q), branch.(cons_q)}, else: {branch.(cons_q), branch.(alt_q)}
+
+    quote do
+      unquote_splicing(inits)
+      unquote(pre)
+      unquote(tuple) = if unquote(test_q), do: unquote(tb), else: unquote(fb)
+      unquote(res)
     end
   end
 
@@ -547,11 +573,16 @@ defmodule TinyLasers.Gate.Lower do
     {:__block__, [], Enum.map(es, &expr(&1, scope))}
   end
 
+  # ternary `test ? a : b` — either branch may ASSIGN variables (`p ? (c=x) : (c=y)`); thread them out.
   defp expr(%{"type" => "ConditionalExpression"} = n, scope) do
-    quote do
-      if unquote(@runtime).truthy(unquote(expr(n["test"], scope))),
-        do: unquote(expr(n["consequent"], scope)),
-        else: unquote(expr(n["alternate"], scope))
+    consq = expr(n["consequent"], scope)
+    altq = expr(n["alternate"], scope)
+    mutated = (assigned_names(n["consequent"]) ++ assigned_names(n["alternate"])) |> Enum.uniq() |> not_boxed(scope)
+
+    if mutated == [] do
+      quote(do: if(unquote(@runtime).truthy(unquote(expr(n["test"], scope))), do: unquote(consq), else: unquote(altq)))
+    else
+      cond_thread(quote(do: unquote(@runtime).truthy(unquote(expr(n["test"], scope)))), consq, altq, mutated, scope, quote(do: nil), false)
     end
   end
 
