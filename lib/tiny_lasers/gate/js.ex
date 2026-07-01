@@ -60,7 +60,9 @@ defmodule TinyLasers.Gate.Js do
 
         res =
           try do
-            {:ok, apply(mod, :run, [])}
+            r = {:ok, apply(mod, :run, [])}
+            Runtime.drain_microtasks()
+            r
           catch
             :throw, {:gg_guest_error, r} -> {:guest_error, r}
             :throw, {:gg_return, v} -> {:ok, v}

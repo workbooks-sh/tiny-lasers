@@ -41,6 +41,7 @@ defmodule TinyLasers.Gate.Runtime do
     Process.put(:gg_out, [])
     Process.put(:gg_fs_writes, [])
     Process.put(:gg_global, {[], %{}})
+    Process.put(:gg_microq, :queue.new())
     :ok
   end
 
@@ -1061,6 +1062,30 @@ defmodule TinyLasers.Gate.Runtime do
   end
 
   # ── Promise internals (synchronous/eager; see the method clauses above) ──
+  # ── microtask queue: settle/then NEVER run callbacks inline (that recursed settle→then→settle unboundedly,
+  # growing the BEAM stack until OOM). Instead callbacks are ENQUEUED and a drain loop runs them iteratively
+  # (bounded, constant stack). This also gives correct JS microtask ordering. ──
+  defp mq_enqueue(thunk), do: Process.put(:gg_microq, :queue.in(thunk, Process.get(:gg_microq, :queue.new())))
+
+  defp mq_take do
+    case :queue.out(Process.get(:gg_microq, :queue.new())) do
+      {{:value, thunk}, q2} -> Process.put(:gg_microq, q2); thunk
+      {:empty, _} -> nil
+    end
+  end
+
+  @microtask_cap 5_000_000
+
+  @doc "Drain all pending microtasks iteratively (called by the run harness after the top-level guest code)."
+  def drain_microtasks(n \\ 0)
+  def drain_microtasks(n) when n >= @microtask_cap, do: guest_error("microtask overflow — unresolved promise loop")
+  def drain_microtasks(n) do
+    case mq_take() do
+      nil -> :ok
+      thunk -> thunk.(); drain_microtasks(n + 1)
+    end
+  end
+
   defp new_promise do
     id = __id()
     Process.put({:gg_prom, id}, {:pending, :undefined, []})
@@ -1069,43 +1094,57 @@ defmodule TinyLasers.Gate.Runtime do
 
   defp prom_state({:promise, id}), do: Process.get({:gg_prom, id}, {:pending, :undefined, []})
 
-  # settle a pending promise. Resolving with a thenable adopts its eventual state (Promise flattening).
+  # settle a pending promise. Resolving with a thenable adopts its eventual state (via prom_on — a SIDE-EFFECT
+  # subscription whose return value is ignored, unlike prom_then). Otherwise record state + enqueue callbacks.
   defp settle({:promise, id} = p, kind, value) do
     case prom_state(p) do
       {:pending, _, cbs} ->
-        cond do
-          kind == :fulfilled and match?({:promise, _}, value) ->
-            prom_then(value, closure(fn _t, a -> settle(p, :fulfilled, List.first(a) || :undefined) end),
-                             closure(fn _t, a -> settle(p, :rejected, List.first(a) || :undefined) end))
-          true ->
-            Process.put({:gg_prom, id}, {kind, value, []})
-            Enum.each(Enum.reverse(cbs), fn cb -> cb.(kind, value) end)
+        if kind == :fulfilled and match?({:promise, _}, value) do
+          prom_on(value, fn v -> settle(p, :fulfilled, v) end, fn e -> settle(p, :rejected, e) end)
+          :ok
+        else
+          Process.put({:gg_prom, id}, {kind, value, []})
+          Enum.each(:lists.reverse(cbs), fn cb -> mq_enqueue(fn -> cb.(kind, value) end) end)
         end
+
       _ -> :ok
     end
     p
   end
 
-  # .then: returns a new promise; run the matching handler (immediately if settled, else queue).
+  # subscribe an INTERNAL side-effect to a promise (Promise.all accumulation, thenable adoption). The handler
+  # is a plain 1-arg Elixir fun; its return value is IGNORED — no out-promise, no return-adoption. (prom_then,
+  # by contrast, settles an out-promise with the handler's return — for that, an internal handler returning a
+  # promise would be re-adopted every cycle → infinite microtask loop.)
+  defp prom_on(p, on_f, on_r) do
+    cb = fn kind, value -> (if kind == :fulfilled, do: on_f, else: on_r).(value) end
+    case prom_state(p) do
+      {:pending, _, cbs} -> Process.put(elem_key(p), {:pending, :undefined, [cb | cbs]})
+      {kind, value, _} -> mq_enqueue(fn -> cb.(kind, value) end)
+    end
+    :ok
+  end
+
+  # .then: returns a new promise; the handler runs as a MICROTASK (enqueued), never inline.
   defp prom_then(p, on_f, on_r) do
     out = new_promise()
-    run = fn kind, value ->
+    cb = fn kind, value ->
       handler = if kind == :fulfilled, do: on_f, else: on_r
-      cond do
-        match?({:fn, _}, handler) or match?({:host, _}, handler) ->
-          try do
-            settle(out, :fulfilled, invoke(handler, :undefined, [value]))
-          catch
-            :throw, {:gg_guest_error, e} -> settle(out, :rejected, e)
-            :throw, {:gg_throw, e} -> settle(out, :rejected, e)
-          end
+      if match?({:fn, _}, handler) or match?({:host, _}, handler) do
+        try do
+          settle(out, :fulfilled, invoke(handler, :undefined, [value]))
+        catch
+          :throw, {:gg_guest_error, e} -> settle(out, :rejected, e)
+          :throw, {:gg_throw, e} -> settle(out, :rejected, e)
+        end
+      else
         # no handler: pass the settled value/reason straight through
-        true -> settle(out, kind, value)
+        settle(out, kind, value)
       end
     end
     case prom_state(p) do
-      {:pending, _, cbs} -> Process.put(elem_key(p), {:pending, :undefined, [run | cbs]})
-      {kind, value, _} -> run.(kind, value)
+      {:pending, _, cbs} -> Process.put(elem_key(p), {:pending, :undefined, [cb | cbs]})
+      {kind, value, _} -> mq_enqueue(fn -> cb.(kind, value) end)
     end
     out
   end
@@ -1114,7 +1153,7 @@ defmodule TinyLasers.Gate.Runtime do
   defp invoke_if(f, args), do: (if match?({:fn, _}, f) or match?({:host, _}, f), do: invoke(f, :undefined, args), else: :undefined)
 
   @doc "Run an async function body thunk, producing a promise: resolves with its (awaited) result, or rejects
-  on a thrown guest error / rejected await. A thunk returning a promise adopts it (via settle-flattening)."
+  on a thrown guest error / rejected await."
   def promise_from(thunk) do
     try do
       settle(new_promise(), :fulfilled, thunk.())
@@ -1124,48 +1163,88 @@ defmodule TinyLasers.Gate.Runtime do
     end
   end
 
-  @doc "`await x`: unwrap a settled promise (rejected → re-throw the reason); non-promises pass through."
-  def await_({:promise, _} = p) do
+  @doc "`await x`: drain microtasks until the awaited promise settles, then unwrap (rejected → re-throw)."
+  def await_({:promise, _} = p), do: (drain_until(p, 0); await_read(p))
+  def await_(v), do: v
+
+  defp await_read(p) do
     case prom_state(p) do
       {:fulfilled, v, _} -> v
       {:rejected, e, _} -> throw_val(e)
       {:pending, _, _} -> :undefined
     end
   end
-  def await_(v), do: v
+
+  # run microtasks until `p` leaves pending (or the queue empties / cap hit).
+  defp drain_until(p, n) do
+    case prom_state(p) do
+      {:pending, _, _} when n < @microtask_cap ->
+        case mq_take() do
+          nil -> :ok
+          thunk -> thunk.(); drain_until(p, n + 1)
+        end
+      _ -> :ok
+    end
+  end
 
   defp promise_static("resolve", [v | _]), do: (if match?({:promise, _}, v), do: v, else: settle(new_promise(), :fulfilled, v))
   defp promise_static("resolve", []), do: settle(new_promise(), :fulfilled, :undefined)
   defp promise_static("reject", [e | _]), do: settle(new_promise(), :rejected, e)
   defp promise_static("reject", []), do: settle(new_promise(), :rejected, :undefined)
-  # Promise.all: fulfilled with an array of results (eager model runs each's settled value). Rejects on first reject.
+  # Promise.all: settle `out` with the results array once every input fulfils (reject on first rejection).
+  # Correct async: register a then on each input; accumulate results in an out-keyed process slot.
   defp promise_static("all", [{:arr, _} = av | _]) do
-    results = Enum.map(al(av), &promise_value/1)
-    case Enum.find(results, fn {s, _} -> s == :rejected end) do
-      {:rejected, e} -> settle(new_promise(), :rejected, e)
-      _ -> settle(new_promise(), :fulfilled, avec(Enum.map(results, fn {_, v} -> v end)))
+    items = al(av)
+    out = new_promise()
+    total = length(items)
+    if total == 0 do
+      settle(out, :fulfilled, avec([]))
+    else
+      Process.put({:gg_all, elem(out, 1)}, {total, List.duplicate(:undefined, total)})
+      items |> Enum.with_index() |> Enum.each(fn {item, i} ->
+        prom_on(promise_wrap(item), fn v -> all_collect(out, i, v) end, fn e -> settle(out, :rejected, e) end)
+      end)
+      out
     end
   end
   defp promise_static("allSettled", [{:arr, _} = av | _]) do
-    outs = Enum.map(al(av), fn item ->
-      case promise_value(item) do
-        {:fulfilled, v} -> cell_new([{"status", "fulfilled"}, {"value", v}])
-        {:rejected, e} -> cell_new([{"status", "rejected"}, {"reason", e}])
-      end
-    end)
-    settle(new_promise(), :fulfilled, avec(outs))
+    items = al(av)
+    out = new_promise()
+    total = length(items)
+    if total == 0 do
+      settle(out, :fulfilled, avec([]))
+    else
+      Process.put({:gg_all, elem(out, 1)}, {total, List.duplicate(:undefined, total)})
+      items |> Enum.with_index() |> Enum.each(fn {item, i} ->
+        prom_on(promise_wrap(item),
+          fn v -> all_collect(out, i, cell_new([{"status", "fulfilled"}, {"value", v}])) end,
+          fn e -> all_collect(out, i, cell_new([{"status", "rejected"}, {"reason", e}])) end)
+      end)
+      out
+    end
   end
   defp promise_static("race", [{:arr, _} = av | _]) do
-    case Enum.map(al(av), &promise_value/1) do
-      [{s, v} | _] -> settle(new_promise(), s, v)
-      [] -> new_promise()
-    end
+    out = new_promise()
+    Enum.each(al(av), fn item ->
+      prom_on(promise_wrap(item), fn v -> settle(out, :fulfilled, v) end, fn e -> settle(out, :rejected, e) end)
+    end)
+    out
   end
   defp promise_static(_, _), do: :undefined
 
-  # the settled {kind, value} of a value-or-promise (eager model: promises are already settled).
-  defp promise_value({:promise, _} = p), do: (case prom_state(p) do {:pending, _, _} -> {:fulfilled, :undefined}; {k, v, _} -> {k, v} end)
-  defp promise_value(v), do: {:fulfilled, v}
+  # record result i for a Promise.all/allSettled `out`; settle when all have arrived.
+  defp all_collect(out, i, v) do
+    {rem, results} = Process.get({:gg_all, elem(out, 1)})
+    results = List.replace_at(results, i, v)
+    if rem - 1 == 0 do
+      settle(out, :fulfilled, avec(results))
+    else
+      Process.put({:gg_all, elem(out, 1)}, {rem - 1, results})
+    end
+  end
+
+  defp promise_wrap({:promise, _} = p), do: p
+  defp promise_wrap(v), do: settle(new_promise(), :fulfilled, v)
 
   @doc "Link a child constructor's prototype to its parent's (ES6 `class Child extends Parent`), so inherited
   instance methods resolve by walking child.prototype -> parent.prototype. Also records the ctor-level super
