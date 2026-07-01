@@ -627,7 +627,7 @@ defmodule TinyLasers.Gate.Lower do
 
     argbind =
       if uses_args?,
-        do: [quote(do: unquote(lvar("arguments")) = {:arr, unquote(argvar)})],
+        do: [quote(do: unquote(lvar("arguments")) = unquote(@runtime).avec(unquote(argvar)))],
         else: []
 
     binds =
