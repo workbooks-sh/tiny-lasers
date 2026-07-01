@@ -146,6 +146,8 @@ defmodule TinyLasers.Gate.Runtime do
 
   @doc "Read a box."
   def box_get({:box, id}), do: Process.get({:gg_box, id}, :undefined)
+  # a value bound plain but read as boxed (analysis over-approximated capture): return it as-is.
+  def box_get(v), do: v
   @doc "Write a box (returns the value, JS assignment semantics)."
   def box_set({:box, id}, v), do: (Process.put({:gg_box, id}, v); v)
 
@@ -514,6 +516,8 @@ defmodule TinyLasers.Gate.Runtime do
   def method(s, "split", [sep | _]) when is_binary(s), do: avec(String.split(s, to_str(sep)))
   def method(s, "trim", _) when is_binary(s), do: String.trim(s)
   def method(s, "trimStart", _) when is_binary(s), do: String.trim_leading(s)
+  def method(s, "trimLeft", _) when is_binary(s), do: String.trim_leading(s)
+  def method(s, "trimRight", _) when is_binary(s), do: String.trim_trailing(s)
   def method(s, "trimEnd", _) when is_binary(s), do: String.trim_trailing(s)
   def method(s, "substring", [a | rest]) when is_binary(s), do: str_substring(s, a, rest)
   def method(s, "substr", [a | rest]) when is_binary(s), do: str_slice(s, a, (case rest do [l | _] -> [a + l]; _ -> [] end))
