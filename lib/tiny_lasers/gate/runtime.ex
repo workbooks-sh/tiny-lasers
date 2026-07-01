@@ -182,24 +182,25 @@ defmodule TinyLasers.Gate.Runtime do
 
   # arrays can carry NAMED properties (JS arrays are objects): `this.tokens.links = {}` — stored in a props
   # map alongside the elements. Numeric keys write elements; named keys write props.
-  def oput({:arr, list}, k, v), do: arr_put(list, %{}, k, v)
-  def oput({:arr, list, meta}, k, v), do: arr_put(list, meta, k, v)
+  def oput({:arr, _} = a, k, v), do: arr_put(a, k, v)
   def oput(_not_obj, _k, _v), do: {[], %{}}
 
-  # write to an array: numeric key → element slot; named key → the props map (dropped from the tuple when empty).
-  defp arr_put(list, meta, k, v) do
+  # write to an array IN PLACE: numeric key → element slot; named key → the props map. Returns the same handle.
+  defp arr_put({:arr, _} = a, k, v) do
+    list = al(a)
+    props = ap(a)
+
     case arr_index(k) do
       nil ->
-        {:arr, list, Map.put(meta, key_str(k), v)}
+        aset(a, list, Map.put(props, key_str(k), v))
 
       idx when idx >= 0 and idx < 1_000_000 ->
         list = if idx >= length(list), do: list ++ List.duplicate(:undefined, idx - length(list) + 1), else: list
-        list = List.replace_at(list, idx, v)
-        if meta == %{}, do: {:arr, list}, else: {:arr, list, meta}
+        aset(a, List.replace_at(list, idx, v), props)
 
       # an out-of-sane-range index (from a NaN/huge computed key) is treated as a named prop, never a giant list.
       idx ->
-        {:arr, list, Map.put(meta, Integer.to_string(idx), v)}
+        aset(a, list, Map.put(props, Integer.to_string(idx), v))
     end
   end
 
@@ -229,22 +230,14 @@ defmodule TinyLasers.Gate.Runtime do
   def oget({:fn, _} = fnv, "prototype"), do: fn_proto(fnv)
   def oget({:fn, f}, k), do: (Process.get(:gg_fnprops, %{}) |> Map.get(f, {[], %{}}) |> elem(1) |> Map.get(key_str(k), :undefined))
   def oget({_keys, map}, k) when is_map(map), do: Map.get(map, key_str(k), :undefined)
-  def oget({:arr, list, meta}, k) do
-    cond do
-      k == "length" -> length(list) * 1.0
-      arr_index(k) != nil -> oget({:arr, list}, k)
-      true -> Map.get(meta, key_str(k), :undefined)
-    end
-  end
   def oget({:set, _} = st, "size"), do: length(set_list(st)) * 1.0
   def oget({:map, _} = mp, "size"), do: length(map_pairs(mp)) * 1.0
-  def oget({:arr, list}, "length"), do: length(list) * 1.0
-  def oget({:arr, list}, i) when is_number(i), do: Enum.at(list, trunc(i), :undefined)
 
-  def oget({:arr, list}, k) when is_binary(k) do
-    case Integer.parse(k) do
-      {n, ""} -> Enum.at(list, n, :undefined)
-      _ -> :undefined
+  def oget({:arr, _} = a, k) do
+    cond do
+      k == "length" -> length(al(a)) * 1.0
+      (idx = arr_index(k)) != nil -> Enum.at(al(a), idx, :undefined)
+      true -> Map.get(ap(a), key_str(k), :undefined)
     end
   end
 
@@ -332,8 +325,7 @@ defmodule TinyLasers.Gate.Runtime do
   end
 
   @doc "Functional index/key write. Arrays grow to fit; objects add the key. Returns a NEW term."
-  def oput_idx({:arr, list}, i, v), do: arr_put(list, %{}, i, v)
-  def oput_idx({:arr, list, meta}, i, v), do: arr_put(list, meta, i, v)
+  def oput_idx({:arr, _} = a, i, v), do: arr_put(a, i, v)
   def oput_idx({:cell, _} = c, k, v), do: cell_put(c, k, v)
   def oput_idx({:globalobj}, k, v), do: oput({:globalobj}, k, v)
   def oput_idx(other, k, v), do: oput(other, k, v)
@@ -346,9 +338,24 @@ defmodule TinyLasers.Gate.Runtime do
     end
   end
 
-  # ── array direct-term (a tagged immutable list, GC'd) ──
+  # ── arrays are MUTABLE REFERENCES (JS array semantics): `{:arr, id}` indexes a per-run table holding
+  # `{elements, named_props}`. push/pop/… mutate in place so aliases + params share the mutation (marked's
+  # `blockTokens(src, this.tokens)` pushes into the caller's array). Non-mutating ops return a NEW array. ──
+  @doc "Allocate a mutable array."
+  def avec(list, props \\ %{}) when is_list(list) do
+    id = Process.get(:gg_vec_next, 0)
+    Process.put(:gg_vec_next, id + 1)
+    Process.put({:gg_vec, id}, {list, props})
+    {:arr, id}
+  end
+
+  defp al({:arr, id}), do: Process.get({:gg_vec, id}, {[], %{}}) |> elem(0)
+  defp ap({:arr, id}), do: Process.get({:gg_vec, id}, {[], %{}}) |> elem(1)
+  defp aset({:arr, id} = a, list, props), do: (Process.put({:gg_vec, id}, {list, props}); a)
+  defp aset_l({:arr, _} = a, list), do: aset(a, list, ap(a))
+
   @doc "Array literal from evaluated elements."
-  def alit(elems) when is_list(elems), do: {:arr, elems}
+  def alit(elems) when is_list(elems), do: avec(elems)
 
   # ── regex as a CAPABILITY (backed by Elixir Regex, returns guest values, stays confined). A regex is a
   # guest-safe term `{:regex, compiled, source, flags}`; the guest can only pass it to the regex methods. ──
@@ -383,17 +390,17 @@ defmodule TinyLasers.Gate.Runtime do
     if global?(rx) do
       case Regex.scan(re, s, capture: :first) |> List.flatten() do
         [] -> :undefined
-        list -> {:arr, list}
+        list -> avec(list)
       end
     else
       case Regex.run(re, s) do
         nil -> :undefined
-        caps -> {:arr, Enum.map(caps, fn c -> c || :undefined end)}
+        caps -> avec(Enum.map(caps, fn c -> c || :undefined end))
       end
     end
   end
 
-  def method(s, "split", [{:regex, re, _, _}]) when is_binary(s), do: {:arr, Regex.split(re, s)}
+  def method(s, "split", [{:regex, re, _, _}]) when is_binary(s), do: avec(Regex.split(re, s))
   def method(s, "search", [{:regex, re, _, _}]) when is_binary(s) do
     case Regex.run(re, s, return: :index) do
       [{pos, _} | _] -> pos * 1.0
@@ -428,7 +435,7 @@ defmodule TinyLasers.Gate.Runtime do
       [{ms, ml} | _] = idxs ->
         caps = Enum.map(idxs, fn {i, l} -> if i < 0, do: :undefined, else: binary_part(str, i, l) end)
         if global, do: relast_set(r, ms + ml)
-        {:arr, caps, %{"index" => ms * 1.0, "input" => str}}
+        avec(caps, %{"index" => ms * 1.0, "input" => str})
 
       _ ->
         (if global, do: relast_set(r, 0)); :null
@@ -470,39 +477,15 @@ defmodule TinyLasers.Gate.Runtime do
   def method({:map, id} = mp, "delete", [k | _]), do: (had = method(mp, "has", [k]); Process.put({:gg_map, id}, List.keydelete(map_pairs(mp), k, 0)); had)
   def method({:map, id}, "clear", _), do: (Process.put({:gg_map, id}, []); :undefined)
   def method({:map, _} = mp, "forEach", [f | _]), do: (Enum.each(map_pairs(mp), fn {k, v} -> call(f, [v, k]) end); :undefined)
-  def method({:map, _} = mp, "keys", _), do: {:arr, Enum.map(map_pairs(mp), &elem(&1, 0))}
-  def method({:map, _} = mp, "values", _), do: {:arr, Enum.map(map_pairs(mp), &elem(&1, 1))}
-  # array-with-props delegates to the plain form but PRESERVES the props map across mutations (tokens.links
-  # must survive tokens.push).
-  def method({:arr, list, meta}, name, args) do
-    case method({:arr, list}, name, args) do
-      {:mut, {:arr, nl}, ret} -> {:mut, {:arr, nl, meta}, ret}
-      other -> other
-    end
+  def method({:map, _} = mp, "keys", _), do: avec(Enum.map(map_pairs(mp), &elem(&1, 0)))
+  def method({:map, _} = mp, "values", _), do: avec(Enum.map(map_pairs(mp), &elem(&1, 1)))
+  # ── all array methods on a mutable reference: mutating ops write the table in place (aliases share); pure
+  # ops return a NEW array. ──
+  def method({:arr, _} = a, name, args) do
+    list = al(a)
+    a0 = List.first(args)
+    arr_method(a, list, name, a0, args)
   end
-  def method({:arr, list}, "push", args), do: {:mut, {:arr, list ++ args}, (length(list) + length(args)) * 1.0}
-  def method({:arr, list}, "pop", _), do: pop_last(list)
-  def method({:arr, list}, "join", [sep | _]), do: list |> Enum.map(&to_str/1) |> Enum.join(to_str(sep))
-  def method({:arr, list}, "join", _), do: list |> Enum.map(&to_str/1) |> Enum.join(",")
-  def method({:arr, list}, "indexOf", [x | _]), do: (Enum.find_index(list, &(&1 === x)) || -1) * 1.0
-  def method({:arr, list}, "includes", [x | _]), do: Enum.any?(list, &(&1 === x))
-  def method({:arr, list}, "slice", [a | rest]), do: {:arr, slice_list(list, a, rest)}
-
-  def method({:arr, list}, "concat", args) do
-    tail = Enum.flat_map(args, fn {:arr, l} -> l; other -> [other] end)
-    {:arr, list ++ tail}
-  end
-
-  def method({:arr, list}, "map", [f | _]),
-    do: {:arr, Enum.with_index(list) |> Enum.map(fn {v, i} -> call(f, [v, i * 1.0]) end)}
-
-  def method({:arr, list}, "forEach", [f | _]) do
-    Enum.with_index(list) |> Enum.each(fn {v, i} -> call(f, [v, i * 1.0]) end)
-    :undefined
-  end
-
-  def method({:arr, list}, "filter", [f | _]),
-    do: {:arr, Enum.filter(list, fn v -> truthy(call(f, [v])) end)}
 
   def method(s, "charCodeAt", [i | _]) when is_binary(s) do
     case :binary.at(s, trunc(i)) do
@@ -523,7 +506,7 @@ defmodule TinyLasers.Gate.Runtime do
     end
   end
 
-  def method(s, "split", [sep | _]) when is_binary(s), do: {:arr, String.split(s, to_str(sep))}
+  def method(s, "split", [sep | _]) when is_binary(s), do: avec(String.split(s, to_str(sep)))
   def method(s, "trim", _) when is_binary(s), do: String.trim(s)
   def method(s, "trimStart", _) when is_binary(s), do: String.trim_leading(s)
   def method(s, "trimEnd", _) when is_binary(s), do: String.trim_trailing(s)
@@ -554,46 +537,73 @@ defmodule TinyLasers.Gate.Runtime do
     case oget(s, i * 1) do c when is_binary(c) -> (:binary.first(c)) * 1.0; _ -> :undefined end
   end
 
-  # ── more array methods ──
-  def method({:arr, list}, "reduce", [f | rest]) do
-    case rest do
-      [init | _] -> Enum.reduce(Enum.with_index(list), init, fn {v, i}, acc -> call(f, [acc, v, i * 1.0]) end)
-      [] -> case list do
-              [] -> guest_error("reduce of empty array with no initial value")
-              [h | t] -> Enum.reduce(Enum.with_index(t, 1), h, fn {v, i}, acc -> call(f, [acc, v, i * 1.0]) end)
-            end
+  # array-method dispatch on the deref'd `list`; mutating cases `aset_l(a, …)` write back in place.
+  defp arr_flat(list), do: Enum.flat_map(list, fn x -> if match?({:arr, _}, x), do: al(x), else: [x] end)
+
+  defp arr_method(a, list, name, a0, args) do
+    case name do
+      "push" -> aset_l(a, list ++ args); (length(list) + length(args)) * 1.0
+      "pop" -> case list do
+                 [] -> :undefined
+                 _ -> {init, [last]} = Enum.split(list, -1); aset_l(a, init); last
+               end
+      "shift" -> case list do [] -> :undefined; [h | t] -> aset_l(a, t); h end
+      "unshift" -> aset_l(a, args ++ list); (length(list) + length(args)) * 1.0
+      "join" -> sep = if a0, do: to_str(a0), else: ","; list |> Enum.map(fn v -> if v in [:undefined, :null], do: "", else: to_str(v) end) |> Enum.join(sep)
+      "indexOf" -> (Enum.find_index(list, &(&1 === a0)) || -1) * 1.0
+      "lastIndexOf" -> idx = list |> Enum.reverse() |> Enum.find_index(&(&1 === a0)); if idx, do: (length(list) - 1 - idx) * 1.0, else: -1.0
+      "includes" -> Enum.any?(list, &(&1 === a0))
+      "slice" -> avec(slice_list(list, a0 || 0.0, Enum.drop(args, 1)))
+      "concat" -> avec(list ++ arr_flat(args))
+      "flat" -> avec(arr_flat(list))
+      "map" -> avec(Enum.with_index(list) |> Enum.map(fn {v, i} -> call(a0, [v, i * 1.0, a]) end))
+      "filter" -> avec(Enum.filter(list, fn v -> truthy(call(a0, [v])) end))
+      "forEach" -> Enum.with_index(list) |> Enum.each(fn {v, i} -> call(a0, [v, i * 1.0, a]) end); :undefined
+      "find" -> Enum.find(list, :undefined, fn v -> truthy(call(a0, [v])) end)
+      "findIndex" -> (Enum.find_index(list, fn v -> truthy(call(a0, [v])) end) || -1) * 1.0
+      "some" -> Enum.any?(list, fn v -> truthy(call(a0, [v])) end)
+      "every" -> Enum.all?(list, fn v -> truthy(call(a0, [v])) end)
+      "reduce" -> arr_reduce(list, args)
+      "reduceRight" -> Enum.reduce(Enum.reverse(list), (if length(args) > 1, do: Enum.at(args, 1), else: :undefined), fn v, acc -> call(a0, [acc, v]) end)
+      "sort" -> cmp = if match?({:fn, _}, a0), do: a0, else: nil
+                sorted = if cmp, do: Enum.sort(list, fn x, y -> num(call(cmp, [x, y])) <= 0 end), else: Enum.sort_by(list, &to_str/1)
+                aset_l(a, sorted); a
+      "reverse" -> aset_l(a, Enum.reverse(list)); a
+      "fill" -> aset_l(a, Enum.map(list, fn _ -> a0 end)); a
+      "at" -> idx = trunc(num(a0)); idx = if idx < 0, do: length(list) + idx, else: idx; Enum.at(list, idx, :undefined)
+      "splice" -> arr_splice(a, list, args)
+      m when m in ["toString", "valueOf"] -> list |> Enum.map(&to_str/1) |> Enum.join(",")
+      _ ->
+        # a function-valued named property (rare): call it; else it is not a function.
+        case Map.get(ap(a), name, :undefined) do
+          {:fn, _} = f -> invoke(f, a, args)
+          _ -> guest_error("not a function")
+        end
     end
   end
-  def method({:arr, list}, "reduceRight", [f | rest]) do
-    init = case rest do [i | _] -> i; _ -> :undefined end
-    Enum.reduce(Enum.reverse(list), init, fn v, acc -> call(f, [acc, v]) end)
+
+  defp arr_reduce(list, [f | rest]) do
+    case rest do
+      [init | _] -> Enum.reduce(Enum.with_index(list), init, fn {v, i}, acc -> call(f, [acc, v, i * 1.0]) end)
+      [] ->
+        case list do
+          [] -> guest_error("reduce of empty array with no initial value")
+          [h | t] -> Enum.reduce(Enum.with_index(t, 1), h, fn {v, i}, acc -> call(f, [acc, v, i * 1.0]) end)
+        end
+    end
   end
-  def method({:arr, list}, "sort", rest) do
-    cmp = case rest do [{:fn, _} = f | _] -> f; _ -> nil end
-    sorted = if cmp, do: Enum.sort(list, fn a, b -> num(call(cmp, [a, b])) <= 0 end), else: Enum.sort_by(list, &to_str/1)
-    {:mut, {:arr, sorted}, {:arr, sorted}}
+
+  # arr.splice(start, deleteCount, ...items) — mutate in place, return the removed elements as a new array.
+  defp arr_splice(a, list, args) do
+    len = length(list)
+    start = trunc(num(List.first(args) || 0.0))
+    start = if start < 0, do: max(len + start, 0), else: min(start, len)
+    dcount = case args do [_, d | _] -> max(trunc(num(d)), 0); _ -> len - start end
+    items = Enum.drop(args, 2)
+    removed = Enum.slice(list, start, dcount)
+    aset_l(a, Enum.take(list, start) ++ items ++ Enum.drop(list, start + dcount))
+    avec(removed)
   end
-  def method({:arr, list}, "reverse", _), do: {:mut, {:arr, Enum.reverse(list)}, {:arr, Enum.reverse(list)}}
-  def method({:arr, list}, "find", [f | _]), do: Enum.find(list, :undefined, fn v -> truthy(call(f, [v])) end)
-  def method({:arr, list}, "findIndex", [f | _]), do: (Enum.find_index(list, fn v -> truthy(call(f, [v])) end) || -1) * 1.0
-  def method({:arr, list}, "some", [f | _]), do: Enum.any?(list, fn v -> truthy(call(f, [v])) end)
-  def method({:arr, list}, "every", [f | _]), do: Enum.all?(list, fn v -> truthy(call(f, [v])) end)
-  def method({:arr, list}, "fill", [v | _]), do: {:mut, {:arr, Enum.map(list, fn _ -> v end)}, {:arr, Enum.map(list, fn _ -> v end)}}
-  def method({:arr, list}, "lastIndexOf", [x | _]) do
-    idx = list |> Enum.reverse() |> Enum.find_index(&(&1 === x))
-    if idx, do: (length(list) - 1 - idx) * 1.0, else: -1.0
-  end
-  def method({:arr, list}, "shift", _) do
-    case list do [] -> {:mut, {:arr, []}, :undefined}; [h | t] -> {:mut, {:arr, t}, h} end
-  end
-  def method({:arr, list}, "unshift", args), do: {:mut, {:arr, args ++ list}, (length(list) + length(args)) * 1.0}
-  def method({:arr, list}, "at", [i | _]) do
-    idx = trunc(i)
-    idx = if idx < 0, do: length(list) + idx, else: idx
-    Enum.at(list, idx, :undefined)
-  end
-  def method({:arr, list}, "flat", _), do: {:arr, Enum.flat_map(list, fn {:arr, l} -> l; other -> [other] end)}
-  def method({:arr, list}, m, _) when m in ["toString", "valueOf"], do: list |> Enum.map(&to_str/1) |> Enum.join(",")
 
   def method({keys, map}, "hasOwnProperty", [k | _]) when is_map(map), do: Map.has_key?(map, key_str(k))
 
@@ -627,10 +637,10 @@ defmodule TinyLasers.Gate.Runtime do
   def method({:global, "Number"}, "parseFloat", [x | _]), do: to_number(x)
   def method({:global, "String"}, "fromCharCode", codes), do: codes |> Enum.map(&<<trunc(&1)::utf8>>) |> Enum.join()
 
-  defp object_static("keys", [o | _]), do: {:arr, okeys(o)}
-  defp object_static("values", [o | _]), do: {:arr, Enum.map(okeys(o), &oget(o, &1))}
-  defp object_static("entries", [o | _]), do: {:arr, Enum.map(okeys(o), fn k -> {:arr, [k, oget(o, k)]} end)}
-  defp object_static("getOwnPropertyNames", [o | _]), do: {:arr, okeys(o)}
+  defp object_static("keys", [o | _]), do: avec(okeys(o))
+  defp object_static("values", [o | _]), do: avec(Enum.map(okeys(o), &oget(o, &1)))
+  defp object_static("entries", [o | _]), do: avec(Enum.map(okeys(o), fn k -> avec([k, oget(o, k)]) end))
+  defp object_static("getOwnPropertyNames", [o | _]), do: avec(okeys(o))
   defp object_static("assign", [target | sources]), do: Enum.reduce(sources, target, fn s, t -> Enum.reduce(okeys(s), t, fn k, acc -> oput(acc, k, oget(s, k)) end) end)
   # Object.create(proto): a fresh object whose prototype chain is `proto` (Babel `_inherits`).
   defp object_static("create", [proto | _]) when proto != :undefined and proto != :null do
@@ -659,14 +669,14 @@ defmodule TinyLasers.Gate.Runtime do
   defp array_static("from", [x | rest]) do
     items = iter_any(x)
     case rest do
-      [{:fn, _} = f | _] -> {:arr, Enum.with_index(items) |> Enum.map(fn {v, i} -> call(f, [v, i * 1.0]) end)}
+      [{:fn, _} = f | _] -> avec(Enum.with_index(items) |> Enum.map(fn {v, i} -> call(f, [v, i * 1.0]) end))
       _ -> {:arr, items}
     end
   end
   defp array_static("of", args), do: {:arr, args}
   defp array_static(_, _), do: :undefined
 
-  defp iter_any({:arr, l}), do: l
+  defp iter_any({:arr, _} = a), do: al(a)
   defp iter_any(s) when is_binary(s), do: for(<<c::utf8 <- s>>, do: <<c::utf8>>)
   defp iter_any(_), do: []
 
@@ -687,7 +697,7 @@ defmodule TinyLasers.Gate.Runtime do
   def call({:global, "String"}, args), do: to_str(List.first(args) || :undefined)
   def call({:global, "Number"}, args), do: to_number(List.first(args) || :undefined)
   def call({:global, "Boolean"}, args), do: truthy(List.first(args) || :undefined)
-  def call({:global, "Array"}, args), do: {:arr, args}
+  def call({:global, "Array"}, args), do: avec(args)
   def call({:global, "Object"}, args), do: List.first(args) || olit()
   def call({:global, err}, args) when err in ["Error", "TypeError", "RangeError", "SyntaxError"], do: construct({:global, err}, args)
   def call({:global, _}, _args), do: :undefined
@@ -707,7 +717,7 @@ defmodule TinyLasers.Gate.Runtime do
   defp json_enc(:undefined), do: "null"
   defp json_enc(:null), do: "null"
   defp json_enc(s) when is_binary(s), do: json_quote(s)
-  defp json_enc({:arr, l}), do: "[" <> (l |> Enum.map(&json_enc/1) |> Enum.join(",")) <> "]"
+  defp json_enc({:arr, _} = a), do: "[" <> (al(a) |> Enum.map(&json_enc/1) |> Enum.join(",")) <> "]"
   defp json_enc({:fn, _}), do: "null"
   defp json_enc(o) do
     keys = okeys(o)
@@ -729,7 +739,7 @@ defmodule TinyLasers.Gate.Runtime do
   defp json_to_guest(b) when is_boolean(b), do: b
   defp json_to_guest(nil), do: :null
   defp json_to_guest(s) when is_binary(s), do: s
-  defp json_to_guest(l) when is_list(l), do: {:arr, Enum.map(l, &json_to_guest/1)}
+  defp json_to_guest(l) when is_list(l), do: avec(Enum.map(l, &json_to_guest/1))
   defp json_to_guest(m) when is_map(m), do: Enum.reduce(m, olit(), fn {k, v}, acc -> oput(acc, to_string(k), json_to_guest(v)) end)
 
   defp parse_int(x) do
@@ -753,14 +763,14 @@ defmodule TinyLasers.Gate.Runtime do
   # Function.prototype.apply/call/bind (marked + minified helpers use these heavily).
   def method({:fn, _} = f, "apply", args) do
     this = List.first(args) || :undefined
-    argl = case args do [_, {:arr, l} | _] -> l; _ -> [] end
+    argl = case args do [_, {:arr, _} = av | _] -> al(av); _ -> [] end
     invoke(f, this, argl)
   end
 
   def method({:protom, :tostring}, m, [x | _]) when m in ["call", "apply"], do: to_string_tag(x)
   def method({:protom, :tostring}, m, []) when m in ["call", "apply"], do: to_string_tag(:undefined)
   def method({:protom, :hasown}, "call", [o, k | _]), do: has_own(o, k)
-  def method({:protom, :hasown}, "apply", [o, {:arr, [k | _]} | _]), do: has_own(o, k)
+  def method({:protom, :hasown}, "apply", [o, {:arr, _} = av | _]), do: has_own(o, List.first(al(av)))
   def method({:fn, _} = f, "call", [this | rest]), do: invoke(f, this, rest)
   def method({:fn, _} = f, "call", []), do: invoke(f, :undefined, [])
 
@@ -783,8 +793,6 @@ defmodule TinyLasers.Gate.Runtime do
     guest_error("not a function")
   end
 
-  defp pop_last([]), do: {:mut, {:arr, []}, :undefined}
-  defp pop_last(list), do: {:mut, {:arr, Enum.drop(list, -1)}, List.last(list)}
 
   defp slice_list(list, a, rest) do
     start = trunc(a)
@@ -873,18 +881,18 @@ defmodule TinyLasers.Gate.Runtime do
   def construct({:global, err}, args) when err in ["Error", "TypeError", "RangeError", "SyntaxError"],
     do: cell_new([{"message", to_str(List.first(args) || "")}, {"name", err}])
 
-  def construct({:global, "Array"}, args), do: {:arr, args}
+  def construct({:global, "Array"}, args), do: avec(args)
   def construct({:global, "Object"}, _), do: cell_new([])
   def construct({:global, "Set"}, args) do
     id = __id()
-    init = case args do [{:arr, l} | _] -> Enum.uniq(l); _ -> [] end
+    init = case args do [{:arr, _} = av | _] -> Enum.uniq(al(av)); _ -> [] end
     Process.put({:gg_set, id}, init)
     {:set, id}
   end
 
   def construct({:global, "Map"}, args) do
     id = __id()
-    init = case args do [{:arr, l} | _] -> Enum.map(l, fn {:arr, [k, v | _]} -> {k, v}; _ -> {:undefined, :undefined} end); _ -> [] end
+    init = case args do [{:arr, _} = av | _] -> Enum.map(al(av), fn e -> case (if match?({:arr,_},e), do: al(e), else: []) do [k, v | _] -> {k, v}; _ -> {:undefined, :undefined} end end); _ -> [] end
     Process.put({:gg_map, id}, init)
     {:map, id}
   end
@@ -1034,8 +1042,7 @@ defmodule TinyLasers.Gate.Runtime do
   def to_str({:obj, _}), do: "[object Object]"
   def to_str({:fun, _}), do: "function"
   def to_str({:host, _}), do: "function"
-  def to_str({:arr, list}), do: list |> Enum.map(&to_str/1) |> Enum.join(",")
-  def to_str({:arr, list, _}), do: to_str({:arr, list})
+  def to_str({:arr, _} = a), do: al(a) |> Enum.map(fn v -> if v in [:undefined, :null], do: "", else: to_str(v) end) |> Enum.join(",")
   def to_str({:regex, _, src, flags}), do: "/" <> src <> "/" <> flags
   def to_str(_), do: "[unknown]"
 
@@ -1050,7 +1057,7 @@ defmodule TinyLasers.Gate.Runtime do
         is_boolean(x) -> "Boolean"
         x == :undefined -> "Undefined"
         x == :null -> "Null"
-        match?({:arr, _}, x) or match?({:arr, _, _}, x) -> "Array"
+        match?({:arr, _}, x) -> "Array"
         match?({:regex, _, _, _}, x) -> "RegExp"
         match?({:fn, _}, x) or match?({:host, _}, x) or match?({:globalfn, _}, x) -> "Function"
         true -> "Object"
@@ -1065,7 +1072,7 @@ defmodule TinyLasers.Gate.Runtime do
       {:fn, f} -> Process.get(:gg_fnprops, %{}) |> Map.get(f, {[], %{}}) |> elem(1) |> Map.has_key?(key)
       {keys, map} when is_map(map) -> Map.has_key?(map, key)
       {:globalobj} -> Process.get(:gg_global, {[], %{}}) |> elem(1) |> Map.has_key?(key)
-      {:arr, list} -> key == "length" or match?({n, ""} when n >= 0 and n < length(list), Integer.parse(key))
+      {:arr, _} = a -> len = length(al(a)); key == "length" or match?({n, ""} when n >= 0 and n < len, Integer.parse(key))
       _ -> false
     end
   end
@@ -1081,17 +1088,15 @@ defmodule TinyLasers.Gate.Runtime do
   def throw_val(v), do: throw({:gg_throw, v})
 
   @doc "for-of iteration items: array elements, or a string's chars (1-char binaries)."
-  def iter({:arr, list, _}), do: list
+  def iter({:arr, _} = a), do: al(a)
   def iter({:set, _} = st), do: set_list(st)
-  def iter({:arr, list}), do: list
   def iter(s) when is_binary(s), do: for <<c::utf8 <- s>>, do: <<c::utf8>>
   def iter(_), do: []
 
   @doc "for-in enumeration keys: object own-keys, array index strings, or none."
   def enum_keys({keys, map}) when is_map(map), do: keys
   def enum_keys({:cell, _} = c), do: elem(cell_read(c), 0)
-  def enum_keys({:arr, list, _}), do: enum_keys({:arr, list})
-  def enum_keys({:arr, list}), do: Enum.map(0..(length(list) - 1)//1, &Integer.to_string/1)
+  def enum_keys({:arr, _} = a), do: (l = al(a); if l == [], do: [], else: Enum.map(0..(length(l) - 1)//1, &Integer.to_string/1))
   def enum_keys(_), do: []
 
   @doc "`typeof` — a fixed set of result binaries (never guest-controlled atoms)."
