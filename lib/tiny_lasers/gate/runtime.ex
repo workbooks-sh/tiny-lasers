@@ -172,6 +172,83 @@ defmodule TinyLasers.Gate.Runtime do
   @doc "Array literal from evaluated elements."
   def alit(elems) when is_list(elems), do: {:arr, elems}
 
+  # ── regex as a CAPABILITY (backed by Elixir Regex, returns guest values, stays confined). A regex is a
+  # guest-safe term `{:regex, compiled, source, flags}`; the guest can only pass it to the regex methods. ──
+  @doc "Compile a guest regex. JS flags i/m/s/u/x map to Elixir opts; g is applied at match/replace time."
+  def regex(source, flags) when is_binary(source) do
+    opts = flags |> String.graphemes() |> Enum.filter(&(&1 in ~w(i m s u x))) |> Enum.join()
+
+    case Regex.compile(source, opts) do
+      {:ok, re} -> {:regex, re, source, flags}
+      {:error, _} -> {:regex, ~r/(?!)/, source, flags}
+    end
+  end
+
+  def regex(_source, _flags), do: {:regex, ~r/(?!)/, "", ""}
+
+  defp global?({:regex, _re, _src, flags}), do: String.contains?(flags, "g")
+
+  # string × regex methods (marked's hot surface): replace/match/split/test/exec
+  def method(s, "replace", [{:regex, re, _, _} = rx, repl]) when is_binary(s) do
+    Regex.replace(re, s, regex_replacement(repl), global: global?(rx))
+  end
+
+  def method(s, "replace", [pat, repl]) when is_binary(s) and is_binary(pat) do
+    # string pattern: replace first occurrence
+    case :binary.match(s, pat) do
+      {pos, len} -> binary_part(s, 0, pos) <> to_str(apply_str_repl(repl, pat)) <> binary_part(s, pos + len, byte_size(s) - pos - len)
+      :nomatch -> s
+    end
+  end
+
+  def method(s, "match", [{:regex, re, _, _} = rx]) when is_binary(s) do
+    if global?(rx) do
+      case Regex.scan(re, s, capture: :first) |> List.flatten() do
+        [] -> :undefined
+        list -> {:arr, list}
+      end
+    else
+      case Regex.run(re, s) do
+        nil -> :undefined
+        caps -> {:arr, Enum.map(caps, fn c -> c || :undefined end)}
+      end
+    end
+  end
+
+  def method(s, "split", [{:regex, re, _, _}]) when is_binary(s), do: {:arr, Regex.split(re, s)}
+  def method(s, "search", [{:regex, re, _, _}]) when is_binary(s) do
+    case Regex.run(re, s, return: :index) do
+      [{pos, _} | _] -> pos * 1.0
+      _ -> -1.0
+    end
+  end
+
+  def method({:regex, re, _, _}, "test", [s | _]), do: Regex.match?(re, to_str(s))
+
+  def method({:regex, re, _, _}, "exec", [s | _]) do
+    case Regex.run(re, to_str(s)) do
+      nil -> :undefined
+      caps -> {:arr, Enum.map(caps, fn c -> c || :undefined end)}
+    end
+  end
+
+  # a function replacement `.replace(re, fn)` — Elixir passes the whole match + captures as separate args.
+  defp regex_replacement({:fn, _} = f), do: fn full, caps -> to_str(call(f, [full | (caps || [])])) end
+  defp regex_replacement({:host, _} = f), do: fn full, caps -> to_str(call(f, [full | (caps || [])])) end
+  defp regex_replacement(repl), do: js_repl_to_elixir(to_str(repl))
+
+  # JS replacement templates: $1..$9 -> \1, $& -> \0, $$ -> $
+  defp js_repl_to_elixir(t) do
+    t
+    |> String.replace("$$", "\x00DOLLAR\x00")
+    |> String.replace(~r/\$(\d)/, "\\\\\\1")
+    |> String.replace("$&", "\\0")
+    |> String.replace("\x00DOLLAR\x00", "$")
+  end
+
+  defp apply_str_repl({:fn, _} = f, matched), do: call(f, [matched])
+  defp apply_str_repl(repl, _matched), do: repl
+
   @doc """
   Confined METHOD dispatch: `recv.name(args)`. The dispatch table IS the builtin surface — a name that
   doesn't resolve for the receiver type is a guest `:undefined` (never a host reach). Mutating array methods

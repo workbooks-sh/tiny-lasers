@@ -226,7 +226,19 @@ defmodule TinyLasers.Gate.Lower do
   defp for_init(e, scope), do: {expr(e, scope), scope}
 
   # ── expressions ──
+  # regex literal /pattern/flags — acorn attaches a "regex" map; compile through the confined regex capability.
+  defp expr(%{"type" => "Literal", "regex" => %{"pattern" => p, "flags" => f}}, _),
+    do: quote(do: unquote(@runtime).regex(unquote(p), unquote(f)))
+
   defp expr(%{"type" => "Literal", "value" => v}, _), do: lit(v)
+
+  # new RegExp(source, flags) — the only constructor wired (classes/prototypes are a later phase).
+  defp expr(%{"type" => "NewExpression", "callee" => %{"type" => "Identifier", "name" => "RegExp"}} = n, scope) do
+    args = n["arguments"] || []
+    src = if args != [], do: expr(Enum.at(args, 0), scope), else: ""
+    flags = if length(args) > 1, do: expr(Enum.at(args, 1), scope), else: ""
+    quote(do: unquote(@runtime).regex(unquote(src), unquote(flags)))
+  end
   defp expr(%{"type" => "Identifier", "name" => n}, scope), do: ident(n, scope)
 
   defp expr(%{"type" => "ObjectExpression", "properties" => props}, scope) do
