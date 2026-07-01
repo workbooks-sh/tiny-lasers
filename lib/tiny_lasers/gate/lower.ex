@@ -29,10 +29,12 @@ defmodule TinyLasers.Gate.Lower do
   def program(ast, granted \\ %{})
 
   def program(%{"type" => "Program", "body" => body}, granted) do
-    {stmts, _scope} = stmts(body, %{locals: MapSet.new(), granted: granted, funcs: MapSet.new()})
-    # top-level `this` is undefined; bind it so a stray ThisExpression outside any function is defined.
-    top_this = quote(do: unquote(Macro.var(:__ggthis, __MODULE__)) = :undefined)
-    {:__block__, [], [top_this | stmts]}
+    vars = collect_vars(body) |> Enum.uniq()
+    scope0 = %{locals: Enum.reduce(vars, MapSet.new(), &MapSet.put(&2, &1)), granted: granted, funcs: MapSet.new()}
+    {stmts, _scope} = stmts(body, scope0)
+    # top-level `this` is undefined; pre-bind all hoisted vars to :undefined (JS var hoisting).
+    prelude = [quote(do: unquote(Macro.var(:__ggthis, __MODULE__)) = :undefined) | Enum.map(vars, fn v -> quote(do: unquote(lvar(v)) = :undefined) end)]
+    {:__block__, [], prelude ++ stmts}
   end
 
   # ── statement lists thread lexical scope (which names are locals) ──
@@ -244,6 +246,30 @@ defmodule TinyLasers.Gate.Lower do
 
   defp stmt(%{"type" => "ForOfStatement"} = n, scope), do: for_each(n, :of, scope)
   defp stmt(%{"type" => "ForInStatement"} = n, scope), do: for_each(n, :in, scope)
+
+  # switch(d){ case v: body; break; … default: … } — lowered to a `d === v` if/else-if chain (break ends a
+  # case; NON-fall-through, the common form). Bind d to a temp, fold the cases into nested IfStatements, reuse
+  # the if-threading for mutated vars.
+  defp stmt(%{"type" => "SwitchStatement"} = n, scope) do
+    dvar = %{"type" => "Identifier", "name" => "__ggswitch"}
+    decl = %{"type" => "VariableDeclaration", "declarations" => [%{"id" => dvar, "init" => n["discriminant"]}]}
+
+    cases = n["cases"] || []
+    {defaults, tested} = Enum.split_with(cases, &(&1["test"] == nil))
+    default_body = if defaults != [], do: block_of(strip_breaks(hd(defaults)["consequent"])), else: nil
+
+    chain =
+      Enum.reduce(Enum.reverse(tested), default_body, fn c, acc ->
+        %{
+          "type" => "IfStatement",
+          "test" => %{"type" => "BinaryExpression", "operator" => "===", "left" => dvar, "right" => c["test"]},
+          "consequent" => block_of(strip_breaks(c["consequent"])),
+          "alternate" => acc
+        }
+      end)
+
+    stmt(%{"type" => "BlockStatement", "body" => [decl | (chain && [chain]) || []]}, scope)
+  end
 
   defp stmt(other, scope), do: {expr(other, scope), scope}
 
@@ -520,7 +546,11 @@ defmodule TinyLasers.Gate.Lower do
     names = Enum.map(params, fn %{"name" => n} -> n end)
     argvar = Macro.var(:__ggargs, __MODULE__)
     thisvar = Macro.var(:__ggthis, __MODULE__)
-    inner = Enum.reduce(names, scope.locals, &MapSet.put(&2, &1))
+    # hoist this function's `var` declarations (JS function scope), pre-bound to :undefined.
+    bodyvars = collect_vars(body) |> Enum.uniq() |> Enum.reject(&(&1 in names))
+    inner = Enum.reduce(names ++ bodyvars, scope.locals, &MapSet.put(&2, &1))
+
+    hoistq = Enum.map(bodyvars, fn v -> quote(do: unquote(lvar(v)) = :undefined) end)
 
     binds =
       names
@@ -536,7 +566,7 @@ defmodule TinyLasers.Gate.Lower do
     quote do
       unquote(@runtime).closure(fn unquote(thisvar), unquote(argvar) ->
         try do
-          unquote_splicing(binds)
+          unquote_splicing(hoistq ++ binds)
           unquote(bodyq)
           :undefined
         catch
@@ -606,6 +636,26 @@ defmodule TinyLasers.Gate.Lower do
   end
 
   defp lvar(n), do: Macro.var(String.to_atom("gg_" <> n), __MODULE__)
+
+  # JS `var` is FUNCTION-scoped and hoisted: collect every var name in a subtree (stopping at nested function
+  # boundaries) so they can be pre-bound to :undefined at the function/program top. Fixes vars declared inside
+  # nested blocks/if/switch referenced elsewhere in the same function.
+  defp collect_vars(nil), do: []
+
+  defp collect_vars(%{"type" => t}) when t in ["FunctionExpression", "FunctionDeclaration", "ArrowFunctionExpression"],
+    do: []
+
+  defp collect_vars(%{"type" => "VariableDeclaration", "declarations" => ds} = n) do
+    names = Enum.flat_map(ds, fn d -> case d["id"] do %{"name" => nm} -> [nm]; _ -> [] end end)
+    names ++ Enum.flat_map(ds, fn d -> collect_vars(d["init"]) end)
+  end
+
+  defp collect_vars(%{} = node), do: node |> Map.drop(["type"]) |> Map.values() |> Enum.flat_map(&collect_vars/1)
+  defp collect_vars(list) when is_list(list), do: Enum.flat_map(list, &collect_vars/1)
+  defp collect_vars(_), do: []
+
+  defp strip_breaks(stmts), do: Enum.reject(stmts || [], &(&1["type"] == "BreakStatement"))
+  defp block_of(stmts), do: %{"type" => "BlockStatement", "body" => stmts}
 
   defp interleave([q | qs], [e | es]), do: [q, e | interleave(qs, es)]
   defp interleave(qs, []), do: qs
