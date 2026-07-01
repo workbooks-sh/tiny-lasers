@@ -71,6 +71,18 @@ defmodule TinyLasers.Gate.F2VerticalTest do
     assert %{ext: [], bifs: []} = TinyLasers.Gate.dangerous_refs(bin)
   end
 
+  test "try/catch/finally + throw + ternary + typeof" do
+    assert %{result: {:ok, "caught:boom"}} = Js.run("var r; try { throw 'boom'; } catch (e) { r = 'caught:' + e; } r")
+    assert %{result: {:ok, 11.0}} = Js.run("var r = 0; try { r = 1; } finally { r = r + 10; } r")
+    assert %{result: {:ok, "big"}} = Js.run("var x = 5; x > 3 ? 'big' : 'small'")
+    assert %{result: {:ok, "number"}} = Js.run("typeof 5")
+    assert %{result: {:ok, "string"}} = Js.run("typeof 'x'")
+    assert %{result: {:ok, "object"}} = Js.run("typeof {}")
+    # a caught guest error (calling undefined) is catchable JS, still confined
+    assert %{result: {:ok, "recovered"}, binary: bin} = Js.run("var r; try { nope(); } catch (e) { r = 'recovered'; } r")
+    assert %{ext: [], bifs: []} = TinyLasers.Gate.dangerous_refs(bin)
+  end
+
   test "the compiled guest references ONLY the Runtime — confinement holds (H2)" do
     src = """
     function merge(a, b) { return { x: a.x, y: b.y }; }

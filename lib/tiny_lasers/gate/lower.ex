@@ -164,6 +164,58 @@ defmodule TinyLasers.Gate.Lower do
     {q, scope}
   end
 
+  defp stmt(%{"type" => "ThrowStatement", "argument" => arg}, scope),
+    do: {quote(do: unquote(@runtime).throw_val(unquote(expr(arg, scope)))), scope}
+
+  # try { block } catch (e) { handler } finally { finalizer }. Mutations thread out as returned state (like
+  # if/for). Guest throws ({:gg_throw}) and guest errors ({:gg_guest_error}) are catchable; {:gg_return}
+  # propagates (never swallowed). Finalizer runs after normal completion (v0: not on a return-in-try).
+  defp stmt(%{"type" => "TryStatement"} = n, scope) do
+    handler = n["handler"]
+    param = handler && handler["param"] && handler["param"]["name"]
+    hscope = if param, do: %{scope | locals: MapSet.put(scope.locals, param)}, else: scope
+
+    {blockq, _} = stmt(n["block"], scope)
+    {handlerq, _} = if handler, do: stmt(handler["body"], hscope), else: {:undefined, scope}
+
+    mutated =
+      (assigned_names(n["block"]) ++ (handler && assigned_names(handler["body"]) || []))
+      |> Enum.uniq()
+
+    state = {:{}, [], Enum.map(mutated, &lvar/1)}
+    bind_param = if param, do: quote(do: unquote(lvar(param)) = __gg_thrown), else: quote(do: _ = __gg_thrown)
+
+    tryq =
+      quote do
+        unquote(state) =
+          try do
+            unquote(blockq)
+            unquote(state)
+          catch
+            :throw, {:gg_throw, __gg_thrown} ->
+              unquote(bind_param)
+              unquote(handlerq)
+              unquote(state)
+
+            :throw, {:gg_guest_error, __gg_reason} ->
+              __gg_thrown = __gg_reason
+              unquote(bind_param)
+              unquote(handlerq)
+              unquote(state)
+          end
+      end
+
+    q =
+      if n["finalizer"] do
+        {finq, _} = stmt(n["finalizer"], scope)
+        quote(do: (unquote(tryq); unquote(finq)))
+      else
+        tryq
+      end
+
+    {q, scope}
+  end
+
   defp stmt(%{"type" => "WhileStatement"} = n, scope) do
     stmt(%{"type" => "ForStatement", "init" => nil, "test" => n["test"], "update" => nil, "body" => n["body"]}, scope)
   end
@@ -267,6 +319,17 @@ defmodule TinyLasers.Gate.Lower do
       "||" -> quote(do: (fn v -> if unquote(@runtime).truthy(v), do: v, else: unquote(rq) end).(unquote(lq)))
     end
   end
+
+  defp expr(%{"type" => "ConditionalExpression"} = n, scope) do
+    quote do
+      if unquote(@runtime).truthy(unquote(expr(n["test"], scope))),
+        do: unquote(expr(n["consequent"], scope)),
+        else: unquote(expr(n["alternate"], scope))
+    end
+  end
+
+  defp expr(%{"type" => "UnaryExpression", "operator" => "typeof", "argument" => a}, scope),
+    do: quote(do: unquote(@runtime).typeof(unquote(expr(a, scope))))
 
   defp expr(%{"type" => "UnaryExpression", "operator" => "!", "argument" => a}, scope),
     do: quote(do: not unquote(@runtime).truthy(unquote(expr(a, scope))))

@@ -367,6 +367,18 @@ defmodule TinyLasers.Gate.Runtime do
   emitted guest module references no external module (keeps the 'only Runtime' confinement invariant literal)."
   def ret(v), do: throw({:gg_return, v})
 
+  @doc "Guest `throw e` — a catchable guest exception carrying the guest value."
+  def throw_val(v), do: throw({:gg_throw, v})
+
+  @doc "`typeof` — a fixed set of result binaries (never guest-controlled atoms)."
+  def typeof(v) when is_number(v), do: "number"
+  def typeof(v) when is_binary(v), do: "string"
+  def typeof(v) when is_boolean(v), do: "boolean"
+  def typeof(:undefined), do: "undefined"
+  def typeof({:fn, _}), do: "function"
+  def typeof({:host, _}), do: "function"
+  def typeof(_), do: "object"
+
   # ── DoS primitives (emitted only for the red-team's containment tests) ──
 
   @doc "Unbounded CPU: tail loop, never returns. Contained by the run process timeout."
