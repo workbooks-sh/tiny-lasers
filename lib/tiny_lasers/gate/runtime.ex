@@ -150,6 +150,7 @@ defmodule TinyLasers.Gate.Runtime do
   def box_get(v), do: v
   @doc "Write a box (returns the value, JS assignment semantics)."
   def box_set({:box, id}, v), do: (Process.put({:gg_box, id}, v); v)
+  def box_set(_plain, v), do: v
 
   @doc "Property write. A cell mutates in place (shared); an immutable object returns a NEW object."
   def oput({:cell, _} = c, k, v), do: cell_put(c, k, v)
