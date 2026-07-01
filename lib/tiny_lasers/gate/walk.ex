@@ -283,8 +283,9 @@ defmodule TinyLasers.Gate.Walk do
     flags = if length(args) > 1, do: eval(Enum.at(args, 1), env), else: ""
     Runtime.regex(src, flags)
   end
-  defp eval(%{"type" => "NewExpression", "callee" => callee, "arguments" => args}, env),
-    do: Runtime.construct(eval(callee, env), eval_args(args, env))
+  defp eval(%{"type" => "NewExpression", "callee" => callee, "arguments" => args}, env) do
+    Runtime.construct(eval(callee, env), eval_args(args, env))
+  end
 
   defp eval(%{"type" => "AssignmentExpression"} = n, env), do: eval_assign(n, env)
 
@@ -332,7 +333,8 @@ defmodule TinyLasers.Gate.Walk do
   end
   defp eval_call(callee, args, env, optional) do
     f = eval(callee, env)
-    if optional && Runtime.is_nullish(f), do: :undefined, else: Runtime.call(f, eval_args(args, env))
+    a = eval_args(args, env)
+    if optional && Runtime.is_nullish(f), do: :undefined, else: Runtime.call(f, a)
   end
 
   defp eval_args(args, env) do
@@ -353,7 +355,8 @@ defmodule TinyLasers.Gate.Walk do
       %{"type" => t} when t in ["ArrayPattern", "ObjectPattern"] ->
         v = eval(r, env); bind_pattern(l, v, env, false); v
       _ ->
-        v = eval(r, env); assign_target(l, v, env); v
+        v = eval(r, env)
+        assign_target(l, v, env); v
     end
   end
   defp eval_assign(%{"operator" => op, "left" => l, "right" => r}, env) when op in ["&&=", "||=", "??="] do
@@ -456,6 +459,7 @@ defmodule TinyLasers.Gate.Walk do
       Runtime.closure(fn this, args ->
         s = push(cenv)
         declare(s, "this", this)
+        declare(s, "arguments", Runtime.avec(args))
         if sup, do: declare(s, "__superval", sup)
         cparams = (ctor && ctor["value"]["params"]) || []
         Enum.each(Enum.flat_map(cparams, &pattern_names/1), fn nm -> ensure_box([hd(s)], hd(s), nm) end)
@@ -495,6 +499,7 @@ defmodule TinyLasers.Gate.Walk do
     Runtime.closure(fn this, args ->
       s = push(cenv)
       declare(s, "this", this)
+      declare(s, "arguments", Runtime.avec(args))
       if sup, do: declare(s, "__superval", sup)
       params = fnode["params"] || []
       Enum.each(Enum.flat_map(params, &pattern_names/1), fn nm -> ensure_box([hd(s)], hd(s), nm) end)
