@@ -659,7 +659,10 @@ defmodule TinyLasers.Gate.Lower do
     assign_to(m["object"], new_base, scope)
   end
 
-  defp assign_to(other, valq, scope), do: quote(do: unquote(@runtime).oput_idx(unquote(expr(other, scope)), "0", unquote(valq)))
+  # a base that is neither an Identifier nor a MemberExpression (ThisExpression, a call result, …) is a mutable
+  # reference (cell/globalobj): the property write in `valq` already mutated it IN PLACE, so just evaluate valq
+  # — there is nothing to rebind. (Previously this wrote a spurious `base["0"] = base` on every `this.x = v`.)
+  defp assign_to(_other, valq, _scope), do: valq
 
   defp expr(%{"type" => "BinaryExpression", "operator" => op} = n, scope) do
     quote(do: unquote(@runtime).binop(unquote(binop_atom(op)), unquote(expr(n["left"], scope)), unquote(expr(n["right"], scope))))
