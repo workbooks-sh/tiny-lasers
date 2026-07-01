@@ -151,51 +151,111 @@ defmodule TinyLasers.Gate.Lower do
   # accumulator) is threaded through the recursion as explicit state: rebound at the top of each iteration,
   # passed forward at the tail, and rebound in the enclosing scope from the loop's final state.
   defp stmt(%{"type" => "ForStatement"} = n, scope) do
-    {initq, s1} = if n["init"], do: for_init(n["init"], scope), else: {:undefined, scope}
+    label = scope[:pending_label]
+    {initq, s0} = if n["init"], do: for_init(n["init"], Map.put(scope, :pending_label, nil)), else: {:undefined, Map.put(scope, :pending_label, nil)}
 
-    mutated =
-      [n["test"], n["update"], n["body"]]
-      |> Enum.reject(&is_nil/1)
-      |> Enum.flat_map(&assigned_names/1)
-      |> Kernel.++(assigned_names(n["init"]))
-      |> Enum.uniq()
-      |> not_boxed(scope)
+    if loop_uses_control?(n["body"]) do
+      # break/continue present: throw-based control flow. The loop's mutated vars are boxed (boxed_set), so the
+      # state persists across the throw — no tuple threading needed.
+      tag = System.unique_integer([:positive])
+      s1 = Map.put(s0, :loops, [{label, tag} | (scope[:loops] || [])])
+      loop = Macro.var(:gg_loop, __MODULE__)
+      testq = if n["test"], do: expr(n["test"], s1), else: true
+      {bodyq, _} = stmt(n["body"], s1)
+      updateq = if n["update"], do: expr(n["update"], s1), else: :undefined
 
-    statevars = Enum.map(mutated, &lvar/1)
-    state_tuple = {:{}, [], statevars}
-    loop = Macro.var(:gg_loop, __MODULE__)
+      q =
+        quote do
+          unquote(initq)
 
-    # a var declared INSIDE the loop body (not already bound in the enclosing scope) must be initialized
-    # before the initial state tuple is built, else it is unbound.
-    inits = for v <- mutated, not MapSet.member?(scope.locals, v), do: quote(do: unquote(lvar(v)) = :undefined)
+          unquote(loop) = fn me ->
+            if unquote(@runtime).truthy(unquote(testq)) do
+              try do
+                unquote(bodyq)
+              catch
+                :throw, {:gg_continue, unquote(tag)} -> :ok
+              end
 
-    testq = if n["test"], do: expr(n["test"], s1), else: true
-    {bodyq, _} = stmt(n["body"], s1)
-    updateq = if n["update"], do: expr(n["update"], s1), else: :undefined
+              unquote(updateq)
+              me.(me)
+            else
+              :ok
+            end
+          end
 
-    q =
-      quote do
-        unquote_splicing(inits)
-        unquote(initq)
-
-        unquote(loop) = fn me, unquote(state_tuple) ->
-          if unquote(@runtime).truthy(unquote(testq)) do
-            unquote(bodyq)
-            unquote(updateq)
-            me.(me, unquote(state_tuple))
-          else
-            unquote(state_tuple)
+          try do
+            unquote(loop).(unquote(loop))
+          catch
+            :throw, {:gg_break, unquote(tag)} -> :ok
           end
         end
 
-        unquote(state_tuple) = unquote(loop).(unquote(loop), unquote(state_tuple))
-      end
+      {q, scope}
+    else
+      s1 = s0
 
-    {q, scope}
+      mutated =
+        [n["test"], n["update"], n["body"]]
+        |> Enum.reject(&is_nil/1)
+        |> Enum.flat_map(&assigned_names/1)
+        |> Kernel.++(assigned_names(n["init"]))
+        |> Enum.uniq()
+        |> not_boxed(scope)
+
+      statevars = Enum.map(mutated, &lvar/1)
+      state_tuple = {:{}, [], statevars}
+      loop = Macro.var(:gg_loop, __MODULE__)
+      inits = for v <- mutated, not MapSet.member?(scope.locals, v), do: quote(do: unquote(lvar(v)) = :undefined)
+      testq = if n["test"], do: expr(n["test"], s1), else: true
+      {bodyq, _} = stmt(n["body"], s1)
+      updateq = if n["update"], do: expr(n["update"], s1), else: :undefined
+
+      q =
+        quote do
+          unquote_splicing(inits)
+          unquote(initq)
+
+          unquote(loop) = fn me, unquote(state_tuple) ->
+            if unquote(@runtime).truthy(unquote(testq)) do
+              unquote(bodyq)
+              unquote(updateq)
+              me.(me, unquote(state_tuple))
+            else
+              unquote(state_tuple)
+            end
+          end
+
+          unquote(state_tuple) = unquote(loop).(unquote(loop), unquote(state_tuple))
+        end
+
+      {q, scope}
+    end
   end
+
+  # resolve a break/continue target to its loop tag: labeled → the matching enclosing loop; unlabeled → innermost.
+  defp loop_tag(%{"name" => lbl}, scope) do
+    case Enum.find(scope[:loops] || [], fn {l, _} -> l == lbl end) do
+      {_, tag} -> tag
+      nil -> (case scope[:loops] do [{_, tag} | _] -> tag; _ -> 0 end)
+    end
+  end
+
+  defp loop_tag(_nil, scope), do: (case scope[:loops] do [{_, tag} | _] -> tag; _ -> 0 end)
 
   defp stmt(%{"type" => "ThrowStatement", "argument" => arg}, scope),
     do: {quote(do: unquote(@runtime).throw_val(unquote(expr(arg, scope)))), scope}
+
+  # a label attaches to its (loop) body — pass it down so the loop registers `label -> tag` for break/continue.
+  defp stmt(%{"type" => "LabeledStatement", "label" => %{"name" => lbl}, "body" => body}, scope),
+    do: stmt(body, Map.put(scope, :pending_label, lbl))
+
+  # break/continue throw to the target loop's catch. Unlabeled → innermost loop; labeled → the loop with that
+  # label. (Boxed loop state survives the throw; see boxed_set/control_loop_vars.)
+  defp stmt(%{"type" => "BreakStatement", "label" => l}, scope),
+    do: {quote(do: unquote(@runtime).brk(unquote(loop_tag(l, scope)))), scope}
+
+  defp stmt(%{"type" => "ContinueStatement", "label" => l}, scope),
+    do: {quote(do: unquote(@runtime).cont(unquote(loop_tag(l, scope)))), scope}
 
   # try { block } catch (e) { handler } finally { finalizer }. Mutations thread out as returned state (like
   # if/for). Guest throws ({:gg_throw}) and guest errors ({:gg_guest_error}) are catchable; {:gg_return}
@@ -886,9 +946,49 @@ defmodule TinyLasers.Gate.Lower do
   # AND for self/forward references (`var n = { m: function(){ return n } }`, where n is captured before it is
   # assigned). Read-only non-captured locals stay plain (no box overhead).
   defp boxed_set(decls, body) do
-    captured = MapSet.new(nested_refs(body))
-    decls |> Enum.filter(&MapSet.member?(captured, &1)) |> MapSet.new()
+    # captured-by-a-nested-fn OR mutated inside a loop that uses break/continue (those loops use throw-based
+    # control flow, which unwinds the tuple-threaded state — so the affected vars must live in boxes instead).
+    boxable = MapSet.union(MapSet.new(nested_refs(body)), MapSet.new(control_loop_vars(body)))
+    decls |> Enum.filter(&MapSet.member?(boxable, &1)) |> MapSet.new()
   end
+
+  @loop_types ["ForStatement", "WhileStatement", "DoWhileStatement", "ForOfStatement", "ForInStatement"]
+
+  # names assigned inside any loop whose body contains a break/continue (own-level, not a nested loop/switch).
+  defp control_loop_vars(%{"type" => t} = n) when t in @loop_types do
+    # must match the loop-lowering decision (loop_uses_control?): a labeled break/continue targeting THIS loop
+    # can live inside a nested loop, so we can't stop at loop boundaries here.
+    own = if loop_uses_control?(n["body"]), do: assigned_names(n), else: []
+    own ++ control_loop_vars_children(n)
+  end
+
+  defp control_loop_vars(%{} = node), do: control_loop_vars_children(node)
+  defp control_loop_vars(list) when is_list(list), do: Enum.flat_map(list, &control_loop_vars/1)
+  defp control_loop_vars(_), do: []
+  defp control_loop_vars_children(node) when is_map(node), do: node |> Map.drop(["type"]) |> Map.values() |> Enum.flat_map(&control_loop_vars/1)
+  defp control_loop_vars_children(_), do: []
+
+  # does this loop-body subtree contain a break/continue that targets THIS loop (stops at nested loops for
+  # unlabeled ones; a labeled break/continue can still target an outer loop but is caught by label there)?
+  defp loop_has_control?(%{"type" => t}) when t in ["BreakStatement", "ContinueStatement"], do: true
+  defp loop_has_control?(%{"type" => t}) when t in @loop_types, do: false
+  defp loop_has_control?(%{"type" => t}) when t in ["FunctionExpression", "FunctionDeclaration", "ArrowFunctionExpression"], do: false
+  defp loop_has_control?(%{} = node), do: node |> Map.drop(["type"]) |> Map.values() |> Enum.any?(&loop_has_control?/1)
+  defp loop_has_control?(list) when is_list(list), do: Enum.any?(list, &loop_has_control?/1)
+  defp loop_has_control?(_), do: false
+
+  # a loop body may contain break/continue targeting THIS loop OR (labeled) an outer one — either way, use the
+  # throw-based control structure. Detect any break/continue not shadowed by a nested loop (unlabeled) — the
+  # labeled ones we always route by label.
+  defp loop_uses_control?(body) do
+    labeled_control?(body) or loop_has_control?(body)
+  end
+
+  defp labeled_control?(%{"type" => t, "label" => l}) when t in ["BreakStatement", "ContinueStatement"] and is_map(l), do: true
+  defp labeled_control?(%{"type" => t}) when t in ["FunctionExpression", "FunctionDeclaration", "ArrowFunctionExpression"], do: false
+  defp labeled_control?(%{} = node), do: node |> Map.drop(["type"]) |> Map.values() |> Enum.any?(&labeled_control?/1)
+  defp labeled_control?(list) when is_list(list), do: Enum.any?(list, &labeled_control?/1)
+  defp labeled_control?(_), do: false
 
   # call/new argument list, spread-aware: `f(...xs, y)` flattens iterables at runtime.
   defp args_of(arguments, scope) do
@@ -908,7 +1008,9 @@ defmodule TinyLasers.Gate.Lower do
 
   defp not_boxed(names, scope), do: Enum.reject(names, &(scope[:boxed] && MapSet.member?(scope.boxed, &1)))
 
-  defp strip_breaks(stmts), do: Enum.reject(stmts || [], &(&1["type"] == "BreakStatement"))
+  # a switch case ends at an UNLABELED break (terminates the switch); a labeled `break outer` must survive to
+  # reach the enclosing loop's catch.
+  defp strip_breaks(stmts), do: Enum.reject(stmts || [], &(&1["type"] == "BreakStatement" and &1["label"] == nil))
   defp block_of(stmts), do: %{"type" => "BlockStatement", "body" => stmts}
 
   defp interleave([q | qs], [e | es]), do: [q, e | interleave(qs, es)]

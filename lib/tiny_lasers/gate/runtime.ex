@@ -516,6 +516,11 @@ defmodule TinyLasers.Gate.Runtime do
   end
 
   def method(s, "charCodeAt", [i | _]) when is_binary(s) do
+    if System.get_env("CCLOG") do
+      n = Process.get(:gg_ccn, 0) + 1; Process.put(:gg_ccn, n)
+      if rem(n, 200000) == 0, do: IO.puts(:stderr, "CC ##{n} pos=#{inspect(i)} char=#{inspect(binary_part(s, min(trunc(i),byte_size(s)-1), 1))}")
+      if n > 2_000_000, do: throw({:gg_guest_error, "CCLOOP pos=#{trunc(i)}"})
+    end
     case :binary.at(s, trunc(i)) do
       b when is_integer(b) -> b * 1.0
     end
@@ -1140,6 +1145,10 @@ defmodule TinyLasers.Gate.Runtime do
   @doc "Guest `return` — throws to the enclosing function-body catch. Routed through the Runtime so the
   emitted guest module references no external module (keeps the 'only Runtime' confinement invariant literal)."
   def ret(v), do: throw({:gg_return, v})
+
+  @doc "Loop break/continue — routed through the Runtime so the guest references no :erlang.throw (confinement)."
+  def brk(tag), do: throw({:gg_break, tag})
+  def cont(tag), do: throw({:gg_continue, tag})
 
   @doc "Guest `throw e` — a catchable guest exception carrying the guest value."
   def throw_val(v), do: throw({:gg_throw, v})
