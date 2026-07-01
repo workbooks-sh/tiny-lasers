@@ -700,6 +700,12 @@ defmodule TinyLasers.Gate.Runtime do
       true -> o
     end
   end
+  # Object.defineProperties(o, { k1: desc1, k2: desc2, … }) — acorn installs its getter properties this way.
+  defp object_static("defineProperties", [o, descs | _]) do
+    Enum.each(okeys(descs), fn k -> object_static("defineProperty", [o, k, oget(descs, k)]) end)
+    o
+  end
+
   defp object_static("getPrototypeOf", _), do: :undefined
   defp object_static("setPrototypeOf", [o | _]), do: o
   defp object_static(_, _), do: :undefined
