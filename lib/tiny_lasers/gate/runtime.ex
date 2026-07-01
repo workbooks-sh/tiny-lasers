@@ -176,6 +176,14 @@ defmodule TinyLasers.Gate.Runtime do
     if idx >= 0 and idx < byte_size(s), do: binary_part(s, idx, 1), else: :undefined
   end
 
+  @doc "global namespace/property reads (Math.PI, Number.MAX_VALUE, Object.prototype)."
+  def oget({:global, "Math"}, "PI"), do: :math.pi()
+  def oget({:global, "Number"}, "MAX_VALUE"), do: 1.7976931348623157e308
+  def oget({:global, "Number"}, "MIN_VALUE"), do: 5.0e-324
+  def oget({:global, "Number"}, "MAX_SAFE_INTEGER"), do: 9_007_199_254_740_991.0
+  def oget({:global, _}, "prototype"), do: cell_new([])
+  def oget({:global, _}, _), do: :undefined
+
   def oget(_not_obj, _k), do: :undefined
 
   @doc "Spread-merge b into a (Object.assign({}, a, b) shape). Returns a NEW object, b's keys last/override."
@@ -381,6 +389,76 @@ defmodule TinyLasers.Gate.Runtime do
   end
 
   def method(s, "split", [sep | _]) when is_binary(s), do: {:arr, String.split(s, to_str(sep))}
+  def method(s, "trim", _) when is_binary(s), do: String.trim(s)
+  def method(s, "trimStart", _) when is_binary(s), do: String.trim_leading(s)
+  def method(s, "trimEnd", _) when is_binary(s), do: String.trim_trailing(s)
+  def method(s, "substring", [a | rest]) when is_binary(s), do: str_substring(s, a, rest)
+  def method(s, "substr", [a | rest]) when is_binary(s), do: str_slice(s, a, (case rest do [l | _] -> [a + l]; _ -> [] end))
+  def method(s, "charAt", [i | _]) when is_binary(s), do: (if oget(s, i * 1) == :undefined, do: "", else: oget(s, i * 1))
+  def method(s, "charAt", _) when is_binary(s), do: binary_part(s, 0, min(1, byte_size(s)))
+  def method(s, "at", [i | _]) when is_binary(s) do
+    idx = trunc(i)
+    idx = if idx < 0, do: byte_size(s) + idx, else: idx
+    if idx >= 0 and idx < byte_size(s), do: binary_part(s, idx, 1), else: :undefined
+  end
+  def method(s, "repeat", [n | _]) when is_binary(s), do: String.duplicate(s, max(trunc(n), 0))
+  def method(s, "padStart", [len | rest]) when is_binary(s), do: str_pad(s, len, rest, :leading)
+  def method(s, "padEnd", [len | rest]) when is_binary(s), do: str_pad(s, len, rest, :trailing)
+  def method(s, "startsWith", [p | _]) when is_binary(s), do: String.starts_with?(s, to_str(p))
+  def method(s, "endsWith", [p | _]) when is_binary(s), do: String.ends_with?(s, to_str(p))
+  def method(s, "includes", [p | _]) when is_binary(s), do: String.contains?(s, to_str(p))
+  def method(s, "replaceAll", [p, r | _]) when is_binary(s) and is_binary(p), do: String.replace(s, p, to_str(r))
+  def method(s, "concat", args) when is_binary(s), do: s <> (args |> Enum.map(&to_str/1) |> Enum.join())
+  def method(s, "lastIndexOf", [sub | _]) when is_binary(s) do
+    parts = :binary.matches(s, to_str(sub))
+    case List.last(parts) do {pos, _} -> pos * 1.0; _ -> -1.0 end
+  end
+  def method(s, m, _) when is_binary(s) and m in ["toString", "valueOf", "normalize"], do: s
+  def method(s, "codePointAt", [i | _]) when is_binary(s) do
+    case oget(s, i * 1) do c when is_binary(c) -> (:binary.first(c)) * 1.0; _ -> :undefined end
+  end
+
+  # ── more array methods ──
+  def method({:arr, list}, "reduce", [f | rest]) do
+    case rest do
+      [init | _] -> Enum.reduce(Enum.with_index(list), init, fn {v, i}, acc -> call(f, [acc, v, i * 1.0]) end)
+      [] -> case list do
+              [] -> guest_error("reduce of empty array with no initial value")
+              [h | t] -> Enum.reduce(Enum.with_index(t, 1), h, fn {v, i}, acc -> call(f, [acc, v, i * 1.0]) end)
+            end
+    end
+  end
+  def method({:arr, list}, "reduceRight", [f | rest]) do
+    init = case rest do [i | _] -> i; _ -> :undefined end
+    Enum.reduce(Enum.reverse(list), init, fn v, acc -> call(f, [acc, v]) end)
+  end
+  def method({:arr, list}, "sort", rest) do
+    cmp = case rest do [{:fn, _} = f | _] -> f; _ -> nil end
+    sorted = if cmp, do: Enum.sort(list, fn a, b -> num(call(cmp, [a, b])) <= 0 end), else: Enum.sort_by(list, &to_str/1)
+    {:mut, {:arr, sorted}, {:arr, sorted}}
+  end
+  def method({:arr, list}, "reverse", _), do: {:mut, {:arr, Enum.reverse(list)}, {:arr, Enum.reverse(list)}}
+  def method({:arr, list}, "find", [f | _]), do: Enum.find(list, :undefined, fn v -> truthy(call(f, [v])) end)
+  def method({:arr, list}, "findIndex", [f | _]), do: (Enum.find_index(list, fn v -> truthy(call(f, [v])) end) || -1) * 1.0
+  def method({:arr, list}, "some", [f | _]), do: Enum.any?(list, fn v -> truthy(call(f, [v])) end)
+  def method({:arr, list}, "every", [f | _]), do: Enum.all?(list, fn v -> truthy(call(f, [v])) end)
+  def method({:arr, list}, "fill", [v | _]), do: {:mut, {:arr, Enum.map(list, fn _ -> v end)}, {:arr, Enum.map(list, fn _ -> v end)}}
+  def method({:arr, list}, "lastIndexOf", [x | _]) do
+    idx = list |> Enum.reverse() |> Enum.find_index(&(&1 === x))
+    if idx, do: (length(list) - 1 - idx) * 1.0, else: -1.0
+  end
+  def method({:arr, list}, "shift", _) do
+    case list do [] -> {:mut, {:arr, []}, :undefined}; [h | t] -> {:mut, {:arr, t}, h} end
+  end
+  def method({:arr, list}, "unshift", args), do: {:mut, {:arr, args ++ list}, (length(list) + length(args)) * 1.0}
+  def method({:arr, list}, "at", [i | _]) do
+    idx = trunc(i)
+    idx = if idx < 0, do: length(list) + idx, else: idx
+    Enum.at(list, idx, :undefined)
+  end
+  def method({:arr, list}, "flat", _), do: {:arr, Enum.flat_map(list, fn {:arr, l} -> l; other -> [other] end)}
+  def method({:arr, list}, m, _) when m in ["toString", "valueOf"], do: list |> Enum.map(&to_str/1) |> Enum.join(",")
+
   def method({keys, map}, "hasOwnProperty", [k | _]) when is_map(map), do: Map.has_key?(map, key_str(k))
 
   # user object with a FUNCTION-valued property: `o.f(args)` calls the stored closure (no `this` binding yet).
@@ -452,14 +530,6 @@ defmodule TinyLasers.Gate.Runtime do
   defp math_static("random", _), do: :rand.uniform()
   defp math_static("sign", [x | _]), do: (cond do x > 0 -> 1.0; x < 0 -> -1.0; true -> 0.0 end)
   defp math_static(_, _), do: :undefined
-
-  @doc "global namespace/property reads (Math.PI, Number.MAX_VALUE, Object.prototype)."
-  def oget({:global, "Math"}, "PI"), do: :math.pi()
-  def oget({:global, "Number"}, "MAX_VALUE"), do: 1.7976931348623157e308
-  def oget({:global, "Number"}, "MIN_VALUE"), do: 5.0e-324
-  def oget({:global, "Number"}, "MAX_SAFE_INTEGER"), do: 9_007_199_254_740_991.0
-  def oget({:global, _}, "prototype"), do: cell_new([])
-  def oget({:global, _}, _), do: :undefined
 
   # calling a namespace/coercion function or a global function
   def call({:global, "String"}, args), do: to_str(List.first(args) || :undefined)
@@ -561,6 +631,30 @@ defmodule TinyLasers.Gate.Runtime do
     end
     binary_part(s, min(start, byte_size(s)), min(len, byte_size(s) - min(start, byte_size(s))))
   end
+
+  # substring(a,b): clamps to [0,len], swaps if a>b (JS semantics), no negatives.
+  defp str_substring(s, a, rest) do
+    len = byte_size(s)
+    a = a |> trunc() |> max(0) |> min(len)
+    b = case rest do [x | _] when is_number(x) -> x |> trunc() |> max(0) |> min(len); _ -> len end
+    lo = min(a, b)
+    binary_part(s, lo, max(a, b) - lo)
+  end
+
+  defp str_pad(s, len, rest, side) do
+    target = trunc(len)
+    pad = case rest do [p | _] -> to_str(p); _ -> " " end
+
+    if byte_size(s) >= target or pad == "" do
+      s
+    else
+      fill = String.duplicate(pad, div(target - byte_size(s), byte_size(pad)) + 1) |> binary_part(0, target - byte_size(s))
+      if side == :leading, do: fill <> s, else: s <> fill
+    end
+  end
+
+  defp num(v) when is_number(v), do: v
+  defp num(_), do: 0
 
   @doc "A guest function as a DIRECTLY-HELD closure (GC'd, no table). The fun takes `(this, args)`; safe —
   the guest can only invoke it via `call/2` or `invoke/3`, and no codegen path extracts and `apply`s it."
