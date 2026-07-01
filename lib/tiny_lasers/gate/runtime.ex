@@ -983,6 +983,12 @@ defmodule TinyLasers.Gate.Runtime do
   def binop(:==, a, b), do: loose_eq(a, b)
   def binop(:!=, a, b), do: not loose_eq(a, b)
   def binop(:in, k, obj), do: has_own(obj, k)
+  # bitwise ops — JS coerces via ToInt32; result is a signed 32-bit int returned as a float.
+  def binop(:band, a, b), do: bitop(a, b, &Bitwise.band/2)
+  def binop(:bor, a, b), do: bitop(a, b, &Bitwise.bor/2)
+  def binop(:bxor, a, b), do: bitop(a, b, &Bitwise.bxor/2)
+  def binop(:bsl, a, b), do: bitop(a, b, fn x, y -> Bitwise.bsl(x, Bitwise.band(y, 31)) end)
+  def binop(:bsr, a, b), do: bitop(a, b, fn x, y -> Bitwise.bsr(x, Bitwise.band(y, 31)) end)
   # relational comparison with a mismatched/non-number operand (`1 < undefined`) is false in JS (NaN).
   def binop(op, _a, _b) when op in [:<, :>, :"<=", :">="], do: false
   # arithmetic on non-number operands: JS coerces via ToNumber; a non-coercible operand yields NaN
@@ -1007,6 +1013,15 @@ defmodule TinyLasers.Gate.Runtime do
       true -> false
     end
   end
+
+  defp to_int32(v) do
+    n = trunc(num(v))
+    m = rem(n, 4_294_967_296)
+    m = if m < 0, do: m + 4_294_967_296, else: m
+    if m >= 2_147_483_648, do: m - 4_294_967_296, else: m
+  end
+
+  defp bitop(a, b, f), do: to_int32(f.(to_int32(a), to_int32(b))) * 1.0
 
   defp arith(a, b, f) do
     na = to_number(a)
