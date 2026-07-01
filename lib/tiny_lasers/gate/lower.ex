@@ -33,7 +33,9 @@ defmodule TinyLasers.Gate.Lower do
     scope0 = %{locals: Enum.reduce(vars, MapSet.new(), &MapSet.put(&2, &1)), granted: granted, funcs: MapSet.new()}
     {stmts, _scope} = stmts(body, scope0)
     # top-level `this` is undefined; pre-bind all hoisted vars to :undefined (JS var hoisting).
-    prelude = [quote(do: unquote(Macro.var(:__ggthis, __MODULE__)) = :undefined) | Enum.map(vars, fn v -> quote(do: unquote(lvar(v)) = :undefined) end)]
+    # top-level `this` IS the global object (a script's `this` === globalThis), so a UMD wrapper's
+    # `t((e=this).marked={})` attaches to it.
+    prelude = [quote(do: unquote(Macro.var(:__ggthis, __MODULE__)) = {:globalobj}) | Enum.map(vars, fn v -> quote(do: unquote(lvar(v)) = :undefined) end)]
     {:__block__, [], prelude ++ stmts}
   end
 
@@ -331,6 +333,13 @@ defmodule TinyLasers.Gate.Lower do
     flags = if length(args) > 1, do: expr(Enum.at(args, 1), scope), else: ""
     quote(do: unquote(@runtime).regex(unquote(src), unquote(flags)))
   end
+
+  # generic `new F(args)`: construct via the Runtime (fresh `this` cell, invoke the constructor, return the
+  # instance). Handles new Lexer(opts), new Error(msg), etc.
+  defp expr(%{"type" => "NewExpression"} = n, scope) do
+    argq = Enum.map(n["arguments"] || [], &expr(&1, scope))
+    quote(do: unquote(@runtime).construct(unquote(expr(n["callee"], scope)), unquote(argq)))
+  end
   defp expr(%{"type" => "Identifier", "name" => n}, scope), do: ident(n, scope)
   defp expr(%{"type" => "ThisExpression"}, _scope), do: Macro.var(:__ggthis, __MODULE__)
 
@@ -624,9 +633,17 @@ defmodule TinyLasers.Gate.Lower do
   defp assigned_names(_), do: []
 
   # ── helpers ──
+  @globals ~w(Object Array Math JSON String Number Boolean Error TypeError RangeError SyntaxError)
+  @global_fns ~w(parseInt parseFloat isNaN isFinite encodeURIComponent decodeURIComponent encodeURI decodeURI)
+
   defp ident(n, scope) do
     cond do
       MapSet.member?(scope.locals, n) -> lvar(n)
+      # global namespaces (Object.keys, Math.floor, JSON.parse…) and bare global functions (parseInt…). Only
+      # if not shadowed by a local/func — these are plain guest values ({:global}/{:globalfn} tags), not host refs.
+      n in ~w(globalThis self window) and not MapSet.member?(scope.locals, n) -> {:{}, [], [:globalobj]}
+      n in @globals and not (scope[:funcs] && MapSet.member?(scope.funcs, n)) -> {:{}, [], [:global, n]}
+      n in @global_fns and not (scope[:funcs] && MapSet.member?(scope.funcs, n)) -> {:{}, [], [:globalfn, n]}
       # a top-level function name resolves LATE via the registry (forward refs + mutual recursion)
       is_map(scope) and scope[:funcs] && MapSet.member?(scope.funcs, n) -> quote(do: unquote(@runtime).greg_get(unquote(n)))
       # a granted capability compiles to its integer handle — never a host module atom

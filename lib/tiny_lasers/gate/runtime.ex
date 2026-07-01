@@ -40,7 +40,20 @@ defmodule TinyLasers.Gate.Runtime do
     Process.put(:gg_next, 0)
     Process.put(:gg_out, [])
     Process.put(:gg_fs_writes, [])
+    Process.put(:gg_global, {[], %{}})
     :ok
+  end
+
+  # the global object (globalThis / self / window / top-level `this`) — a singleton mutable object so a UMD
+  # bundle can attach its export (`(globalThis).marked = {…}`) and the host can read it back.
+  def oget({:globalobj}, k), do: Process.get(:gg_global, {[], %{}}) |> elem(1) |> Map.get(key_str(k), :undefined)
+
+  def oput({:globalobj}, k, v) do
+    k = key_str(k)
+    {keys, map} = Process.get(:gg_global, {[], %{}})
+    keys = if Map.has_key?(map, k), do: keys, else: keys ++ [k]
+    Process.put(:gg_global, {keys, Map.put(map, k, v)})
+    {:globalobj}
   end
 
   @doc "Positional arg fetch for guest closures (keeps the guest's BIF surface off `Enum`)."
@@ -123,7 +136,18 @@ defmodule TinyLasers.Gate.Runtime do
   @doc "Property write. A cell mutates in place (shared); an immutable object returns a NEW object."
   def oput({:cell, _} = c, k, v), do: cell_put(c, k, v)
 
-  def oput({keys, map}, k, v) do
+  # functions are objects: `marked.parse = fn`, `marked.Lexer = ...`. Properties live in a per-function table
+  # keyed by the closure identity (mutation is shared, like a cell). Returns the function.
+  def oput({:fn, f} = fnv, k, v) do
+    k = key_str(k)
+    props = Process.get(:gg_fnprops, %{})
+    {keys, map} = Map.get(props, f, {[], %{}})
+    keys = if Map.has_key?(map, k), do: keys, else: keys ++ [k]
+    Process.put(:gg_fnprops, Map.put(props, f, {keys, Map.put(map, k, v)}))
+    fnv
+  end
+
+  def oput({keys, map}, k, v) when is_map(map) do
     k = key_str(k)
     keys = if Map.has_key?(map, k), do: keys, else: keys ++ [k]
     {keys, Map.put(map, k, v)}
@@ -133,6 +157,7 @@ defmodule TinyLasers.Gate.Runtime do
 
   @doc "Property read. Objects: by key. Arrays: numeric index + `length`. Non-objects: `:undefined`."
   def oget({:cell, _} = c, k), do: cell_read(c) |> elem(1) |> Map.get(key_str(k), :undefined)
+  def oget({:fn, f}, k), do: (Process.get(:gg_fnprops, %{}) |> Map.get(f, {[], %{}}) |> elem(1) |> Map.get(key_str(k), :undefined))
   def oget({_keys, map}, k) when is_map(map), do: Map.get(map, key_str(k), :undefined)
   def oget({:arr, list}, "length"), do: length(list) * 1.0
   def oget({:arr, list}, i) when is_number(i), do: Enum.at(list, trunc(i), :undefined)
@@ -170,6 +195,7 @@ defmodule TinyLasers.Gate.Runtime do
   @doc "Ordered own-keys of a direct-term object."
   def okeys({keys, map}) when is_map(map), do: keys
   def okeys({:cell, _} = c), do: elem(cell_read(c), 0)
+  def okeys({:globalobj}), do: Process.get(:gg_global, {[], %{}}) |> elem(0)
   def okeys(_), do: []
 
   # ── MUTABLE CELL objects (stateful instances: things with methods, e.g. a Lexer/Parser). Few and long-
@@ -214,7 +240,16 @@ defmodule TinyLasers.Gate.Runtime do
   end
 
   def oput_idx({:cell, _} = c, k, v), do: cell_put(c, k, v)
+  def oput_idx({:globalobj}, k, v), do: oput({:globalobj}, k, v)
   def oput_idx(other, k, v), do: oput(other, k, v)
+
+  @doc "method call on the global object (globalThis.marked(md))."
+  def method({:globalobj} = g, name, args) do
+    case oget(g, name) do
+      {:fn, _} = f -> invoke(f, g, args)
+      _ -> guest_error("not a function")
+    end
+  end
 
   # ── array direct-term (a tagged immutable list, GC'd) ──
   @doc "Array literal from evaluated elements."
@@ -366,6 +401,141 @@ defmodule TinyLasers.Gate.Runtime do
     end
   end
 
+  # ── global namespaces (Object/Array/Math/JSON/Number/String) — static methods + a few properties ──
+  def method({:global, "Object"}, name, args), do: object_static(name, args)
+  def method({:global, "Array"}, name, args), do: array_static(name, args)
+  def method({:global, "Math"}, name, args), do: math_static(name, args)
+  def method({:global, "JSON"}, "stringify", [v | rest]), do: json_stringify(v, rest)
+  def method({:global, "JSON"}, "parse", [s | _]) when is_binary(s), do: json_parse(s)
+  def method({:global, "Number"}, "isInteger", [x | _]), do: is_number(x) and trunc(x) == x
+  def method({:global, "Number"}, "isNaN", [x | _]), do: not is_number(x)
+  def method({:global, "Number"}, "isFinite", [x | _]), do: is_number(x)
+  def method({:global, "Number"}, "parseFloat", [x | _]), do: to_number(x)
+  def method({:global, "String"}, "fromCharCode", codes), do: codes |> Enum.map(&<<trunc(&1)::utf8>>) |> Enum.join()
+
+  defp object_static("keys", [o | _]), do: {:arr, okeys(o)}
+  defp object_static("values", [o | _]), do: {:arr, Enum.map(okeys(o), &oget(o, &1))}
+  defp object_static("entries", [o | _]), do: {:arr, Enum.map(okeys(o), fn k -> {:arr, [k, oget(o, k)]} end)}
+  defp object_static("getOwnPropertyNames", [o | _]), do: {:arr, okeys(o)}
+  defp object_static("assign", [target | sources]), do: Enum.reduce(sources, target, fn s, t -> Enum.reduce(okeys(s), t, fn k, acc -> oput(acc, k, oget(s, k)) end) end)
+  defp object_static("create", _), do: cell_new([])
+  defp object_static("freeze", [o | _]), do: o
+  defp object_static("defineProperty", [o, k, desc | _]), do: oput(o, to_str(k), oget(desc, "value"))
+  defp object_static("getPrototypeOf", _), do: :undefined
+  defp object_static("setPrototypeOf", [o | _]), do: o
+  defp object_static(_, _), do: :undefined
+
+  defp array_static("isArray", [x | _]), do: match?({:arr, _}, x)
+  defp array_static("from", [x | rest]) do
+    items = iter_any(x)
+    case rest do
+      [{:fn, _} = f | _] -> {:arr, Enum.with_index(items) |> Enum.map(fn {v, i} -> call(f, [v, i * 1.0]) end)}
+      _ -> {:arr, items}
+    end
+  end
+  defp array_static("of", args), do: {:arr, args}
+  defp array_static(_, _), do: :undefined
+
+  defp iter_any({:arr, l}), do: l
+  defp iter_any(s) when is_binary(s), do: for(<<c::utf8 <- s>>, do: <<c::utf8>>)
+  defp iter_any(_), do: []
+
+  defp math_static("floor", [x | _]), do: Float.floor(x / 1)
+  defp math_static("ceil", [x | _]), do: Float.ceil(x / 1)
+  defp math_static("round", [x | _]), do: Float.round(x / 1) |> trunc() |> Kernel.*(1.0)
+  defp math_static("trunc", [x | _]), do: trunc(x) * 1.0
+  defp math_static("abs", [x | _]), do: abs(x) * 1.0
+  defp math_static("sqrt", [x | _]), do: :math.sqrt(x)
+  defp math_static("pow", [a, b | _]), do: :math.pow(a, b)
+  defp math_static("max", args), do: (args |> Enum.filter(&is_number/1) |> Enum.max(fn -> 0.0 end)) * 1.0
+  defp math_static("min", args), do: (args |> Enum.filter(&is_number/1) |> Enum.min(fn -> 0.0 end)) * 1.0
+  defp math_static("random", _), do: :rand.uniform()
+  defp math_static("sign", [x | _]), do: (cond do x > 0 -> 1.0; x < 0 -> -1.0; true -> 0.0 end)
+  defp math_static(_, _), do: :undefined
+
+  @doc "global namespace/property reads (Math.PI, Number.MAX_VALUE, Object.prototype)."
+  def oget({:global, "Math"}, "PI"), do: :math.pi()
+  def oget({:global, "Number"}, "MAX_VALUE"), do: 1.7976931348623157e308
+  def oget({:global, "Number"}, "MIN_VALUE"), do: 5.0e-324
+  def oget({:global, "Number"}, "MAX_SAFE_INTEGER"), do: 9_007_199_254_740_991.0
+  def oget({:global, _}, "prototype"), do: cell_new([])
+  def oget({:global, _}, _), do: :undefined
+
+  # calling a namespace/coercion function or a global function
+  def call({:global, "String"}, args), do: to_str(List.first(args) || :undefined)
+  def call({:global, "Number"}, args), do: to_number(List.first(args) || :undefined)
+  def call({:global, "Boolean"}, args), do: truthy(List.first(args) || :undefined)
+  def call({:global, "Array"}, args), do: {:arr, args}
+  def call({:global, "Object"}, args), do: List.first(args) || olit()
+  def call({:global, err}, args) when err in ["Error", "TypeError", "RangeError", "SyntaxError"], do: construct({:global, err}, args)
+  def call({:global, _}, _args), do: :undefined
+
+  def call({:globalfn, "parseInt"}, [x | _]), do: parse_int(x)
+  def call({:globalfn, "parseFloat"}, [x | _]), do: to_number(x)
+  def call({:globalfn, "isNaN"}, [x | _]), do: not is_number(x)
+  def call({:globalfn, "isFinite"}, [x | _]), do: is_number(x)
+  def call({:globalfn, enc}, [x | _]) when enc in ["encodeURIComponent", "encodeURI"], do: URI.encode(to_str(x))
+  def call({:globalfn, dec}, [x | _]) when dec in ["decodeURIComponent", "decodeURI"], do: URI.decode(to_str(x))
+  def call({:globalfn, _}, _), do: :undefined
+
+  defp json_stringify(v, _rest), do: json_enc(v)
+  defp json_enc(n) when is_number(n), do: to_str(n)
+  defp json_enc(true), do: "true"
+  defp json_enc(false), do: "false"
+  defp json_enc(:undefined), do: "null"
+  defp json_enc(:null), do: "null"
+  defp json_enc(s) when is_binary(s), do: json_quote(s)
+  defp json_enc({:arr, l}), do: "[" <> (l |> Enum.map(&json_enc/1) |> Enum.join(",")) <> "]"
+  defp json_enc({:fn, _}), do: "null"
+  defp json_enc(o) do
+    keys = okeys(o)
+    body = keys |> Enum.map(fn k -> json_quote(k) <> ":" <> json_enc(oget(o, k)) end) |> Enum.join(",")
+    "{" <> body <> "}"
+  end
+
+  defp json_quote(s), do: "\"" <> (s |> String.replace("\\", "\\\\") |> String.replace("\"", "\\\"") |> String.replace("\n", "\\n")) <> "\""
+
+  defp json_parse(s) do
+    try do
+      TinyLasers.Wasm.Json.decode!(s) |> json_to_guest()
+    rescue
+      _ -> :undefined
+    end
+  end
+
+  defp json_to_guest(n) when is_number(n), do: n / 1
+  defp json_to_guest(b) when is_boolean(b), do: b
+  defp json_to_guest(nil), do: :null
+  defp json_to_guest(s) when is_binary(s), do: s
+  defp json_to_guest(l) when is_list(l), do: {:arr, Enum.map(l, &json_to_guest/1)}
+  defp json_to_guest(m) when is_map(m), do: Enum.reduce(m, olit(), fn {k, v}, acc -> oput(acc, to_string(k), json_to_guest(v)) end)
+
+  defp parse_int(x) do
+    case Integer.parse(String.trim(to_str(x))) do
+      {n, _} -> n * 1.0
+      :error -> :undefined
+    end
+  end
+
+  defp to_number(x) when is_number(x), do: x
+  defp to_number(true), do: 1.0
+  defp to_number(false), do: 0.0
+  defp to_number(s) when is_binary(s) do
+    case Float.parse(String.trim(s)) do
+      {n, ""} -> n
+      _ -> case Integer.parse(String.trim(s)) do {n, ""} -> n * 1.0; _ -> :undefined end
+    end
+  end
+  defp to_number(_), do: :undefined
+
+  # a property call on a function object: `marked.parse(md)` — look up the function-valued property + invoke.
+  def method({:fn, _} = fnv, name, args) do
+    case oget(fnv, name) do
+      {:fn, _} = g -> invoke(g, fnv, args)
+      _ -> guest_error("not a function")
+    end
+  end
+
   # calling a method that doesn't resolve (incl. on `:undefined`, e.g. `os.cmd(...)`) is a guest TypeError,
   # NOT a host escape — the receiver was never a host reference.
   def method(_recv, _name, _args), do: guest_error("not a function")
@@ -403,6 +573,26 @@ defmodule TinyLasers.Gate.Runtime do
   def greg_set(name, closure), do: Process.put({:gg_fn, name}, closure)
   @doc "Resolve a top-level guest function by name (late) — `:undefined` if never declared."
   def greg_get(name), do: Process.get({:gg_fn, name}, :undefined)
+
+  @doc "`new F(args)` — construct an instance: fresh `this` cell, invoke the constructor, return the instance
+  (the constructor's returned object if it returns one, else the mutated `this`). Error constructors make an
+  error object; `new RegExp` is handled at the codegen level."
+  def construct({:fn, _} = f, args) do
+    this = cell_new([])
+
+    case invoke(f, this, args) do
+      {tag, _} = obj when tag in [:cell, :arr] -> obj
+      {keys, map} = obj when is_map(map) -> obj
+      _ -> this
+    end
+  end
+
+  def construct({:global, err}, args) when err in ["Error", "TypeError", "RangeError", "SyntaxError"],
+    do: cell_new([{"message", to_str(List.first(args) || "")}, {"name", err}])
+
+  def construct({:global, "Array"}, args), do: {:arr, args}
+  def construct({:global, "Object"}, _), do: cell_new([])
+  def construct(_not_ctor, _args), do: guest_error("not a constructor")
 
   @doc "Invoke a guest function with an explicit `this` receiver (method call). Ungranted callees error."
   def invoke({:fn, f}, this, args) when is_function(f, 2), do: f.(this, args)
@@ -537,6 +727,9 @@ defmodule TinyLasers.Gate.Runtime do
   def typeof({:fn, _}), do: "function"
   def typeof({:host, _}), do: "function"
   def typeof({:cell, _}), do: "object"
+  def typeof({:globalobj}), do: "object"
+  def typeof({:global, _}), do: "function"
+  def typeof({:globalfn, _}), do: "function"
   def typeof(_), do: "object"
 
   # ── DoS primitives (emitted only for the red-team's containment tests) ──
