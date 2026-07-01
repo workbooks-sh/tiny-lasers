@@ -294,6 +294,8 @@ defmodule TinyLasers.Gate.Runtime do
   def oget({:global, "Object"}, k) when is_binary(k) and k not in ["prototype"] do
     if k in @obj_statics, do: closure(fn _this, args -> object_static(k, args) end), else: :undefined
   end
+  def oget({:global, "Promise"}, k) when k in ["resolve", "reject", "all", "allSettled", "race"],
+    do: closure(fn _this, args -> promise_static(k, args) end)
   def oget({:global, _}, _), do: :undefined
 
   def oget({:proto, _}, "toString"), do: {:protom, :tostring}
@@ -562,6 +564,19 @@ defmodule TinyLasers.Gate.Runtime do
   def method({:map, _} = mp, "forEach", [f | _]), do: (Enum.each(map_pairs(mp), fn {k, v} -> call(f, [v, k]) end); :undefined)
   def method({:map, _} = mp, "keys", _), do: avec(Enum.map(map_pairs(mp), &elem(&1, 0)))
   def method({:map, _} = mp, "values", _), do: avec(Enum.map(map_pairs(mp), &elem(&1, 1)))
+  def method({:map, _} = mp, "entries", _), do: avec(Enum.map(map_pairs(mp), fn {k, v} -> avec([k, v]) end))
+
+  # ── Promises: synchronous/eager model. No event loop — resolve/reject settle immediately and .then runs its
+  # callback right away on an already-settled promise (a pending promise queues callbacks, run on settle). This
+  # covers rollup's load-time Promise.resolve().then(...) deferral idioms; strict microtask ordering is a later
+  # rung if byte-identical output needs it.
+  def method({:promise, _} = p, "then", [onF | rest]), do: prom_then(p, onF, List.first(rest) || :undefined)
+  def method({:promise, _} = p, "catch", [onR | _]), do: prom_then(p, :undefined, onR)
+  def method({:promise, _} = p, "finally", [onFin | _]) do
+    f = closure(fn _t, a -> (invoke_if(onFin, []); List.first(a) || :undefined) end)
+    r = closure(fn _t, a -> (invoke_if(onFin, []); throw_val(List.first(a) || :undefined)) end)
+    prom_then(p, f, r)
+  end
   # ── all array methods on a mutable reference: mutating ops write the table in place (aliases share); pure
   # ops return a NEW array. ──
   def method({:arr, _} = a, name, args) do
@@ -721,6 +736,7 @@ defmodule TinyLasers.Gate.Runtime do
 
   # ── global namespaces (Object/Array/Math/JSON/Number/String) — static methods + a few properties ──
   def method({:global, "Object"}, name, args), do: object_static(name, args)
+  def method({:global, "Promise"}, name, args), do: promise_static(name, args)
   def method({:global, "Array"}, name, args), do: array_static(name, args)
   def method({:global, "Math"}, name, args), do: math_static(name, args)
   def method({:global, "JSON"}, "stringify", [v | rest]), do: json_stringify(v, rest)
@@ -983,6 +999,92 @@ defmodule TinyLasers.Gate.Runtime do
     proto == target or instanceof_chain((case proto do {:cell, pid} -> Process.get({:gg_instproto, pid}); _ -> nil end), target)
   end
 
+  # ── Promise internals (synchronous/eager; see the method clauses above) ──
+  defp new_promise do
+    id = __id()
+    Process.put({:gg_prom, id}, {:pending, :undefined, []})
+    {:promise, id}
+  end
+
+  defp prom_state({:promise, id}), do: Process.get({:gg_prom, id}, {:pending, :undefined, []})
+
+  # settle a pending promise. Resolving with a thenable adopts its eventual state (Promise flattening).
+  defp settle({:promise, id} = p, kind, value) do
+    case prom_state(p) do
+      {:pending, _, cbs} ->
+        cond do
+          kind == :fulfilled and match?({:promise, _}, value) ->
+            prom_then(value, closure(fn _t, a -> settle(p, :fulfilled, List.first(a) || :undefined) end),
+                             closure(fn _t, a -> settle(p, :rejected, List.first(a) || :undefined) end))
+          true ->
+            Process.put({:gg_prom, id}, {kind, value, []})
+            Enum.each(Enum.reverse(cbs), fn cb -> cb.(kind, value) end)
+        end
+      _ -> :ok
+    end
+    p
+  end
+
+  # .then: returns a new promise; run the matching handler (immediately if settled, else queue).
+  defp prom_then(p, on_f, on_r) do
+    out = new_promise()
+    run = fn kind, value ->
+      handler = if kind == :fulfilled, do: on_f, else: on_r
+      cond do
+        match?({:fn, _}, handler) or match?({:host, _}, handler) ->
+          try do
+            settle(out, :fulfilled, invoke(handler, :undefined, [value]))
+          catch
+            :throw, {:gg_guest_error, e} -> settle(out, :rejected, e)
+            :throw, {:gg_throw, e} -> settle(out, :rejected, e)
+          end
+        # no handler: pass the settled value/reason straight through
+        true -> settle(out, kind, value)
+      end
+    end
+    case prom_state(p) do
+      {:pending, _, cbs} -> Process.put(elem_key(p), {:pending, :undefined, [run | cbs]})
+      {kind, value, _} -> run.(kind, value)
+    end
+    out
+  end
+
+  defp elem_key({:promise, id}), do: {:gg_prom, id}
+  defp invoke_if(f, args), do: (if match?({:fn, _}, f) or match?({:host, _}, f), do: invoke(f, :undefined, args), else: :undefined)
+
+  defp promise_static("resolve", [v | _]), do: (if match?({:promise, _}, v), do: v, else: settle(new_promise(), :fulfilled, v))
+  defp promise_static("resolve", []), do: settle(new_promise(), :fulfilled, :undefined)
+  defp promise_static("reject", [e | _]), do: settle(new_promise(), :rejected, e)
+  defp promise_static("reject", []), do: settle(new_promise(), :rejected, :undefined)
+  # Promise.all: fulfilled with an array of results (eager model runs each's settled value). Rejects on first reject.
+  defp promise_static("all", [{:arr, _} = av | _]) do
+    results = Enum.map(al(av), &promise_value/1)
+    case Enum.find(results, fn {s, _} -> s == :rejected end) do
+      {:rejected, e} -> settle(new_promise(), :rejected, e)
+      _ -> settle(new_promise(), :fulfilled, avec(Enum.map(results, fn {_, v} -> v end)))
+    end
+  end
+  defp promise_static("allSettled", [{:arr, _} = av | _]) do
+    outs = Enum.map(al(av), fn item ->
+      case promise_value(item) do
+        {:fulfilled, v} -> cell_new([{"status", "fulfilled"}, {"value", v}])
+        {:rejected, e} -> cell_new([{"status", "rejected"}, {"reason", e}])
+      end
+    end)
+    settle(new_promise(), :fulfilled, avec(outs))
+  end
+  defp promise_static("race", [{:arr, _} = av | _]) do
+    case Enum.map(al(av), &promise_value/1) do
+      [{s, v} | _] -> settle(new_promise(), s, v)
+      [] -> new_promise()
+    end
+  end
+  defp promise_static(_, _), do: :undefined
+
+  # the settled {kind, value} of a value-or-promise (eager model: promises are already settled).
+  defp promise_value({:promise, _} = p), do: (case prom_state(p) do {:pending, _, _} -> {:fulfilled, :undefined}; {k, v, _} -> {k, v} end)
+  defp promise_value(v), do: {:fulfilled, v}
+
   @doc "Link a child constructor's prototype to its parent's (ES6 `class Child extends Parent`), so inherited
   instance methods resolve by walking child.prototype -> parent.prototype. Also records the ctor-level super
   link for static inheritance."
@@ -1054,6 +1156,21 @@ defmodule TinyLasers.Gate.Runtime do
     init = case args do [{:arr, _} = av | _] -> Enum.uniq(al(av)); _ -> [] end
     Process.put({:gg_set, id}, init)
     {:set, id}
+  end
+
+  # new Promise(executor): run the executor synchronously with (resolve, reject); a synchronous resolve/reject
+  # settles now (eager model). A throwing executor rejects.
+  def construct({:global, "Promise"}, [executor | _]) do
+    p = new_promise()
+    res = closure(fn _t, a -> settle(p, :fulfilled, List.first(a) || :undefined) end)
+    rej = closure(fn _t, a -> settle(p, :rejected, List.first(a) || :undefined) end)
+    try do
+      invoke(executor, :undefined, [res, rej])
+    catch
+      :throw, {:gg_guest_error, e} -> settle(p, :rejected, e)
+      :throw, {:gg_throw, e} -> settle(p, :rejected, e)
+    end
+    p
   end
 
   def construct({:global, m}, args) when m in ["Map", "WeakMap"] do
@@ -1349,6 +1466,7 @@ defmodule TinyLasers.Gate.Runtime do
   def typeof(:nan), do: "number"
   def typeof(:null), do: "object"
   def typeof({:symbol, _, _}), do: "symbol"
+  def typeof({:promise, _}), do: "object"
   def typeof(_), do: "object"
 
   # ── DoS primitives (emitted only for the red-team's containment tests) ──
