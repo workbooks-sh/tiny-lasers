@@ -115,9 +115,17 @@ process.platform = "linux";
 process.versions = { node: "18.0.0" };
 process.emitWarning = function(){};
 process.on = function(){ return process; };
+process.once = function(){ return process; };
+process.off = function(){ return process; };
+process.removeListener = function(){ return process; };
+process.prependListener = function(){ return process; };
+process.emit = function(){ return false; };
+process.exit = function(){};
 
-// ── dispatching require (overrides cjs_prelude's stub) ──
-require = function(n) {
+// ── dispatching require (a function DECLARATION so it wins the registry over cjs_prelude's stub — a bare
+// `require = function(){}` would only bind a local, leaving the bundle's greg-resolved require pointing at
+// the stub) ──
+function require(n) {
   switch (n) {
     case "events": { var e = EventEmitter; e.EventEmitter = EventEmitter; e.default = EventEmitter; return e; }
     case "path": case "node:path": return path;

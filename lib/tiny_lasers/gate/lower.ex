@@ -1119,7 +1119,7 @@ defmodule TinyLasers.Gate.Lower do
   defp assigned_names(_), do: []
 
   # ── helpers ──
-  @globals ~w(Object Array Math JSON String Number Boolean Error TypeError RangeError SyntaxError Set Map WeakSet WeakMap Symbol Promise Uint8Array Int8Array Uint16Array Int16Array Uint32Array Int32Array Float32Array Float64Array)
+  @globals ~w(Object Array Math JSON String Number Boolean Error TypeError RangeError SyntaxError Set Map WeakSet WeakMap Symbol Promise Buffer Uint8Array Int8Array Uint16Array Int16Array Uint32Array Int32Array Float32Array Float64Array)
   @global_fns ~w(parseInt parseFloat isNaN isFinite encodeURIComponent decodeURIComponent encodeURI decodeURI)
 
   defp ident(n, scope) do

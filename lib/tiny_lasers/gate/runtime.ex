@@ -244,6 +244,10 @@ defmodule TinyLasers.Gate.Runtime do
   def oget({_keys, map}, k) when is_map(map), do: Map.get(map, key_str(k), :undefined)
   def oget({:set, _} = st, "size"), do: length(set_list(st)) * 1.0
   def oget({:map, _} = mp, "size"), do: length(map_pairs(mp)) * 1.0
+  def oget({:bytes, b}, k) when k in ["length", "byteLength"], do: byte_size(b) * 1.0
+  def oget({:bytes, _}, "byteOffset"), do: 0.0
+  def oget({:bytes, b}, k) when is_number(k), do: (i = trunc(k); if i >= 0 and i < byte_size(b), do: :binary.at(b, i) * 1.0, else: :undefined)
+  def oget({:bytes, _}, _), do: :undefined
 
   def oget({:arr, _} = a, k) do
     cond do
@@ -386,6 +390,25 @@ defmodule TinyLasers.Gate.Runtime do
 
   @doc "A rest parameter's array: the args from index `i` onward. (Keeps Enum.drop out of emitted guest code.)"
   def args_rest(args, i) when is_list(args), do: avec(Enum.drop(args, i))
+
+  @doc "Public accessor: a guest array's element list (for host capability bridges reading guest arrays)."
+  def arr_to_list({:arr, _} = a), do: al(a)
+  def arr_to_list(_), do: []
+
+  defp bytes_bin({:bytes, b}), do: b
+  defp bytes_bin(b) when is_binary(b), do: b
+  defp bytes_bin(_), do: ""
+
+  @doc "Granted `__host(op, params)` capability bridge → dispatches to a host module (e.g. the rollup
+  wasm parser via HostRollup) and returns the result as a guest object. Confined: the guest holds only the
+  integer capability handle; the host work (running wasm) happens here, never referenced in guest code."
+  def host_rollup_bridge([op, params | _], _ctx) do
+    plist = arr_to_list(params)
+    case TinyLasers.Wasm.HostRollup.call(to_string(op), plist) do
+      m when is_map(m) -> cell_new(Enum.map(m, fn {k, v} -> {to_string(k), v} end))
+      other -> other
+    end
+  end
 
   defp al({:arr, id}), do: Process.get({:gg_vec, id}, {[], %{}}) |> elem(0)
   defp ap({:arr, id}), do: Process.get({:gg_vec, id}, {[], %{}}) |> elem(1)
@@ -737,9 +760,33 @@ defmodule TinyLasers.Gate.Runtime do
   def method({:cell, _} = c, name, args) do
     case oget(c, name) do
       {:fn, _} = f -> invoke(f, c, args)
-      _ -> if System.get_env("GAPLOG"), do: IO.puts(:stderr, "GAP cellmeth #{inspect(name)}"); guest_error("not a function")
+      _ ->
+        if System.get_env("GAPLOG"), do: IO.puts(:stderr, "GAP cellmeth #{inspect(name)} keys=#{inspect(okeys(c)) |> String.slice(0, 90)}")
+        if System.get_env("GAPSOFT"), do: :undefined, else: guest_error("not a function")
     end
   end
+
+  # ── Node Buffer: a raw byte buffer as {:bytes, binary}. Buffer.from(str[, enc]) / Buffer.from(byteArray).
+  # Guest strings are already UTF-8 binaries, so utf-8 is identity; base64 decodes. Used by rollup's xxhash
+  # (Buffer.from(id).toString("base64")) and the wasm-bridge base64 paths.
+  def method({:global, "Buffer"}, "from", [data | rest]) do
+    enc = List.first(rest)
+    cond do
+      enc == "base64" and is_binary(data) -> {:bytes, (case Base.decode64(data) do {:ok, b} -> b; _ -> "" end)}
+      is_binary(data) -> {:bytes, data}
+      match?({:bytes, _}, data) -> data
+      match?({:arr, _}, data) -> {:bytes, al(data) |> Enum.map(&(trunc(to_number(&1)) |> Bitwise.band(0xFF))) |> :erlang.list_to_binary()}
+      true -> {:bytes, ""}
+    end
+  end
+  def method({:global, "Buffer"}, name, args) when name in ["alloc", "allocUnsafe"], do: (n = trunc(to_number(List.first(args) || 0.0)); {:bytes, :binary.copy(<<0>>, n)})
+  def method({:global, "Buffer"}, "concat", [{:arr, _} = a | _]), do: {:bytes, al(a) |> Enum.map(fn {:bytes, b} -> b; b when is_binary(b) -> b; _ -> "" end) |> IO.iodata_to_binary()}
+  def method({:global, "Buffer"}, "isBuffer", [x | _]), do: match?({:bytes, _}, x)
+
+  # methods on a byte buffer value.
+  def method({:bytes, b}, "toString", rest), do: (case List.first(rest) do "base64" -> Base.encode64(b); "hex" -> Base.encode16(b, case: :lower); _ -> b end)
+  def method({:bytes, _} = bytes, "subarray", [a0 | rest]), do: (b = bytes_bin(bytes); s = trunc(to_number(a0)); e = (case rest do [e0 | _] -> trunc(to_number(e0)); _ -> byte_size(b) end); {:bytes, binary_part(b, s, max(min(e, byte_size(b)) - s, 0))})
+  def method({:bytes, _} = bytes, "slice", args), do: method(bytes, "subarray", args)
 
   # ── global namespaces (Object/Array/Math/JSON/Number/String) — static methods + a few properties ──
   def method({:global, "Object"}, name, args), do: object_static(name, args)
@@ -1512,6 +1559,7 @@ defmodule TinyLasers.Gate.Runtime do
   def typeof(:null), do: "object"
   def typeof({:symbol, _, _}), do: "symbol"
   def typeof({:promise, _}), do: "object"
+  def typeof({:bytes, _}), do: "object"
   def typeof(_), do: "object"
 
   # ── DoS primitives (emitted only for the red-team's containment tests) ──
