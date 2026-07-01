@@ -522,6 +522,41 @@ defmodule TinyLasers.Gate.Runtime do
 
   defp ta_elems({:ta, _, _, _, len} = ta), do: for(i <- 0..(len - 1)//1, do: ta_get(ta, i))
   defp ta_elems(_), do: []
+
+  # DataView: map get/set<Kind> → element kind; big/little endian.
+  defp dv_kind("Float64"), do: :f64
+  defp dv_kind("Float32"), do: :f32
+  defp dv_kind("Uint32"), do: :u32
+  defp dv_kind("Int32"), do: :i32
+  defp dv_kind("Uint16"), do: :u16
+  defp dv_kind("Int16"), do: :i16
+  defp dv_kind("Uint8"), do: :u8
+  defp dv_kind("Int8"), do: :i8
+  defp dv_kind(_), do: :u8
+
+  defp dv_get(kind, bin, pos, le) do
+    sz = ta_size(kind)
+    if pos >= 0 and pos + sz <= byte_size(bin) do
+      raw = binary_part(bin, pos, sz)
+      raw = if le, do: raw, else: dv_swap(raw)
+      ta_dec(kind, raw)
+    else
+      :undefined
+    end
+  end
+
+  defp dv_set(id, kind, pos, v, le) do
+    sz = ta_size(kind)
+    bin = abuf_bin(id)
+    if pos >= 0 and pos + sz <= byte_size(bin) do
+      enc = ta_enc(kind, v)
+      enc = if le, do: enc, else: dv_swap(enc)
+      abuf_put(id, binary_part(bin, 0, pos) <> enc <> binary_part(bin, pos + sz, byte_size(bin) - pos - sz))
+    end
+  end
+
+  # ta_enc/ta_dec are little-endian; big-endian DataView access reverses the bytes.
+  defp dv_swap(bin), do: bin |> :binary.bin_to_list() |> Enum.reverse() |> :erlang.list_to_binary()
   # the raw bytes this view spans (for TextDecoder / Buffer.from).
   defp ta_bytes({:ta, kind, id, off, len}), do: binary_part(abuf_bin(id), off, min(len * ta_size(kind), byte_size(abuf_bin(id)) - off))
 
@@ -938,6 +973,17 @@ defmodule TinyLasers.Gate.Runtime do
     :undefined
   end
   def method({:ta, _, _, _, len} = ta, "fill", [v | _]), do: (Enum.each(0..(len - 1)//1, fn i -> ta_set(ta, i, v) end); ta)
+
+  # DataView getX(byteOffset, littleEndian) / setX(byteOffset, value, littleEndian).
+  def method({:dataview, id, base, _}, "get" <> kind, [pos | rest]) do
+    le = List.first(rest) == true
+    dv_get(dv_kind(kind), abuf_bin(id), base + trunc(to_number(pos)), le)
+  end
+  def method({:dataview, id, base, _}, "set" <> kind, [pos, v | rest]) do
+    le = Enum.at(rest, 0) == true
+    dv_set(id, dv_kind(kind), base + trunc(to_number(pos)), to_number(v), le)
+    :undefined
+  end
   def method({:ta, _, _, _, _} = ta, name, args) do
     # a named-property method (e.g. Object.assign'd convertString) is invoked; else an array-like method.
     f = Process.get({:gg_taprops, ta}, %{}) |> Map.get(name)
@@ -1510,6 +1556,13 @@ defmodule TinyLasers.Gate.Runtime do
   # linear byte buffer. This gives `.buffer` + reinterpretation — rollup reads its AST as
   # `new Uint32Array(uint8.buffer)`, which needs the u8 bytes viewable as u32s.
   def construct({:global, "ArrayBuffer"}, [n | _]) when is_number(n), do: mk_abuf(:binary.copy(<<0>>, trunc(n)))
+  # DataView over an ArrayBuffer — typed reads/writes at a byte offset (rollup reads AST numeric literals via
+  # new DataView(buffer.buffer).getFloat64(byteOffset, true)).
+  def construct({:global, "DataView"}, [{:abuf, id, blen} | rest]) do
+    off = trunc(to_number(Enum.at(rest, 0) || 0.0))
+    len = case Enum.at(rest, 1) do nil -> blen - off; l -> trunc(to_number(l)) end
+    {:dataview, id, off, len}
+  end
   def construct({:global, ta}, args)
       when ta in ["Uint8Array", "Int8Array", "Uint16Array", "Int16Array", "Uint32Array",
                   "Int32Array", "Float32Array", "Float64Array"] do
@@ -1883,6 +1936,7 @@ defmodule TinyLasers.Gate.Runtime do
   def typeof({:date, _}), do: "object"
   def typeof({:ta, _, _, _, _}), do: "object"
   def typeof({:abuf, _, _}), do: "object"
+  def typeof({:dataview, _, _, _}), do: "object"
   def typeof({:textdecoder}), do: "object"
   def typeof({:textencoder}), do: "object"
   def typeof(_), do: "object"
