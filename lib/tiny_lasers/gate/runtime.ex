@@ -383,6 +383,16 @@ defmodule TinyLasers.Gate.Runtime do
   @doc "Flatten call arguments with spread elements into a plain args list (`f(...xs, y)`)."
   def spread_args(parts), do: Enum.flat_map(parts, fn {:spread, v} -> iter(v); {:one, v} -> [v] end)
 
+  @doc "Array rest binding `[a, ...rest] = arr` — the elements from index `from` onward as a new array."
+  def arest({:arr, _} = a, from), do: avec(Enum.drop(al(a), from))
+  def arest(_other, _from), do: avec([])
+
+  @doc "Object rest binding `{a, ...rest} = o` — a new object of `o`'s own keys except the destructured ones."
+  def orest(o, taken) do
+    keep = okeys(o) |> Enum.reject(&(&1 in taken))
+    cell_new(Enum.map(keep, fn k -> {k, oget(o, k)} end))
+  end
+
   # ── regex as a CAPABILITY (backed by Elixir Regex, returns guest values, stays confined). A regex is a
   # guest-safe term `{:regex, compiled, source, flags}`; the guest can only pass it to the regex methods. ──
   @doc "Compile a guest regex. JS flags i/m/s/u/x map to Elixir opts; g is applied at match/replace time."

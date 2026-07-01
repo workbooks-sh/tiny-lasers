@@ -63,7 +63,9 @@ defmodule TinyLasers.Gate.Lower do
     do: %{s | funcs: MapSet.put(s[:funcs] || MapSet.new(), n), fnmap: Map.put(s[:fnmap] || %{}, n, fnkey(n, f))}
 
   defp hoist(%{"type" => "VariableDeclaration", "declarations" => ds}, s) do
-    Enum.reduce(ds, s, fn %{"id" => %{"name" => n}}, acc -> %{acc | locals: MapSet.put(acc.locals, n)} end)
+    Enum.reduce(ds, s, fn d, acc ->
+      Enum.reduce(pattern_names(d["id"]), acc, &%{&2 | locals: MapSet.put(&2.locals, &1)})
+    end)
   end
 
   defp hoist(_, s), do: s
@@ -71,15 +73,16 @@ defmodule TinyLasers.Gate.Lower do
   # ── statements ──
   defp stmt(%{"type" => "VariableDeclaration", "declarations" => ds}, scope) do
     {rev, sc} =
-      Enum.reduce(ds, {[], scope}, fn %{"id" => %{"name" => n}} = d, {acc, s} ->
+      Enum.reduce(ds, {[], scope}, fn d, {acc, s} ->
         init = d["init"]
-        s2 = %{s | locals: MapSet.put(s.locals, n)}
+        s2 = Enum.reduce(pattern_names(d["id"]), s, &%{&2 | locals: MapSet.put(&2.locals, &1)})
         vq = if init, do: expr(init, s2), else: :undefined
-        # a boxed var's box is pre-created at scope entry; the declaration SETS the box (never rebinds).
+
         q =
-          if s2[:boxed] && MapSet.member?(s2.boxed, n),
-            do: quote(do: unquote(@runtime).box_set(unquote(lvar(n)), unquote(vq))),
-            else: quote(do: unquote(lvar(n)) = unquote(vq))
+          case d["id"] do
+            %{"type" => "Identifier", "name" => n} -> bind_local(n, vq, s2)
+            pattern -> destructure(pattern, vq, s2)
+          end
 
         {[q | acc], s2}
       end)
@@ -1037,9 +1040,8 @@ defmodule TinyLasers.Gate.Lower do
   defp collect_vars(%{"type" => t}) when t in ["FunctionExpression", "FunctionDeclaration", "ArrowFunctionExpression"],
     do: []
 
-  defp collect_vars(%{"type" => "VariableDeclaration", "declarations" => ds} = n) do
-    names = Enum.flat_map(ds, fn d -> case d["id"] do %{"name" => nm} -> [nm]; _ -> [] end end)
-    names ++ Enum.flat_map(ds, fn d -> collect_vars(d["init"]) end)
+  defp collect_vars(%{"type" => "VariableDeclaration", "declarations" => ds} = _n) do
+    Enum.flat_map(ds, fn d -> pattern_names(d["id"]) end) ++ Enum.flat_map(ds, fn d -> collect_vars(d["init"]) end)
   end
 
   defp collect_vars(%{} = node), do: node |> Map.drop(["type"]) |> Map.values() |> Enum.flat_map(&collect_vars/1)
@@ -1153,6 +1155,80 @@ defmodule TinyLasers.Gate.Lower do
   end
 
   defp not_boxed(names, scope), do: Enum.reject(names, &(scope[:boxed] && MapSet.member?(scope.boxed, &1)))
+
+  # ── destructuring patterns (const {a,b}=o / [x,y]=arr, with defaults + rest) ──
+  defp pattern_names(nil), do: []
+  defp pattern_names(%{"type" => "Identifier", "name" => n}), do: [n]
+
+  defp pattern_names(%{"type" => "ObjectPattern", "properties" => props}),
+    do: Enum.flat_map(props || [], fn
+      %{"type" => "RestElement", "argument" => a} -> pattern_names(a)
+      %{"value" => v} -> pattern_names(v)
+      _ -> []
+    end)
+
+  defp pattern_names(%{"type" => "ArrayPattern", "elements" => els}), do: Enum.flat_map(els || [], &pattern_names/1)
+  defp pattern_names(%{"type" => "AssignmentPattern", "left" => l}), do: pattern_names(l)
+  defp pattern_names(%{"type" => "RestElement", "argument" => a}), do: pattern_names(a)
+  defp pattern_names(_), do: []
+
+  defp bind_local(n, vq, scope) do
+    if scope[:boxed] && MapSet.member?(scope.boxed, n),
+      do: quote(do: unquote(@runtime).box_set(unquote(lvar(n)), unquote(vq))),
+      else: quote(do: unquote(lvar(n)) = unquote(vq))
+  end
+
+  # bind a destructuring pattern from `vq` — evaluate vq once into a temp, then bind each target.
+  defp destructure(pattern, vq, scope) do
+    tmp = uniqvar()
+    {:__block__, [], [quote(do: unquote(tmp) = unquote(vq)) | destr_targets(pattern, tmp, scope)]}
+  end
+
+  defp destr_targets(%{"type" => "Identifier", "name" => n}, valq, scope), do: [bind_local(n, valq, scope)]
+
+  defp destr_targets(%{"type" => "AssignmentPattern", "left" => l, "right" => r}, valq, scope) do
+    v = uniqvar()
+    [
+      quote(do: unquote(v) = unquote(valq)),
+      quote(do: unquote(v) = if(unquote(@runtime).binop(:===, unquote(v), :undefined), do: unquote(expr(r, scope)), else: unquote(v)))
+      | destr_targets(l, v, scope)
+    ]
+  end
+
+  defp destr_targets(%{"type" => "ObjectPattern", "properties" => props}, valq, scope) do
+    v = uniqvar()
+    taken = for p <- props, p["type"] != "RestElement", do: key_str_of(p["key"])
+
+    [quote(do: unquote(v) = unquote(valq))] ++
+      Enum.flat_map(props, fn
+        %{"type" => "RestElement", "argument" => a} ->
+          destr_targets(a, quote(do: unquote(@runtime).orest(unquote(v), unquote(taken))), scope)
+
+        %{"key" => key, "value" => value, "computed" => computed} ->
+          keyq = if computed, do: expr(key, scope), else: key_of(key)
+          destr_targets(value, quote(do: unquote(@runtime).oget(unquote(v), unquote(keyq))), scope)
+      end)
+  end
+
+  defp destr_targets(%{"type" => "ArrayPattern", "elements" => els}, valq, scope) do
+    v = uniqvar()
+
+    [quote(do: unquote(v) = unquote(valq))] ++
+      (els
+       |> Enum.with_index()
+       |> Enum.flat_map(fn
+         {nil, _} -> []
+         {%{"type" => "RestElement", "argument" => a}, i} -> destr_targets(a, quote(do: unquote(@runtime).arest(unquote(v), unquote(i))), scope)
+         {el, i} -> destr_targets(el, quote(do: unquote(@runtime).oget(unquote(v), unquote(i * 1.0))), scope)
+       end))
+  end
+
+  defp key_str_of(%{"name" => n}), do: n
+  defp key_str_of(%{"value" => v}) when is_binary(v), do: v
+  defp key_str_of(%{"value" => v}), do: to_string(v)
+  defp key_str_of(_), do: ""
+
+  defp uniqvar, do: Macro.var(String.to_atom("__ggp#{System.unique_integer([:positive])}"), __MODULE__)
 
   # a switch case ends at an UNLABELED break (terminates the switch); a labeled `break outer` must survive to
   # reach the enclosing loop's catch.
