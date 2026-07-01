@@ -214,20 +214,29 @@ defmodule TinyLasers.Gate.Runtime do
   @doc "Property read. Objects: by key. Arrays: numeric index + `length`. Non-objects: `:undefined`."
   # cell property read WITH prototype-chain fallback: ES5 classes put methods on `Ctor.prototype`; a `new
   # Ctor()` instance resolves a missing own-property from its linked prototype (see construct/2, fn_proto/1).
-  def oget({:cell, id} = c, k) do
-    key = key_str(k)
+  def oget({:cell, _} = c, k), do: cell_oget(c, key_str(k), c)
 
+  # resolve a cell property through the prototype chain; a `{:getter, fn}` marker is invoked with `this` = the
+  # ORIGINAL receiver (so a prototype getter reading the instance's scope state works).
+  defp cell_oget({:cell, id} = c, key, recv) do
     case Map.get(cell_read(c) |> elem(1), key, :__miss) do
       :__miss ->
         case Process.get({:gg_instproto, id}) do
           nil -> :undefined
-          proto -> oget(proto, key)
+          {:cell, _} = proto -> cell_oget(proto, key, recv)
+          proto -> deget(oget(proto, key), recv)
         end
+
+      {:getter, f} ->
+        invoke(f, recv, [])
 
       v ->
         v
     end
   end
+
+  defp deget({:getter, f}, recv), do: invoke(f, recv, [])
+  defp deget(v, _recv), do: v
 
   # a function's `.prototype` is a stable per-function cell (ES5 method bag: `Ctor.prototype.m = fn`).
   def oget({:fn, _} = fnv, "prototype"), do: fn_proto(fnv)
@@ -687,7 +696,7 @@ defmodule TinyLasers.Gate.Runtime do
   defp object_static("defineProperty", [o, k, desc | _]) do
     cond do
       has_own(desc, "value") -> oput(o, to_str(k), oget(desc, "value"))
-      has_own(desc, "get") -> oput(o, to_str(k), invoke(oget(desc, "get"), o, []))
+      has_own(desc, "get") -> oput(o, to_str(k), {:getter, oget(desc, "get")})
       true -> o
     end
   end
