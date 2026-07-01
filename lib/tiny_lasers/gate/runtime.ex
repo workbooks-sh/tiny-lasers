@@ -155,6 +155,13 @@ defmodule TinyLasers.Gate.Runtime do
 
   @doc "Property write. A cell mutates in place (shared); an immutable object returns a NEW object."
   def oput({:cell, _} = c, k, v), do: cell_put(c, k, v)
+  def oput({:ta, _, _, _, _} = ta, k, v) when is_number(k), do: (ta_set(ta, trunc(k), v); v)
+  # named property on a typed array (JS typed arrays are objects): store in a side table, return the ARRAY
+  # (Object.assign(array, {...}) folds oput over the target and relies on it returning the target).
+  def oput({:ta, _, _, _, _} = ta, k, v) do
+    Process.put({:gg_taprops, ta}, Map.put(Process.get({:gg_taprops, ta}, %{}), key_str(k), v))
+    ta
+  end
   # Proxy set trap (target, keyString, value, receiver); falls back to writing the target.
   def oput({:proxy, t, h} = px, k, v) do
     case oget(h, "set") do
@@ -263,6 +270,17 @@ defmodule TinyLasers.Gate.Runtime do
   def oget({:bytes, _}, "byteOffset"), do: 0.0
   def oget({:bytes, b}, k) when is_number(k), do: (i = trunc(k); if i >= 0 and i < byte_size(b), do: :binary.at(b, i) * 1.0, else: :undefined)
   def oget({:bytes, _}, _), do: :undefined
+
+  # typed-array views + ArrayBuffers
+  def oget({:ta, _, _, _, _} = ta, k) when is_number(k), do: ta_get(ta, trunc(k))
+  def oget({:ta, _, _, _, len}, "length"), do: len * 1.0
+  def oget({:ta, kind, _, _, len}, "byteLength"), do: len * ta_size(kind) * 1.0
+  def oget({:ta, _, _, off, _}, "byteOffset"), do: off * 1.0
+  def oget({:ta, kind, _, _, _}, "BYTES_PER_ELEMENT"), do: ta_size(kind) * 1.0
+  def oget({:ta, _, id, _, _}, "buffer"), do: {:abuf, id, byte_size(abuf_bin(id))}
+  def oget({:ta, _, _, _, _} = ta, key), do: Process.get({:gg_taprops, ta}, %{}) |> Map.get(key_str(key), :undefined)
+  def oget({:abuf, _, blen}, "byteLength"), do: blen * 1.0
+  def oget({:abuf, _, _}, _), do: :undefined
 
   def oget({:arr, _} = a, k) do
     cond do
@@ -426,8 +444,86 @@ defmodule TinyLasers.Gate.Runtime do
   # coerce a byte source (Buffer/typed array/array-of-bytes/binary) to a binary (TextDecoder.decode).
   defp to_bin_bytes({:bytes, b}), do: b
   defp to_bin_bytes(b) when is_binary(b), do: b
+  defp to_bin_bytes({:ta, _, _, _, _} = ta), do: ta_bytes(ta)
   defp to_bin_bytes({:arr, _} = a), do: al(a) |> Enum.map(&(trunc(to_number(&1)) |> Bitwise.band(0xFF))) |> :erlang.list_to_binary()
   defp to_bin_bytes(_), do: ""
+
+  # ── ArrayBuffer + typed-array views ──────────────────────────────────────────────────────────────────────
+  def mk_abuf(bin) do
+    id = __id()
+    Process.put({:gg_abuf, id}, bin)
+    {:abuf, id, byte_size(bin)}
+  end
+
+  defp abuf_bin(id), do: Process.get({:gg_abuf, id}, "")
+  defp abuf_put(id, bin), do: Process.put({:gg_abuf, id}, bin)
+
+  defp ta_kind("Uint8Array"), do: :u8
+  defp ta_kind("Int8Array"), do: :i8
+  defp ta_kind("Uint16Array"), do: :u16
+  defp ta_kind("Int16Array"), do: :i16
+  defp ta_kind("Uint32Array"), do: :u32
+  defp ta_kind("Int32Array"), do: :i32
+  defp ta_kind("Float32Array"), do: :f32
+  defp ta_kind("Float64Array"), do: :f64
+
+  defp ta_size(k) when k in [:u8, :i8], do: 1
+  defp ta_size(k) when k in [:u16, :i16], do: 2
+  defp ta_size(k) when k in [:u32, :i32, :f32], do: 4
+  defp ta_size(:f64), do: 8
+
+  defp ta_enc(:u8, v), do: <<Bitwise.band(trunc(v), 0xFF)::unsigned-8>>
+  defp ta_enc(:i8, v), do: <<trunc(v)::signed-8>>
+  defp ta_enc(:u16, v), do: <<Bitwise.band(trunc(v), 0xFFFF)::unsigned-little-16>>
+  defp ta_enc(:i16, v), do: <<trunc(v)::signed-little-16>>
+  defp ta_enc(:u32, v), do: <<Bitwise.band(trunc(v), 0xFFFFFFFF)::unsigned-little-32>>
+  defp ta_enc(:i32, v), do: <<trunc(v)::signed-little-32>>
+  defp ta_enc(:f32, v), do: <<(v / 1)::float-little-32>>
+  defp ta_enc(:f64, v), do: <<(v / 1)::float-little-64>>
+
+  defp ta_dec(:u8, <<v::unsigned-8>>), do: v * 1.0
+  defp ta_dec(:i8, <<v::signed-8>>), do: v * 1.0
+  defp ta_dec(:u16, <<v::unsigned-little-16>>), do: v * 1.0
+  defp ta_dec(:i16, <<v::signed-little-16>>), do: v * 1.0
+  defp ta_dec(:u32, <<v::unsigned-little-32>>), do: v * 1.0
+  defp ta_dec(:i32, <<v::signed-little-32>>), do: v * 1.0
+  defp ta_dec(:f32, <<v::float-little-32>>), do: v
+  defp ta_dec(:f64, <<v::float-little-64>>), do: v
+  defp ta_dec(_, _), do: :nan
+
+  defp ta_from_elems(kind, elems) do
+    sz = ta_size(kind)
+    bin = elems |> Enum.map(fn v -> ta_enc(kind, to_number(v)) end) |> IO.iodata_to_binary()
+    {:abuf, id, _} = mk_abuf(bin)
+    {:ta, kind, id, 0, div(byte_size(bin), sz)}
+  end
+
+  # element read/write via the underlying buffer at byte_off + i*size.
+  defp ta_get({:ta, kind, id, off, len}, i) when i >= 0 and i < len do
+    sz = ta_size(kind)
+    pos = off + i * sz
+    bin = abuf_bin(id)
+    if pos + sz <= byte_size(bin), do: ta_dec(kind, binary_part(bin, pos, sz)), else: :undefined
+  end
+  defp ta_get({:ta, kind, _, _, len}, i) do
+    if System.get_env("GAPLOG"), do: IO.puts(:stderr, "TA-OOB #{kind} idx=#{i} len=#{len}")
+    :undefined
+  end
+
+  defp ta_set({:ta, kind, id, off, _len}, i, v) do
+    sz = ta_size(kind)
+    pos = off + i * sz
+    bin = abuf_bin(id)
+    if pos + sz <= byte_size(bin) do
+      abuf_put(id, binary_part(bin, 0, pos) <> ta_enc(kind, to_number(v)) <> binary_part(bin, pos + sz, byte_size(bin) - pos - sz))
+    end
+    v
+  end
+
+  defp ta_elems({:ta, _, _, _, len} = ta), do: for(i <- 0..(len - 1)//1, do: ta_get(ta, i))
+  defp ta_elems(_), do: []
+  # the raw bytes this view spans (for TextDecoder / Buffer.from).
+  defp ta_bytes({:ta, kind, id, off, len}), do: binary_part(abuf_bin(id), off, min(len * ta_size(kind), byte_size(abuf_bin(id)) - off))
 
   @doc "Granted `__host(op, params)` capability bridge → dispatches to a host module (e.g. the rollup
   wasm parser via HostRollup) and returns the result as a guest object. Confined: the guest holds only the
@@ -633,6 +729,11 @@ defmodule TinyLasers.Gate.Runtime do
     r = closure(fn _t, a -> (invoke_if(onFin, []); throw_val(List.first(a) || :undefined)) end)
     prom_then(p, f, r)
   end
+  # a computed-member CALL `arr[i](args)` / `ta[i](args)` — the callee is the element (a function), invoked
+  # with `this` = the container (rollup: `nodeConverters[nodeType](position, buffer)`).
+  def method({:arr, _} = a, k, args) when is_number(k), do: invoke(oget(a, k), a, args)
+  def method({:ta, _, _, _, _} = ta, k, args) when is_number(k), do: invoke(oget(ta, k), ta, args)
+
   # ── all array methods on a mutable reference: mutating ops write the table in place (aliases share); pure
   # ops return a NEW array. ──
   def method({:arr, _} = a, name, args) do
@@ -817,6 +918,31 @@ defmodule TinyLasers.Gate.Runtime do
   def method({:bytes, b}, "toString", rest), do: (case List.first(rest) do "base64" -> Base.encode64(b); "hex" -> Base.encode16(b, case: :lower); _ -> b end)
   def method({:bytes, _} = bytes, "subarray", [a0 | rest]), do: (b = bytes_bin(bytes); s = trunc(to_number(a0)); e = (case rest do [e0 | _] -> trunc(to_number(e0)); _ -> byte_size(b) end); {:bytes, binary_part(b, s, max(min(e, byte_size(b)) - s, 0))})
   def method({:bytes, _} = bytes, "slice", args), do: method(bytes, "subarray", args)
+
+  # typed-array methods
+  def method({:ta, kind, id, off, len} = ta, "subarray", args) do
+    a = trunc(to_number(List.first(args) || 0.0)); a = if a < 0, do: max(len + a, 0), else: min(a, len)
+    e = case Enum.at(args, 1) do nil -> len; x -> (xe = trunc(to_number(x)); if xe < 0, do: max(len + xe, 0), else: min(xe, len)) end
+    _ = id; _ = off
+    {:ta, kind, id, off + a * ta_size(kind), max(e - a, 0)}
+  end
+  def method({:ta, kind, _, _, len} = ta, "slice", args) do
+    a = trunc(to_number(List.first(args) || 0.0)); a = if a < 0, do: max(len + a, 0), else: min(a, len)
+    e = case Enum.at(args, 1) do nil -> len; x -> (xe = trunc(to_number(x)); if xe < 0, do: max(len + xe, 0), else: min(xe, len)) end
+    ta_from_elems(kind, Enum.slice(ta_elems(ta), a, max(e - a, 0)))
+  end
+  def method({:ta, _, _, _, _} = ta, "set", [src | rest]) do
+    off = trunc(to_number(Enum.at(rest, 0) || 0.0))
+    srcels = case src do {:ta, _, _, _, _} -> ta_elems(src); {:arr, _} -> al(src); _ -> [] end
+    srcels |> Enum.with_index() |> Enum.each(fn {v, i} -> ta_set(ta, off + i, v) end)
+    :undefined
+  end
+  def method({:ta, _, _, _, len} = ta, "fill", [v | _]), do: (Enum.each(0..(len - 1)//1, fn i -> ta_set(ta, i, v) end); ta)
+  def method({:ta, _, _, _, _} = ta, name, args) do
+    # a named-property method (e.g. Object.assign'd convertString) is invoked; else an array-like method.
+    f = Process.get({:gg_taprops, ta}, %{}) |> Map.get(name)
+    if match?({:fn, _}, f) or match?({:host, _}, f), do: invoke(f, ta, args), else: method(avec(ta_elems(ta)), name, args)
+  end
 
   # Date stub methods (deterministic; timing only).
   def method({:date, ms}, m, _) when m in ["getTime", "valueOf"], do: ms
@@ -1380,15 +1506,27 @@ defmodule TinyLasers.Gate.Runtime do
   # TextDecoder/TextEncoder — guest strings are UTF-8 binaries, so decode/encode are near-identity.
   def construct({:global, "TextDecoder"}, _), do: {:textdecoder}
   def construct({:global, "TextEncoder"}, _), do: {:textencoder}
-  # typed arrays are backed by a plain guest array (indexed get/set, length, subarray all work on {:arr,_}).
-  # new TA(n) -> n zeros; new TA([...]) / new TA(otherTA) -> element copy.
+  # Real ArrayBuffer-backed typed arrays: `{:ta, kind, abuf_id, byte_off, len}` views over an `{:abuf, id, blen}`
+  # linear byte buffer. This gives `.buffer` + reinterpretation — rollup reads its AST as
+  # `new Uint32Array(uint8.buffer)`, which needs the u8 bytes viewable as u32s.
+  def construct({:global, "ArrayBuffer"}, [n | _]) when is_number(n), do: mk_abuf(:binary.copy(<<0>>, trunc(n)))
   def construct({:global, ta}, args)
       when ta in ["Uint8Array", "Int8Array", "Uint16Array", "Int16Array", "Uint32Array",
                   "Int32Array", "Float32Array", "Float64Array"] do
+    kind = ta_kind(ta)
+    sz = ta_size(kind)
     case args do
-      [{:arr, _} = av | _] -> avec(al(av))
-      [n | _] when is_number(n) -> avec(List.duplicate(0.0, trunc(n)))
-      _ -> avec([])
+      # new TA(arrayBuffer[, byteOffset[, length]]) — a VIEW sharing the buffer.
+      [{:abuf, id, blen} | rest] ->
+        off = trunc(to_number(Enum.at(rest, 0) || 0.0))
+        len = case Enum.at(rest, 1) do nil -> div(blen - off, sz); l -> trunc(to_number(l)) end
+        {:ta, kind, id, off, len}
+      # new TA(otherTypedArray) / new TA([...]) — copy elements into a fresh buffer.
+      [{:ta, _, _, _, _} = src | _] -> ta_from_elems(kind, ta_elems(src))
+      [{:arr, _} = av | _] -> ta_from_elems(kind, al(av))
+      [{:bytes, b} | _] -> ta_from_elems(kind, :binary.bin_to_list(b) |> Enum.map(&(&1 * 1.0)))
+      [n | _] when is_number(n) -> {:abuf, id, _} = mk_abuf(:binary.copy(<<0>>, trunc(n) * sz)); {:ta, kind, id, 0, trunc(n)}
+      _ -> {:abuf, id, _} = mk_abuf(""); {:ta, kind, id, 0, 0}
     end
   end
   def construct({:global, "Object"}, _), do: cell_new([])
@@ -1637,6 +1775,20 @@ defmodule TinyLasers.Gate.Runtime do
   def to_str({:host, _}), do: "function"
   def to_str({:arr, _} = a), do: al(a) |> Enum.map(fn v -> if v in [:undefined, :null], do: "", else: to_str(v) end) |> Enum.join(",")
   def to_str({:regex, _, src, flags}), do: "/" <> src <> "/" <> flags
+  def to_str({:fn, _}), do: "function"
+  def to_str({:date, _} = d), do: method(d, "toString", [])
+  def to_str({:bytes, b}), do: b
+  def to_str({:proxy, t, _}), do: to_str(t)
+  # a cell: honor a guest `toString`, else Error-shape (`Name: message`), else the object tag.
+  def to_str({:cell, _} = c) do
+    cond do
+      match?({:fn, _}, oget(c, "toString")) -> to_str(invoke(oget(c, "toString"), c, []))
+      oget(c, "message") != :undefined or oget(c, "name") != :undefined ->
+        nm = case oget(c, "name") do :undefined -> "Error"; n -> to_str(n) end
+        case oget(c, "message") do :undefined -> nm; "" -> nm; m -> nm <> ": " <> to_str(m) end
+      true -> "[object Object]"
+    end
+  end
   def to_str(:infinity), do: "Infinity"
   def to_str(:neg_infinity), do: "-Infinity"
   def to_str(:nan), do: "NaN"
@@ -1697,6 +1849,8 @@ defmodule TinyLasers.Gate.Runtime do
   @doc "for-of iteration items: array elements, or a string's chars (1-char binaries)."
   def iter({:arr, _} = a), do: al(a)
   def iter({:set, _} = st), do: set_list(st)
+  def iter({:ta, _, _, _, _} = ta), do: ta_elems(ta)
+  def iter({:map, _} = mp), do: Enum.map(map_pairs(mp), fn {k, v} -> avec([k, v]) end)
   def iter(s) when is_binary(s), do: for <<c::utf8 <- s>>, do: <<c::utf8>>
   def iter(_), do: []
 
@@ -1727,6 +1881,8 @@ defmodule TinyLasers.Gate.Runtime do
   def typeof({:bytes, _}), do: "object"
   def typeof({:proxy, t, _}), do: typeof(t)
   def typeof({:date, _}), do: "object"
+  def typeof({:ta, _, _, _, _}), do: "object"
+  def typeof({:abuf, _, _}), do: "object"
   def typeof({:textdecoder}), do: "object"
   def typeof({:textencoder}), do: "object"
   def typeof(_), do: "object"

@@ -3,6 +3,15 @@
 // Layered AFTER cjs_prelude (which defines module/exports/require/process/globalThis) and OVERRIDES its
 // stub require with a dispatching one.
 
+// ── console (log → host print; warn/error/etc are stderr in node, so no-op for stdout-captured output) ──
+var console = {
+  log: function(){ print(arguments[0]); },
+  info: function(){ print(arguments[0]); },
+  warn: function(){}, error: function(){}, debug: function(){}, trace: function(){},
+  group: function(){}, groupEnd: function(){}, groupCollapsed: function(){}, table: function(){},
+  dir: function(){}, assert: function(){}, count: function(){}, time: function(){}, timeEnd: function(){}
+};
+
 // ── events.EventEmitter ──
 function EventEmitter() { this._events = {}; }
 EventEmitter.prototype.on = function(ev, fn) { (this._events[ev] || (this._events[ev] = [])).push(fn); return this; };
