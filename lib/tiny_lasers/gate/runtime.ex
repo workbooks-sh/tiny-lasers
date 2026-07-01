@@ -364,6 +364,9 @@ defmodule TinyLasers.Gate.Runtime do
     avec(Enum.flat_map(parts, fn {:spread, v} -> iter(v); {:one, v} -> [v] end))
   end
 
+  @doc "Flatten call arguments with spread elements into a plain args list (`f(...xs, y)`)."
+  def spread_args(parts), do: Enum.flat_map(parts, fn {:spread, v} -> iter(v); {:one, v} -> [v] end)
+
   # ── regex as a CAPABILITY (backed by Elixir Regex, returns guest values, stays confined). A regex is a
   # guest-safe term `{:regex, compiled, source, flags}`; the guest can only pass it to the regex methods. ──
   @doc "Compile a guest regex. JS flags i/m/s/u/x map to Elixir opts; g is applied at match/replace time."

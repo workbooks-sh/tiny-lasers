@@ -357,7 +357,7 @@ defmodule TinyLasers.Gate.Lower do
   # generic `new F(args)`: construct via the Runtime (fresh `this` cell, invoke the constructor, return the
   # instance). Handles new Lexer(opts), new Error(msg), etc.
   defp expr(%{"type" => "NewExpression"} = n, scope) do
-    argq = Enum.map(n["arguments"] || [], &expr(&1, scope))
+    argq = args_of(n["arguments"], scope)
     quote(do: unquote(@runtime).construct(unquote(expr(n["callee"], scope)), unquote(argq)))
   end
   defp expr(%{"type" => "Identifier", "name" => n}, scope), do: ident(n, scope)
@@ -423,7 +423,7 @@ defmodule TinyLasers.Gate.Lower do
   # `{:mut, new_recv, result}`; when the receiver is an identifier we rebind it (JS in-place mutation).
   defp expr(%{"type" => "CallExpression", "callee" => %{"type" => "MemberExpression", "computed" => false} = m} = c, scope) do
     name = key_of(m["property"])
-    argq = Enum.map(c["arguments"], &expr(&1, scope))
+    argq = args_of(c["arguments"], scope)
 
     case m["object"] do
       # identifier receiver: rebind it if the method mutated (a.push(x))
@@ -595,7 +595,7 @@ defmodule TinyLasers.Gate.Lower do
   end
 
   defp expr(%{"type" => "CallExpression"} = c, scope) do
-    argq = Enum.map(c["arguments"], &expr(&1, scope))
+    argq = args_of(c["arguments"], scope)
     quote(do: unquote(@runtime).call(unquote(expr(c["callee"], scope)), unquote(argq)))
   end
 
@@ -847,6 +847,22 @@ defmodule TinyLasers.Gate.Lower do
   defp boxed_set(decls, body) do
     captured = MapSet.new(nested_refs(body))
     decls |> Enum.filter(&MapSet.member?(captured, &1)) |> MapSet.new()
+  end
+
+  # call/new argument list, spread-aware: `f(...xs, y)` flattens iterables at runtime.
+  defp args_of(arguments, scope) do
+    args = arguments || []
+    if Enum.any?(args, &(&1["type"] == "SpreadElement")) do
+      parts =
+        Enum.map(args, fn
+          %{"type" => "SpreadElement", "argument" => a} -> quote(do: {:spread, unquote(expr(a, scope))})
+          e -> quote(do: {:one, unquote(expr(e, scope))})
+        end)
+
+      quote(do: unquote(@runtime).spread_args(unquote(parts)))
+    else
+      Enum.map(args, &expr(&1, scope))
+    end
   end
 
   defp not_boxed(names, scope), do: Enum.reject(names, &(scope[:boxed] && MapSet.member?(scope.boxed, &1)))
