@@ -516,11 +516,6 @@ defmodule TinyLasers.Gate.Runtime do
   end
 
   def method(s, "charCodeAt", [i | _]) when is_binary(s) do
-    if System.get_env("CCLOG") do
-      n = Process.get(:gg_ccn, 0) + 1; Process.put(:gg_ccn, n)
-      if rem(n, 200000) == 0, do: IO.puts(:stderr, "CC ##{n} pos=#{inspect(i)} char=#{inspect(binary_part(s, min(trunc(i),byte_size(s)-1), 1))}")
-      if n > 2_000_000, do: throw({:gg_guest_error, "CCLOOP pos=#{trunc(i)}"})
-    end
     case :binary.at(s, trunc(i)) do
       b when is_integer(b) -> b * 1.0
     end
@@ -786,6 +781,7 @@ defmodule TinyLasers.Gate.Runtime do
 
   @doc "ToNumber coercion (public: unary + uses it)."
   def to_number(x) when is_number(x), do: x
+  def to_number(x) when x in [:infinity, :neg_infinity, :nan], do: x
   def to_number(true), do: 1.0
   def to_number(false), do: 0.0
   def to_number(s) when is_binary(s) do
@@ -1003,6 +999,20 @@ defmodule TinyLasers.Gate.Runtime do
   def binop(:*, a, b) when is_number(a) and is_number(b), do: a * b
   def binop(:/, a, b) when is_number(a) and is_number(b) and b != 0, do: a / b
   def binop(:/, _a, _b), do: guest_error("division by zero")
+  # ±Infinity in relational comparisons (rank-ordered; NaN comparisons are always false, handled by fallback).
+  def binop(op, a, b) when op in [:<, :>, :"<=", :">="] and (a == :infinity or a == :neg_infinity or b == :infinity or b == :neg_infinity) do
+    case {rel_key(a), rel_key(b)} do
+      {nil, _} -> false
+      {_, nil} -> false
+      {ka, kb} -> case op do
+        :< -> ka < kb
+        :> -> ka > kb
+        :"<=" -> ka <= kb
+        :">=" -> ka >= kb
+      end
+    end
+  end
+
   def binop(:<, a, b) when is_number(a) and is_number(b), do: a < b
   def binop(:>, a, b) when is_number(a) and is_number(b), do: a > b
   def binop(:"<=", a, b) when is_number(a) and is_number(b), do: a <= b
@@ -1062,10 +1072,21 @@ defmodule TinyLasers.Gate.Runtime do
 
   defp bitop(a, b, f), do: to_int32(f.(to_int32(a), to_int32(b))) * 1.0
 
+  defp rel_key(:infinity), do: {2, 0}
+  defp rel_key(:neg_infinity), do: {0, 0}
+  defp rel_key(x) when is_number(x), do: {1, x}
+  defp rel_key(_), do: nil
+
   defp arith(a, b, f) do
     na = to_number(a)
     nb = to_number(b)
-    if is_number(na) and is_number(nb), do: f.(na, nb), else: :nan
+    cond do
+      is_number(na) and is_number(nb) -> f.(na, nb)
+      # 0 - (±Infinity) negates it (covers unary minus); anything else with an infinity stays infinite/NaN.
+      a == 0.0 and nb == :infinity -> :neg_infinity
+      a == 0.0 and nb == :neg_infinity -> :infinity
+      true -> :nan
+    end
   end
 
   def truthy(false), do: false
@@ -1106,6 +1127,9 @@ defmodule TinyLasers.Gate.Runtime do
   def to_str({:host, _}), do: "function"
   def to_str({:arr, _} = a), do: al(a) |> Enum.map(fn v -> if v in [:undefined, :null], do: "", else: to_str(v) end) |> Enum.join(",")
   def to_str({:regex, _, src, flags}), do: "/" <> src <> "/" <> flags
+  def to_str(:infinity), do: "Infinity"
+  def to_str(:neg_infinity), do: "-Infinity"
+  def to_str(:nan), do: "NaN"
   def to_str(_), do: "[unknown]"
 
   defp set_list({:set, id}), do: Process.get({:gg_set, id}, [])
@@ -1177,6 +1201,9 @@ defmodule TinyLasers.Gate.Runtime do
   def typeof({:regex, _, _, _}), do: "object"
   def typeof({:global, _}), do: "function"
   def typeof({:globalfn, _}), do: "function"
+  def typeof(:infinity), do: "number"
+  def typeof(:neg_infinity), do: "number"
+  def typeof(:nan), do: "number"
   def typeof(:null), do: "object"
   def typeof(_), do: "object"
 

@@ -905,6 +905,10 @@ defmodule TinyLasers.Gate.Lower do
       # a boxed local reads through its box (shared mutable closure variable)
       scope[:boxed] && MapSet.member?(scope.boxed, n) -> quote(do: unquote(@runtime).box_get(unquote(lvar(n))))
       MapSet.member?(scope.locals, n) -> lvar(n)
+      # numeric global constants
+      n == "Infinity" and not MapSet.member?(scope.locals, n) -> :infinity
+      n == "NaN" and not MapSet.member?(scope.locals, n) -> :nan
+      n == "undefined" and not MapSet.member?(scope.locals, n) -> :undefined
       # global namespaces (Object.keys, Math.floor, JSON.parse…) and bare global functions (parseInt…). Only
       # if not shadowed by a local/func — these are plain guest values ({:global}/{:globalfn} tags), not host refs.
       n in ~w(globalThis self window) and not MapSet.member?(scope.locals, n) -> {:{}, [], [:globalobj]}
