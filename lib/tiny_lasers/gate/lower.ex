@@ -110,7 +110,7 @@ defmodule TinyLasers.Gate.Lower do
   defp stmt(%{"type" => "FunctionDeclaration", "id" => %{"name" => n}} = f, scope) do
     key = fnkey(n, f)
     scope = %{scope | funcs: MapSet.put(scope[:funcs] || MapSet.new(), n), fnmap: Map.put(scope[:fnmap] || %{}, n, key)}
-    fq = func(f["params"], f["body"], scope)
+    fq = func(f["params"], f["body"], scope, f["async"] == true)
     {quote(do: unquote(@runtime).greg_set(unquote(key), unquote(fq))), scope}
   end
 
@@ -923,7 +923,12 @@ defmodule TinyLasers.Gate.Lower do
   end
 
   defp expr(%{"type" => t} = f, scope) when t in ["FunctionExpression", "ArrowFunctionExpression"],
-    do: func(f["params"], f["body"], scope)
+    do: func(f["params"], f["body"], scope, f["async"] == true)
+
+  # `await x`: in the eager/synchronous promise model, unwrap a settled promise to its value (rejected → throw,
+  # caught by the enclosing async fn's promise_from → rejected promise). Non-promises pass through.
+  defp expr(%{"type" => "AwaitExpression", "argument" => a}, scope),
+    do: quote(do: unquote(@runtime).await_(unquote(expr(a, scope))))
 
   defp expr(nil, _), do: :undefined
   defp expr(_other, _scope), do: :undefined
@@ -935,7 +940,7 @@ defmodule TinyLasers.Gate.Lower do
   # a guest function as a directly-held closure with the (this, args) ABI. Recursion/forward/mutual refs are
   # handled by the late-bound function registry (a function name resolves to Runtime.greg_get at each use),
   # so no Y-combinator is needed here. `this` binds the method receiver; ThisExpression lowers to __ggthis.
-  defp func(params, body, scope) do
+  defp func(params, body, scope, async? \\ false) do
     names = Enum.flat_map(params, &pattern_names/1)
     argvar = Macro.var(:__ggargs, __MODULE__)
     thisvar = Macro.var(:__ggthis, __MODULE__)
@@ -1003,35 +1008,56 @@ defmodule TinyLasers.Gate.Lower do
     nreturns = count_returns(stmts_list)
     last = List.last(stmts_list)
     tail_return? = nreturns == 0 or (nreturns == 1 and last && last["type"] == "ReturnStatement")
+    prelude = hoistq ++ param_box_inits ++ binds ++ argbind
 
-    if tail_return? do
-      {value_stmts, _} =
-        if last && last["type"] == "ReturnStatement" do
-          {init, sc} = stmts(Enum.drop(stmts_list, -1), bscope)
-          {init ++ [expr(last["argument"] || %{"type" => "Literal", "value" => nil}, sc)], sc}
-        else
-          {sq, sc} = stmts(stmts_list, bscope)
-          {sq ++ [:undefined], sc}
+    cond do
+      # an ASYNC function ALWAYS returns a promise: run the body inside promise_from, which resolves with the
+      # result (awaits settle synchronously in the eager model) or rejects on a thrown guest error/rejected await.
+      async? ->
+        {bq, _} = stmts(stmts_list, bscope)
+        quote do
+          unquote(@runtime).closure(fn unquote(thisvar), unquote(argvar) ->
+            unquote_splicing(prelude)
+            unquote(@runtime).promise_from(fn ->
+              try do
+                unquote_splicing(bq ++ [:undefined])
+              catch
+                :throw, {:gg_return, v} -> v
+              end
+            end)
+          end)
         end
 
-      quote do
-        unquote(@runtime).closure(fn unquote(thisvar), unquote(argvar) ->
-          unquote_splicing(hoistq ++ param_box_inits ++ binds ++ argbind ++ value_stmts)
-        end)
-      end
-    else
-      {bq, _} = stmts(stmts_list, bscope)
-
-      quote do
-        unquote(@runtime).closure(fn unquote(thisvar), unquote(argvar) ->
-          try do
-            unquote_splicing(hoistq ++ param_box_inits ++ binds ++ argbind ++ bq)
-            :undefined
-          catch
-            :throw, {:gg_return, v} -> v
+      # #6 direct-return optimization: returns only at the tail → the block's value IS the result, no try/catch.
+      tail_return? ->
+        {value_stmts, _} =
+          if last && last["type"] == "ReturnStatement" do
+            {init, sc} = stmts(Enum.drop(stmts_list, -1), bscope)
+            {init ++ [expr(last["argument"] || %{"type" => "Literal", "value" => nil}, sc)], sc}
+          else
+            {sq, sc} = stmts(stmts_list, bscope)
+            {sq ++ [:undefined], sc}
           end
-        end)
-      end
+
+        quote do
+          unquote(@runtime).closure(fn unquote(thisvar), unquote(argvar) ->
+            unquote_splicing(prelude ++ value_stmts)
+          end)
+        end
+
+      true ->
+        {bq, _} = stmts(stmts_list, bscope)
+
+        quote do
+          unquote(@runtime).closure(fn unquote(thisvar), unquote(argvar) ->
+            try do
+              unquote_splicing(prelude ++ bq)
+              :undefined
+            catch
+              :throw, {:gg_return, v} -> v
+            end
+          end)
+        end
     end
   end
 

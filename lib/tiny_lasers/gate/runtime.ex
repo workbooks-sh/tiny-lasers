@@ -1052,6 +1052,27 @@ defmodule TinyLasers.Gate.Runtime do
   defp elem_key({:promise, id}), do: {:gg_prom, id}
   defp invoke_if(f, args), do: (if match?({:fn, _}, f) or match?({:host, _}, f), do: invoke(f, :undefined, args), else: :undefined)
 
+  @doc "Run an async function body thunk, producing a promise: resolves with its (awaited) result, or rejects
+  on a thrown guest error / rejected await. A thunk returning a promise adopts it (via settle-flattening)."
+  def promise_from(thunk) do
+    try do
+      settle(new_promise(), :fulfilled, thunk.())
+    catch
+      :throw, {:gg_guest_error, e} -> settle(new_promise(), :rejected, e)
+      :throw, {:gg_throw, e} -> settle(new_promise(), :rejected, e)
+    end
+  end
+
+  @doc "`await x`: unwrap a settled promise (rejected → re-throw the reason); non-promises pass through."
+  def await_({:promise, _} = p) do
+    case prom_state(p) do
+      {:fulfilled, v, _} -> v
+      {:rejected, e, _} -> throw_val(e)
+      {:pending, _, _} -> :undefined
+    end
+  end
+  def await_(v), do: v
+
   defp promise_static("resolve", [v | _]), do: (if match?({:promise, _}, v), do: v, else: settle(new_promise(), :fulfilled, v))
   defp promise_static("resolve", []), do: settle(new_promise(), :fulfilled, :undefined)
   defp promise_static("reject", [e | _]), do: settle(new_promise(), :rejected, e)
