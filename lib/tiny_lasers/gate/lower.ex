@@ -117,7 +117,7 @@ defmodule TinyLasers.Gate.Lower do
     alt = if n["alternate"], do: elem(stmt(n["alternate"], scope), 0), else: nil
 
     mutated =
-      (assigned_names(n["consequent"]) ++ assigned_names(n["alternate"])) |> Enum.uniq()
+      (assigned_names(n["consequent"]) ++ assigned_names(n["alternate"])) |> Enum.uniq() |> not_boxed(scope)
 
     if mutated == [] do
       q = quote(do: if(unquote(@runtime).truthy(unquote(t)), do: unquote(cons), else: unquote(alt || :undefined)))
@@ -157,6 +157,7 @@ defmodule TinyLasers.Gate.Lower do
       |> Enum.flat_map(&assigned_names/1)
       |> Kernel.++(assigned_names(n["init"]))
       |> Enum.uniq()
+      |> not_boxed(scope)
 
     statevars = Enum.map(mutated, &lvar/1)
     state_tuple = {:{}, [], statevars}
@@ -208,6 +209,7 @@ defmodule TinyLasers.Gate.Lower do
     mutated =
       (assigned_names(n["block"]) ++ (handler && assigned_names(handler["body"]) || []))
       |> Enum.uniq()
+      |> not_boxed(scope)
 
     state = {:{}, [], Enum.map(mutated, &lvar/1)}
     inits = for v <- mutated, not MapSet.member?(scope.locals, v), do: quote(do: unquote(lvar(v)) = :undefined)
@@ -304,7 +306,7 @@ defmodule TinyLasers.Gate.Lower do
     itemsfn = if kind == :of, do: :iter, else: :enum_keys
     itemsq = quote(do: unquote(@runtime).unquote(itemsfn)(unquote(expr(n["right"], scope))))
 
-    mutated = (assigned_names(n["body"]) -- [vn]) |> Enum.uniq()
+    mutated = (assigned_names(n["body"]) -- [vn]) |> Enum.uniq() |> not_boxed(scope)
     inits = for v <- mutated, not MapSet.member?(scope.locals, v), do: quote(do: unquote(lvar(v)) = :undefined)
     state = {:{}, [], Enum.map(mutated, &lvar/1)}
     loop = Macro.var(:gg_feach, __MODULE__)
@@ -492,7 +494,12 @@ defmodule TinyLasers.Gate.Lower do
   end
 
   # assign `valq` to a target (Identifier or MemberExpression), rebuilding the chain up to the root identifier.
-  defp assign_to(%{"type" => "Identifier", "name" => n}, valq, scope), do: quote(do: unquote(lvar(n)) = unquote(valq))
+  # A boxed root is written through its box (never rebound — that would destroy the shared box).
+  defp assign_to(%{"type" => "Identifier", "name" => n}, valq, scope) do
+    if scope[:boxed] && MapSet.member?(scope.boxed, n),
+      do: quote(do: unquote(@runtime).box_set(unquote(lvar(n)), unquote(valq))),
+      else: quote(do: unquote(lvar(n)) = unquote(valq))
+  end
 
   defp assign_to(%{"type" => "MemberExpression"} = m, valq, scope) do
     kq = if m["computed"], do: expr(m["property"], scope), else: key_of(m["property"])
@@ -615,7 +622,11 @@ defmodule TinyLasers.Gate.Lower do
           else: quote(do: unquote(lvar(p)) = unquote(av))
       end)
 
-    bscope = %{scope | locals: inner, boxed: MapSet.union(scope[:boxed] || MapSet.new(), boxed)}
+    # a param/var here SHADOWS an outer boxed var of the same name — the inner one is a distinct variable, so
+    # drop shadowed names from the inherited boxed set before unioning this scope's boxed vars.
+    shadow = MapSet.new(names ++ bodyvars)
+    inherited = MapSet.difference(scope[:boxed] || MapSet.new(), shadow)
+    bscope = %{scope | locals: inner, boxed: MapSet.union(inherited, boxed)}
 
     # #6 direct-return optimization: if returns appear ONLY at the body's tail (or not at all), compile
     # without the try/catch/throw machinery — the block's value IS the result. Avoids one throw+catch per call
@@ -792,6 +803,8 @@ defmodule TinyLasers.Gate.Lower do
     captured = MapSet.new(nested_refs(body))
     decls |> Enum.filter(&MapSet.member?(captured, &1)) |> MapSet.new()
   end
+
+  defp not_boxed(names, scope), do: Enum.reject(names, &(scope[:boxed] && MapSet.member?(scope.boxed, &1)))
 
   defp strip_breaks(stmts), do: Enum.reject(stmts || [], &(&1["type"] == "BreakStatement"))
   defp block_of(stmts), do: %{"type" => "BlockStatement", "body" => stmts}
