@@ -418,6 +418,12 @@ defmodule TinyLasers.Gate.Lower do
     members = (n["body"] && n["body"]["body"]) || []
     ctor = Enum.find(members, &(&1["kind"] == "constructor"))
 
+    # ES6 inheritance: `class C extends S`. Bind the superclass value to a hidden local so the ctor/methods can
+    # invoke it (super()/super.m()), rewrite Super nodes, and link the prototype chain after the ctor exists.
+    sup = n["superClass"]
+    sn = "__ggsuper$#{n["start"]}"
+    rw = fn node -> if sup, do: rw_super(node, sn), else: node end
+
     cid = %{"type" => "Identifier", "name" => name}
     proto = member_of(cid, ident_key("prototype"), false)
 
@@ -427,31 +433,67 @@ defmodule TinyLasers.Gate.Lower do
       # carry the class's `start` so the ctor's greg key (fnkey) matches the enclosing-scope hoist below.
       "start" => n["start"],
       "params" => (ctor && ctor["value"]["params"]) || [],
-      "body" => (ctor && ctor["value"]["body"]) || %{"type" => "BlockStatement", "body" => []}
+      "body" => rw.((ctor && ctor["value"]["body"]) || %{"type" => "BlockStatement", "body" => []})
     }
 
     member_stmts =
       for mth <- members, mth["kind"] != "constructor" do
         target = if mth["static"], do: cid, else: proto
         key = mth["key"]
+        # the method fn IS the super scope: rewrite its body (rw_super stops at nested fns, so calling it on the
+        # whole FunctionExpression would skip the body entirely).
+        mval = if sup, do: Map.put(mth["value"], "body", rw_super(mth["value"]["body"], sn)), else: mth["value"]
 
         case mth["kind"] do
           k when k in ["method", nil] ->
             expr_stmt(%{"type" => "AssignmentExpression", "operator" => "=",
-              "left" => member_of(target, key, mth["computed"]), "right" => mth["value"]})
+              "left" => member_of(target, key, mth["computed"]), "right" => mval})
 
           k when k in ["get", "set"] ->
             # Object.defineProperty(target, key, { <get|set>: fn })
             desc = %{"type" => "ObjectExpression", "properties" => [
-              %{"type" => "Property", "key" => ident_key(k), "value" => mth["value"], "computed" => false, "kind" => "init"}
+              %{"type" => "Property", "key" => ident_key(k), "value" => mval, "computed" => false, "kind" => "init"}
             ]}
             expr_stmt(call_expr(member_of(obj_id("Object"), ident_key("defineProperty"), false),
               [target_key_expr(target, key, mth["computed"]), desc]))
         end
       end
 
-    stmts([ctor_decl | member_stmts], scope)
+    if sup do
+      # bind the superclass VALUE in the greg registry (globally reachable from every method/ctor closure — a
+      # captured local wouldn't work: `sn` is synthesised during lowering, after the enclosing function's
+      # capture/box analysis already ran). Methods reference `sn` as a greg-backed name.
+      scope_f = scope
+                |> Map.put(:funcs, MapSet.put(scope[:funcs] || MapSet.new(), sn))
+                |> Map.put(:fnmap, Map.put(scope[:fnmap] || %{}, sn, sn))
+      {lowered, sc} = stmts([ctor_decl | member_stmts], scope_f)
+      setsuperq = quote(do: unquote(@runtime).greg_set(unquote(sn), unquote(expr(sup, scope))))
+      childq = quote(do: unquote(@runtime).greg_get(unquote(fnkey(name, ctor_decl))))
+      linkq = quote(do: unquote(@runtime).set_proto_chain(unquote(childq), unquote(@runtime).greg_get(unquote(sn))))
+      {block([setsuperq | lowered] ++ [linkq]), sc}
+    else
+      stmts([ctor_decl | member_stmts], scope)
+    end
   end
+
+  # rewrite `super(...)` / `super.m(...)` / `super.m` against a bound superclass local `sn`. super() invokes the
+  # parent constructor with the current `this`; super.m(...) invokes the parent-prototype method with `this`.
+  # Does not descend into nested regular functions (they open a new super scope); arrows inherit and ARE rewritten.
+  defp rw_super(%{"type" => "CallExpression", "callee" => %{"type" => "Super"}} = c, sn) do
+    %{c | "callee" => member_of(ident_key(sn), ident_key("call"), false),
+          "arguments" => [%{"type" => "ThisExpression"} | Enum.map(c["arguments"] || [], &rw_super(&1, sn))]}
+  end
+  defp rw_super(%{"type" => "CallExpression", "callee" => %{"type" => "MemberExpression", "object" => %{"type" => "Super"}} = m} = c, sn) do
+    protom = member_of(member_of(ident_key(sn), ident_key("prototype"), false), m["property"], m["computed"])
+    %{c | "callee" => member_of(protom, ident_key("call"), false),
+          "arguments" => [%{"type" => "ThisExpression"} | Enum.map(c["arguments"] || [], &rw_super(&1, sn))]}
+  end
+  defp rw_super(%{"type" => "MemberExpression", "object" => %{"type" => "Super"}} = m, sn),
+    do: %{m | "object" => member_of(ident_key(sn), ident_key("prototype"), false), "property" => rw_super(m["property"], sn)}
+  defp rw_super(%{"type" => ft} = n, _sn) when ft in ["FunctionExpression", "FunctionDeclaration"], do: n
+  defp rw_super(%{} = node, sn), do: Map.new(node, fn {k, v} -> {k, rw_super(v, sn)} end)
+  defp rw_super(list, sn) when is_list(list), do: Enum.map(list, &rw_super(&1, sn))
+  defp rw_super(x, _sn), do: x
 
   defp stmt(other, scope), do: {expr(other, scope), scope}
 

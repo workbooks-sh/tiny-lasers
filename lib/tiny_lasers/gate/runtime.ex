@@ -983,6 +983,19 @@ defmodule TinyLasers.Gate.Runtime do
     proto == target or instanceof_chain((case proto do {:cell, pid} -> Process.get({:gg_instproto, pid}); _ -> nil end), target)
   end
 
+  @doc "Link a child constructor's prototype to its parent's (ES6 `class Child extends Parent`), so inherited
+  instance methods resolve by walking child.prototype -> parent.prototype. Also records the ctor-level super
+  link for static inheritance."
+  def set_proto_chain({:fn, _} = child, {:fn, _} = parent) do
+    {:cell, cid} = fn_proto(child)
+    Process.put({:gg_instproto, cid}, fn_proto(parent))
+    Process.put({:gg_superctor, child_key(child)}, parent)
+    :undefined
+  end
+  def set_proto_chain(_, _), do: :undefined
+
+  defp child_key({:fn, f}), do: f
+
   # a function's prototype cell (stable per closure) — the ES5 method bag for `new Ctor()` instances.
   defp fn_proto({:fn, f}) do
     case Process.get(:gg_fnproto, %{}) |> Map.get(f) do
@@ -1089,7 +1102,10 @@ defmodule TinyLasers.Gate.Runtime do
 
   def call({:host, cap_id}, args), do: host_call(cap_id, args)
   def call(nc, args) do
-    if System.get_env("GAPLOG"), do: IO.puts(:stderr, "GAP call on #{inspect(nc) |> String.slice(0, 60)} args=#{inspect(args) |> String.slice(0, 80)}")
+    if System.get_env("GAPLOG") do
+      st = Process.info(self(), :current_stacktrace) |> elem(1) |> Enum.filter(fn {m,_,_,_} -> m |> to_string() |> String.contains?("Guest") end) |> Enum.take(3) |> Enum.map(fn {_,f,a,_} -> "#{f}/#{a}" end)
+      IO.puts(:stderr, "GAP call on #{inspect(nc) |> String.slice(0, 40)} args=#{inspect(args) |> String.slice(0, 40)} @ #{Enum.join(st, " <- ")}")
+    end
     if System.get_env("GAPSOFT"), do: :undefined, else: guest_error("not a function")
   end
 
