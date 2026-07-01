@@ -923,7 +923,7 @@ defmodule TinyLasers.Gate.Lower do
   end
 
   defp expr(%{"type" => t} = f, scope) when t in ["FunctionExpression", "ArrowFunctionExpression"],
-    do: func(f["params"], f["body"], scope, f["async"] == true)
+    do: func(f["params"], f["body"], scope, f["async"] == true, t == "ArrowFunctionExpression")
 
   # `await x`: in the eager/synchronous promise model, unwrap a settled promise to its value (rejected → throw,
   # caught by the enclosing async fn's promise_from → rejected promise). Non-promises pass through.
@@ -940,10 +940,13 @@ defmodule TinyLasers.Gate.Lower do
   # a guest function as a directly-held closure with the (this, args) ABI. Recursion/forward/mutual refs are
   # handled by the late-bound function registry (a function name resolves to Runtime.greg_get at each use),
   # so no Y-combinator is needed here. `this` binds the method receiver; ThisExpression lowers to __ggthis.
-  defp func(params, body, scope, async? \\ false) do
+  defp func(params, body, scope, async? \\ false, arrow? \\ false) do
     names = Enum.flat_map(params, &pattern_names/1)
     argvar = Macro.var(:__ggargs, __MODULE__)
-    thisvar = Macro.var(:__ggthis, __MODULE__)
+    # a regular function binds `this` (__ggthis) from its call-time receiver; an ARROW inherits `this`
+    # lexically, so it must NOT rebind __ggthis — use a throwaway param and let the body's ThisExpression
+    # (which lowers to __ggthis) capture the enclosing binding (the program binds __ggthis at the top).
+    thisvar = if arrow?, do: Macro.var(:__ggthis_lex_ignored, __MODULE__), else: Macro.var(:__ggthis, __MODULE__)
     # hoist this function's `var` declarations (JS function scope), pre-bound to :undefined.
     bodyvars = collect_vars(body) |> Enum.uniq() |> Enum.reject(&(&1 in names))
     uses_args? = "arguments" in all_idents(body)
