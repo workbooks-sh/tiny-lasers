@@ -408,34 +408,69 @@ defmodule TinyLasers.Gate.Lower do
         _ -> "__ggforvar"
       end
 
-    s1 = %{scope | locals: MapSet.put(scope.locals, vn)}
+    label = scope[:pending_label]
+    base = Map.put(scope, :pending_label, nil)
+    s1 = %{base | locals: MapSet.put(base.locals, vn)}
     itemsfn = if kind == :of, do: :iter, else: :enum_keys
-    itemsq = quote(do: unquote(@runtime).unquote(itemsfn)(unquote(expr(n["right"], scope))))
-
-    mutated = (assigned_names(n["body"]) -- [vn]) |> Enum.uniq() |> not_boxed(scope)
-    inits = for v <- mutated, not MapSet.member?(scope.locals, v), do: quote(do: unquote(lvar(v)) = :undefined)
-    state = {:{}, [], Enum.map(mutated, &lvar/1)}
+    itemsq = quote(do: unquote(@runtime).unquote(itemsfn)(unquote(expr(n["right"], base))))
     loop = Macro.var(:gg_feach, __MODULE__)
-    {bodyq, _} = stmt(n["body"], s1)
 
-    q =
-      quote do
-        unquote_splicing(inits)
+    if loop_uses_control?(n["body"]) do
+      tag = System.unique_integer([:positive])
+      sc = Map.put(s1, :loops, [{label, tag, :loop} | (scope[:loops] || [])])
+      {bodyq, _} = stmt(n["body"], sc)
 
-        unquote(loop) = fn
-          me, [__ggitem | __ggrest], unquote(state) ->
-            unquote(lvar(vn)) = __ggitem
-            unquote(bodyq)
-            me.(me, __ggrest, unquote(state))
+      q =
+        quote do
+          unquote(loop) = fn
+            me, [__ggitem | __ggrest] ->
+              unquote(lvar(vn)) = __ggitem
 
-          _me, [], unquote(state) ->
-            unquote(state)
+              try do
+                unquote(bodyq)
+              catch
+                :throw, {:gg_continue, unquote(tag)} -> :ok
+              end
+
+              me.(me, __ggrest)
+
+            _me, [] ->
+              :ok
+          end
+
+          try do
+            unquote(loop).(unquote(loop), unquote(itemsq))
+          catch
+            :throw, {:gg_break, unquote(tag)} -> :ok
+          end
         end
 
-        unquote(state) = unquote(loop).(unquote(loop), unquote(itemsq), unquote(state))
-      end
+      {q, scope}
+    else
+      mutated = (assigned_names(n["body"]) -- [vn]) |> Enum.uniq() |> not_boxed(base)
+      inits = for v <- mutated, not MapSet.member?(base.locals, v), do: quote(do: unquote(lvar(v)) = :undefined)
+      state = {:{}, [], Enum.map(mutated, &lvar/1)}
+      {bodyq, _} = stmt(n["body"], s1)
 
-    {q, scope}
+      q =
+        quote do
+          unquote_splicing(inits)
+
+          unquote(loop) = fn
+            me, [__ggitem | __ggrest], unquote(state) ->
+              unquote(lvar(vn)) = __ggitem
+              unquote(bodyq)
+              me.(me, __ggrest, unquote(state))
+
+            _me, [], unquote(state) ->
+              unquote(state)
+          end
+
+          unquote(state) = unquote(loop).(unquote(loop), unquote(itemsq), unquote(state))
+        end
+
+      {q, scope}
+    end
   end
 
   # ── expressions ──
