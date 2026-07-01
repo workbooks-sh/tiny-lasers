@@ -794,8 +794,15 @@ defmodule TinyLasers.Gate.Runtime do
   def binop(:"<=", a, b) when is_number(a) and is_number(b), do: a <= b
   def binop(:">=", a, b) when is_number(a) and is_number(b), do: a >= b
   def binop(:rem, a, b) when is_number(a) and is_number(b) and b != 0, do: a - b * Float.floor(a / b)
+  # string relational comparison (lexicographic, JS semantics)
+  def binop(:<, a, b) when is_binary(a) and is_binary(b), do: a < b
+  def binop(:>, a, b) when is_binary(a) and is_binary(b), do: a > b
+  def binop(:"<=", a, b) when is_binary(a) and is_binary(b), do: a <= b
+  def binop(:">=", a, b) when is_binary(a) and is_binary(b), do: a >= b
   def binop(:==, a, b), do: a === b
   def binop(:!=, a, b), do: a !== b
+  # relational comparison with a mismatched/non-number operand (`1 < undefined`) is false in JS (NaN).
+  def binop(op, _a, _b) when op in [:<, :>, :"<=", :">="], do: false
   def binop(_op, _a, _b), do: guest_error("bad operands")
 
   def truthy(false), do: false
