@@ -112,6 +112,47 @@ defmodule TinyLasers.Gate.Runtime do
 
   def keys(_), do: []
 
+  # ── F2 DIRECT-TERM objects (Phase 1): held directly by the guest, NOT a handle-table entry, so the BEAM
+  # GC reclaims unreachable objects (H1). Representation `{keys, map}` — an ordered-key list + a binary-keyed
+  # map — is a plain immutable term (no atom/pid/fun), so it is a safe guest value. Mutation is functional
+  # (returns a new tuple); the lowering rebinds the local. ──
+
+  @doc "Empty direct-term object."
+  def olit, do: {[], %{}}
+
+  @doc "Functional property write on a direct-term object (insertion-ordered). Returns a NEW object."
+  def oput({keys, map}, k, v) do
+    k = key_str(k)
+    keys = if Map.has_key?(map, k), do: keys, else: keys ++ [k]
+    {keys, Map.put(map, k, v)}
+  end
+
+  def oput(_not_obj, _k, _v), do: {[], %{}}
+
+  @doc "Property read on a direct-term object. Non-objects read as `:undefined`."
+  def oget({_keys, map}, k), do: Map.get(map, key_str(k), :undefined)
+  def oget(_not_obj, _k), do: :undefined
+
+  @doc "Spread-merge b into a (Object.assign({}, a, b) shape). Returns a NEW object, b's keys last/override."
+  def omerge({ak, amap}, {bk, bmap}) do
+    {keys, map} =
+      Enum.reduce(bk, {ak, amap}, fn k, {ks, m} ->
+        if Map.has_key?(m, k), do: {ks, Map.put(m, k, bmap[k])}, else: {ks ++ [k], Map.put(m, k, bmap[k])}
+      end)
+
+    {keys, map}
+  end
+
+  def omerge(a, _non_obj), do: a
+
+  @doc "Ordered own-keys of a direct-term object."
+  def okeys({keys, _map}), do: keys
+  def okeys(_), do: []
+
+  @doc "A guest function as a DIRECTLY-HELD closure (GC'd, no table). Safe: the guest can only invoke it via
+  `call/2`; no codegen path extracts and `apply`s the raw fun."
+  def closure(f) when is_function(f, 1), do: {:fn, f}
+
   # ── closures (handles, never raw funs) ──
 
   @doc "Register a native closure behind a `{:fun, id}` handle."
@@ -130,6 +171,8 @@ defmodule TinyLasers.Gate.Runtime do
   capability handle. Anything else is a guest TypeError — NOT a host escape.
   There is no path here from guest data to an arbitrary MFA.
   """
+  def call({:fn, f}, args) when is_function(f, 1), do: f.(args)
+
   def call({:fun, id}, args) do
     case Process.get(:gg_funs) |> Map.get(id) do
       f when is_function(f, 1) -> f.(args)
@@ -164,6 +207,9 @@ defmodule TinyLasers.Gate.Runtime do
   def binop(:/, _a, _b), do: guest_error("division by zero")
   def binop(:<, a, b) when is_number(a) and is_number(b), do: a < b
   def binop(:>, a, b) when is_number(a) and is_number(b), do: a > b
+  def binop(:"<=", a, b) when is_number(a) and is_number(b), do: a <= b
+  def binop(:">=", a, b) when is_number(a) and is_number(b), do: a >= b
+  def binop(:rem, a, b) when is_number(a) and is_number(b) and b != 0, do: a - b * Float.floor(a / b)
   def binop(:==, a, b), do: a === b
   def binop(:!=, a, b), do: a !== b
   def binop(_op, _a, _b), do: guest_error("bad operands")
@@ -208,6 +254,10 @@ defmodule TinyLasers.Gate.Runtime do
 
   @doc "A guest-level exception. NOT a host escape — the driver catches it as a guest error."
   def guest_error(reason), do: throw({:gg_guest_error, reason})
+
+  @doc "Guest `return` — throws to the enclosing function-body catch. Routed through the Runtime so the
+  emitted guest module references no external module (keeps the 'only Runtime' confinement invariant literal)."
+  def ret(v), do: throw({:gg_return, v})
 
   # ── DoS primitives (emitted only for the red-team's containment tests) ──
 
