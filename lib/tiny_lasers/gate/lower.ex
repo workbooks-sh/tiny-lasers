@@ -349,8 +349,11 @@ defmodule TinyLasers.Gate.Lower do
   defp expr(%{"type" => "ObjectExpression", "properties" => props}, scope) do
     has_spread = Enum.any?(props, &(&1["type"] == "SpreadElement"))
     has_method = Enum.any?(props, &method_prop?/1)
+    # an EMPTY {} literal is almost always a mutable accumulator/instance-to-be-filled (UMD export, builder
+    # target); a NON-empty data-bag literal is usually complete → immutable (GC'd, the H1 flood).
+    empty = props == []
 
-    if has_method and not has_spread do
+    if (has_method or empty) and not has_spread do
       pairs =
         Enum.map(props, fn p ->
           kq = if p["computed"], do: expr(p["key"], scope), else: key_of(p["key"])
@@ -465,13 +468,25 @@ defmodule TinyLasers.Gate.Lower do
         base = m["object"]
         kq = if m["computed"], do: expr(m["property"], scope), else: key_of(m["property"])
 
+        # JS assignment evaluates to the ASSIGNED VALUE (v), not the container — critical for `a = o.x = v`
+        # and the UMD `(e=g).marked = {}` (whose value must be the new object). Bind rq once, then return it.
+        v = Macro.var(:__ggav, __MODULE__)
+
         case base do
           %{"type" => "Identifier", "name" => n} ->
-            quote(do: unquote(lvar(n)) = unquote(@runtime).oput_idx(unquote(ident(n, scope)), unquote(kq), unquote(rq)))
+            quote do
+              unquote(v) = unquote(rq)
+              unquote(lvar(n)) = unquote(@runtime).oput_idx(unquote(ident(n, scope)), unquote(kq), unquote(v))
+              unquote(v)
+            end
 
           _ ->
-            # nested member target (o.a.b = v): functional update without rebinding the deep base (v0 limit)
-            quote(do: unquote(@runtime).oput_idx(unquote(expr(base, scope)), unquote(kq), unquote(rq)))
+            # in-place on a cell/global base; on an immutable base the update is on a fresh copy (v0 limit)
+            quote do
+              unquote(v) = unquote(rq)
+              unquote(@runtime).oput_idx(unquote(expr(base, scope)), unquote(kq), unquote(v))
+              unquote(v)
+            end
         end
     end
   end
