@@ -169,6 +169,14 @@ defmodule TinyLasers.Gate.Runtime do
     end
   end
 
+  # regex properties (marked's edit() helper reads `re.source` to compose patterns as strings).
+  def oget({:regex, _re, src, _flags}, "source"), do: src
+  def oget({:regex, _re, _src, flags}, "flags"), do: flags
+  def oget({:regex, _re, _src, flags}, "global"), do: String.contains?(flags, "g")
+  def oget({:regex, _re, _src, flags}, "ignoreCase"), do: String.contains?(flags, "i")
+  def oget({:regex, _re, _src, flags}, "multiline"), do: String.contains?(flags, "m")
+  def oget({:regex, _re, _src, _flags}, "lastIndex"), do: 0.0
+
   # string properties: `.length` and index access `s[i]` (JS returns a 1-char string).
   def oget(s, "length") when is_binary(s), do: byte_size(s) * 1.0
   def oget(s, i) when is_binary(s) and is_number(i) do
@@ -822,6 +830,7 @@ defmodule TinyLasers.Gate.Runtime do
   def typeof({:host, _}), do: "function"
   def typeof({:cell, _}), do: "object"
   def typeof({:globalobj}), do: "object"
+  def typeof({:regex, _, _, _}), do: "object"
   def typeof({:global, _}), do: "function"
   def typeof({:globalfn, _}), do: "function"
   def typeof(_), do: "object"
