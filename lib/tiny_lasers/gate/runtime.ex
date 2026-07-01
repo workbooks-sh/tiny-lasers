@@ -146,6 +146,10 @@ defmodule TinyLasers.Gate.Runtime do
   end
 
   @doc "Read a box."
+  @doc "Re-raise an already-wrapped control throw (gg_throw/gg_return/gg_break/…) after a `finally` ran —
+  keeps the guest binary free of a direct :erlang.throw reference (confinement gate)."
+  def rethrow(e), do: throw(e)
+
   def box_get({:box, id}), do: Process.get({:gg_box, id}, :undefined)
   # a value bound plain but read as boxed (analysis over-approximated capture): return it as-is.
   def box_get(v), do: v
@@ -153,19 +157,36 @@ defmodule TinyLasers.Gate.Runtime do
   def box_set({:box, id}, v), do: (Process.put({:gg_box, id}, v); v)
   def box_set(_plain, v), do: v
 
+  @doc """
+  `recv.f?.()` support: true iff the receiver is a property-bag (cell/map/global object) whose `key` property
+  is nullish — the optional call must yield undefined instead of a not-a-function error. Non-bag receivers
+  (strings, arrays, builtins) return false because their methods live in dispatch clauses, not properties.
+  """
+  def optcall_missing?(obj, key) do
+    case obj do
+      {:cell, _} -> is_nullish(oget(obj, key))
+      {:globalobj} -> is_nullish(oget(obj, key))
+      {keys, map} when is_list(keys) and is_map(map) -> is_nullish(oget(obj, key))
+      _ -> false
+    end
+  end
+
   @doc "Property write. A cell mutates in place (shared); an immutable object returns a NEW object."
   def oput({:cell, _} = c, k, v), do: cell_put(c, k, v)
-  def oput({:ta, _, _, _, _} = ta, k, v) when is_number(k), do: (ta_set(ta, trunc(k), v); v)
+  # element write on a typed array mutates the backing buffer and returns the ARRAY — Lower's member-assignment
+  # rebinds the root identifier to oput's return, so returning the value would clobber the variable (the
+  # rollup native-bridge `u8[i] = buf[i]` loop hit exactly this).
+  def oput({:ta, _, _, _, _} = ta, k, v) when is_number(k), do: (ta_set(ta, trunc(k), v); ta)
   # named property on a typed array (JS typed arrays are objects): store in a side table, return the ARRAY
   # (Object.assign(array, {...}) folds oput over the target and relies on it returning the target).
   def oput({:ta, _, _, _, _} = ta, k, v) do
     Process.put({:gg_taprops, ta}, Map.put(Process.get({:gg_taprops, ta}, %{}), key_str(k), v))
     ta
   end
-  # Proxy set trap (target, keyString, value, receiver); falls back to writing the target.
+  # Proxy set trap (target, key, value, receiver) — key stays a symbol when it is one.
   def oput({:proxy, t, h} = px, k, v) do
     case oget(h, "set") do
-      f when elem(f, 0) in [:fn, :host] -> invoke(f, h, [t, key_str(k), v, px]); px
+      f when elem(f, 0) in [:fn, :host] -> invoke(f, h, [t, trap_key(k), v, px]); px
       _ -> oput(t, k, v); px
     end
   end
@@ -201,7 +222,9 @@ defmodule TinyLasers.Gate.Runtime do
   # arrays can carry NAMED properties (JS arrays are objects): `this.tokens.links = {}` — stored in a props
   # map alongside the elements. Numeric keys write elements; named keys write props.
   def oput({:arr, _} = a, k, v), do: arr_put(a, k, v)
-  def oput(_not_obj, _k, _v), do: {[], %{}}
+  # property write on a primitive is a silent no-op (JS sloppy mode) — return the RECEIVER unchanged so a
+  # root-identifier rebind doesn't replace a number/string/undefined with an empty object.
+  def oput(not_obj, _k, _v), do: not_obj
 
   # write to an array IN PLACE: numeric key → element slot; named key → the props map. Returns the same handle.
   defp arr_put({:arr, _} = a, k, v) do
@@ -261,17 +284,27 @@ defmodule TinyLasers.Gate.Runtime do
 
   # a function's `.prototype` is a stable per-function cell (ES5 method bag: `Ctor.prototype.m = fn`).
   def oget({:fn, _} = fnv, "prototype"), do: fn_proto(fnv)
-  def oget({:fn, f}, k), do: (Process.get(:gg_fnprops, %{}) |> Map.get(f, {[], %{}}) |> elem(1) |> Map.get(key_str(k), :undefined))
+  # a {:getter, g} marker on a function object (static class accessor via defineProperty) is invoked on read.
+  def oget({:fn, f} = fnv, k) do
+    case Process.get(:gg_fnprops, %{}) |> Map.get(f, {[], %{}}) |> elem(1) |> Map.get(key_str(k), :undefined) do
+      {:getter, g} -> invoke(g, fnv, [])
+      v -> v
+    end
+  end
   def oget({_keys, map}, k) when is_map(map), do: Map.get(map, key_str(k), :undefined)
   def oget({:set, _} = st, "size"), do: length(set_list(st)) * 1.0
   def oget({:map, _} = mp, "size"), do: length(map_pairs(mp)) * 1.0
-  # Proxy get trap (falls back to the target). The trap receives (target, keyString, receiver).
+  # Proxy get trap (falls back to the target). The trap receives (target, key, receiver) — key stays a
+  # SYMBOL when it is one (rollup: `bundle[lowercaseBundleKeys]` compares the trapped key with ===).
   def oget({:proxy, t, h} = px, k) do
     case oget(h, "get") do
-      f when elem(f, 0) in [:fn, :host] -> invoke(f, h, [t, key_str(k), px])
+      f when elem(f, 0) in [:fn, :host] -> invoke(f, h, [t, trap_key(k), px])
       _ -> oget(t, k)
     end
   end
+
+  defp trap_key({:symbol, _, _} = s), do: s
+  defp trap_key(k), do: key_str(k)
   def oget({:bytes, b}, k) when k in ["length", "byteLength"], do: byte_size(b) * 1.0
   def oget({:bytes, _}, "byteOffset"), do: 0.0
   def oget({:bytes, b}, k) when is_number(k), do: (i = trunc(k); if i >= 0 and i < byte_size(b), do: :binary.at(b, i) * 1.0, else: :undefined)
@@ -345,6 +378,9 @@ defmodule TinyLasers.Gate.Runtime do
 
   def oget({:proto, _}, "toString"), do: {:protom, :tostring}
   def oget({:proto, _}, "hasOwnProperty"), do: {:protom, :hasown}
+  # any other prototype method (`Array.prototype.slice.call(arguments, 1)`): a closure that dispatches the
+  # named method on the receiver, so .call/.apply/.bind ride the normal {:fn} machinery.
+  def oget({:proto, _}, meth) when is_binary(meth), do: closure(fn this, args -> method(this, meth, args) end)
   def oget({:proto, _}, _), do: :undefined
 
   def oget(_not_obj, _k), do: :undefined
@@ -626,9 +662,28 @@ defmodule TinyLasers.Gate.Runtime do
     end
   end
 
-  # `[^]` is JS for "any char incl. newline" but is an empty (invalid) class in PCRE — rewrite to `[\s\S]`.
-  # acorn's skipWhiteSpace `/\/\*[^]*?\*\//` relies on it.
-  defp js_re_to_pcre(src), do: String.replace(src, "[^]", "[\\s\\S]")
+  # JS-only regex syntax → PCRE before compile:
+  #  * `[^]` ("any char incl. newline") is an empty/invalid class in PCRE — rewrite to `[\s\S]`.
+  #  * `\uXXXX` / `\u{X..}` code-point escapes — PCRE spells them `\x{...}` (a failed compile silently
+  #    yields the never-match regex, which broke rollup's VALID_IDENTIFIER_REGEXP → `exports["y"]`).
+  defp js_re_to_pcre(src), do: src |> String.replace("[^]", "[\\s\\S]") |> rx_u_escapes()
+
+  defp rx_u_escapes(src), do: rx_u(src, [])
+  defp rx_u(<<>>, acc), do: IO.iodata_to_binary(Enum.reverse(acc))
+  defp rx_u(<<"\\\\", rest::binary>>, acc), do: rx_u(rest, ["\\\\" | acc])
+  defp rx_u(<<"\\u{", rest::binary>>, acc) do
+    case String.split(rest, "}", parts: 2) do
+      [hex, tail] -> rx_u(tail, ["\\x{" <> hex <> "}" | acc])
+      _ -> rx_u(rest, ["\\u{" | acc])
+    end
+  end
+  defp rx_u(<<"\\u", a, b, c, d, rest::binary>>, acc)
+       when a in ?0..?9 or a in ?a..?f or a in ?A..?F do
+    if Enum.all?([b, c, d], &(&1 in ?0..?9 or &1 in ?a..?f or &1 in ?A..?F)),
+      do: rx_u(rest, ["\\x{" <> <<a, b, c, d>> <> "}" | acc]),
+      else: rx_u(<<a, b, c, d, rest::binary>>, ["\\u" | acc])
+  end
+  defp rx_u(<<ch, rest::binary>>, acc), do: rx_u(rest, [<<ch>> | acc])
 
   def regex(_source, _flags), do: {:regex, ~r/(?!)/, "", ""}
 
@@ -640,17 +695,33 @@ defmodule TinyLasers.Gate.Runtime do
   def method(s, "replace", [{:regex, re, _, _} = rx, f]) when is_binary(s) and (elem(f, 0) == :fn or elem(f, 0) == :host) do
     idxs = Regex.scan(re, s, return: :index)
     idxs = if global?(rx), do: idxs, else: Enum.take(idxs, 1)
+    # JS replacer args are (match, p1..pN, offset, string) with N = the PATTERN's group count; Regex.scan
+    # truncates trailing unmatched optional groups, which would shift offset into a group slot — pad them.
+    ngroups = rx_group_count(re)
 
     {chunks, last} =
       Enum.reduce(idxs, {[], 0}, fn caps, {acc, pos} ->
         [{ms, ml} | _] = caps
         [full | groups] = Enum.map(caps, fn {i, l} -> if i < 0, do: :undefined, else: binary_part(s, i, l) end)
+        groups = groups ++ List.duplicate(:undefined, max(ngroups - length(groups), 0))
         repl = to_str(call(f, [full | groups] ++ [ms * 1.0, s]))
         {[acc, binary_part(s, pos, ms - pos), repl], ms + ml}
       end)
 
     IO.iodata_to_binary([chunks, binary_part(s, last, byte_size(s) - last)])
   end
+
+  # capture-group count of a compiled regex: '(' openers that are real groups (not (?: (?= (?! (?<= (?<!),
+  # counting named groups (?<name>...), skipping escaped parens and char classes.
+  defp rx_group_count(re), do: rx_gc(Regex.source(re), false, 0)
+  defp rx_gc(<<>>, _cc, n), do: n
+  defp rx_gc(<<"\\", _, rest::binary>>, cc, n), do: rx_gc(rest, cc, n)
+  defp rx_gc(<<"[", rest::binary>>, false, n), do: rx_gc(rest, true, n)
+  defp rx_gc(<<"]", rest::binary>>, true, n), do: rx_gc(rest, false, n)
+  defp rx_gc(<<"(?<", c, rest::binary>>, false, n) when c not in [?=, ?!], do: rx_gc(rest, false, n + 1)
+  defp rx_gc(<<"(?", rest::binary>>, false, n), do: rx_gc(rest, false, n)
+  defp rx_gc(<<"(", rest::binary>>, false, n), do: rx_gc(rest, false, n + 1)
+  defp rx_gc(<<_, rest::binary>>, cc, n), do: rx_gc(rest, cc, n)
 
   def method(s, "replace", [{:regex, re, _, _} = rx, repl]) when is_binary(s) do
     Regex.replace(re, s, regex_replacement(repl), global: global?(rx))
@@ -836,6 +907,14 @@ defmodule TinyLasers.Gate.Runtime do
     case List.last(parts) do {pos, _} -> pos * 1.0; _ -> -1.0 end
   end
   def method(s, m, _) when is_binary(s) and m in ["toString", "valueOf", "normalize"], do: s
+  # number toString with optional radix (acorn: `code.toString(16)`); JS emits lowercase digits.
+  def method(n, "toString", args) when is_number(n) do
+    case args do
+      [r | _] when is_number(r) and r != 10.0 -> Integer.to_string(trunc(n), trunc(r)) |> String.downcase()
+      _ -> to_str(n)
+    end
+  end
+  def method(n, "valueOf", _) when is_number(n), do: n
   def method(s, "codePointAt", [i | _]) when is_binary(s) do
     case oget(s, i * 1) do c when is_binary(c) -> (:binary.first(c)) * 1.0; _ -> :undefined end
   end
@@ -1018,6 +1097,13 @@ defmodule TinyLasers.Gate.Runtime do
   # a method call on a Proxy: get the (trapped) property, invoke with this=proxy.
   def method({:proxy, _, _} = px, name, args), do: invoke(oget(px, name), px, args)
 
+  # `Builtin.call(this, …)` / `.apply(this, argsArray)` — a builtin used as a SUPERCLASS ctor: Lower rewrites
+  # `super(...)` to `__ggsuper.call(this, ...)`, and the superclass may be a global (class X extends Set).
+  # Route through invoke, which knows how to initialise a cell `this` from a builtin parent.
+  def method({:global, _} = g, "call", [this | rest]), do: invoke(g, this, rest)
+  def method({:global, _} = g, "apply", [this | rest]),
+    do: invoke(g, this, (case rest do [{:arr, _} = av | _] -> al(av); _ -> [] end))
+
   # Reflect: the default-passthrough operations Proxy handlers delegate to.
   def method({:global, "Reflect"}, name, args), do: reflect_static(name, args)
 
@@ -1039,15 +1125,19 @@ defmodule TinyLasers.Gate.Runtime do
   defp object_static("entries", [o | _]), do: avec(Enum.map(okeys(o), fn k -> avec([k, oget(o, k)]) end))
   defp object_static("getOwnPropertyNames", [o | _]), do: avec(okeys(o))
   defp object_static("assign", [target | sources]), do: Enum.reduce(sources, target, fn s, t -> Enum.reduce(okeys(s), t, fn k, acc -> oput(acc, k, oget(s, k)) end) end)
-  # Object.create(proto): a fresh object whose prototype chain is `proto` (Babel `_inherits`).
-  defp object_static("create", [proto | _]) when proto != :undefined and proto != :null do
+  # Object.create(proto[, props]): a fresh object whose prototype chain is `proto` (Babel `_inherits`), with
+  # optional property descriptors (rollup: `Object.create(null, { [EntitiesKey]: { value: new Set() } })`).
+  defp object_static("create", [proto | rest]) do
     c = cell_new([])
-    {:cell, id} = c
-    Process.put({:gg_instproto, id}, proto)
-    c
+    if proto != :undefined and proto != :null do
+      {:cell, id} = c
+      Process.put({:gg_instproto, id}, proto)
+    end
+    case rest do
+      [props | _] when props != :undefined and props != :null -> object_static("defineProperties", [c, props])
+      _ -> c
+    end
   end
-
-  defp object_static("create", _), do: cell_new([])
   defp object_static("freeze", [o | _]), do: o
   # defineProperty: set `value` if the descriptor carries one (Babel `_createClass` method attach); a
   # value-less descriptor (`{writable:false}` on `Ctor.prototype`) must NOT clobber the existing property.
@@ -1133,6 +1223,7 @@ defmodule TinyLasers.Gate.Runtime do
   def call({:global, "String"}, args), do: to_str(List.first(args) || :undefined)
   def call({:global, "Number"}, args), do: to_number(List.first(args) || :undefined)
   def call({:global, "Boolean"}, args), do: truthy(List.first(args) || :undefined)
+  def call({:global, "Array"}, [n]) when is_number(n), do: avec(List.duplicate(:undefined, trunc(n)))
   def call({:global, "Array"}, args), do: avec(args)
   def call({:global, "Object"}, args), do: List.first(args) || olit()
   def call({:global, err}, args) when err in ["Error", "TypeError", "RangeError", "SyntaxError"], do: construct({:global, err}, args)
@@ -1148,6 +1239,8 @@ defmodule TinyLasers.Gate.Runtime do
   def call({:globalfn, "parseFloat"}, [x | _]), do: to_number(x)
   def call({:globalfn, "isNaN"}, [x | _]), do: not is_number(x)
   def call({:globalfn, "isFinite"}, [x | _]), do: is_number(x)
+  # BigInt(x) — bigints are floats in F2 (same as the $bigint literal lowering); exact >2^53 is a later rung.
+  def call({:globalfn, "BigInt"}, [x | _]), do: to_number(x)
   def call({:globalfn, enc}, [x | _]) when enc in ["encodeURIComponent", "encodeURI"], do: URI.encode(to_str(x))
   def call({:globalfn, dec}, [x | _]) when dec in ["decodeURIComponent", "decodeURI"], do: URI.decode(to_str(x))
   def call({:globalfn, _}, _), do: :undefined
@@ -1425,7 +1518,9 @@ defmodule TinyLasers.Gate.Runtime do
     case prom_state(p) do
       {:fulfilled, v, _} -> v
       {:rejected, e, _} -> throw_val(e)
-      {:pending, _, _} -> :undefined
+      # the eager model has no timers/IO: a promise still pending after a full drain means a resolve was LOST
+      # (a real bug — silently yielding undefined here hid a dead module-graph build for days). Fail loudly.
+      {:pending, _, _} -> guest_error("await on a never-settling promise (lost resolve — eager model has no timers)")
     end
   end
 
@@ -1553,6 +1648,9 @@ defmodule TinyLasers.Gate.Runtime do
   def construct({:global, err}, args) when err in ["Error", "TypeError", "RangeError", "SyntaxError"],
     do: cell_new([{"message", to_str(List.first(args) || "")}, {"name", err}])
 
+  # `new Array(n)` with a single numeric arg is a length-n hole array (rollup: `new Array(list.length)`),
+  # NOT a one-element array containing n.
+  def construct({:global, "Array"}, [n]) when is_number(n), do: avec(List.duplicate(:undefined, trunc(n)))
   def construct({:global, "Array"}, args), do: avec(args)
   # Proxy: {:proxy, target, handler}. Property get/set + method calls route through the handler's traps
   # (falling back to the target). rollup's output bundle is a Proxy over the chunk map.
@@ -1654,6 +1752,29 @@ defmodule TinyLasers.Gate.Runtime do
     guest_error("not a function")
   end
 
+  # ── generators (eager-collect model) ──
+  # A generator call runs its body to completion, collecting yields into a frame; the call returns the
+  # collected values as an array (iterable by for-of/spread exactly like the lazy protocol for finite,
+  # fully-consumed generators — rollup's only uses). Two-way `x = yield` and infinite generators are NOT
+  # supported; a frame stack handles generators calling generators.
+
+  def gen_begin, do: Process.put(:gg_genstack, [[] | Process.get(:gg_genstack, [])])
+  def gen_yield(v) do
+    [h | t] = Process.get(:gg_genstack)
+    Process.put(:gg_genstack, [[v | h] | t])
+    :undefined
+  end
+  def gen_yield_star(v) do
+    [h | t] = Process.get(:gg_genstack)
+    Process.put(:gg_genstack, [Enum.reverse(iter(v)) ++ h | t])
+    :undefined
+  end
+  def gen_end do
+    [h | t] = Process.get(:gg_genstack)
+    Process.put(:gg_genstack, t)
+    avec(Enum.reverse(h))
+  end
+
   # ── closures (handles, never raw funs) ──
 
   @doc "Register a native closure behind a `{:fun, id}` handle."
@@ -1684,8 +1805,8 @@ defmodule TinyLasers.Gate.Runtime do
   def call({:host, cap_id}, args), do: host_call(cap_id, args)
   def call(nc, args) do
     if System.get_env("GAPLOG") do
-      st = Process.info(self(), :current_stacktrace) |> elem(1) |> Enum.filter(fn {m,_,_,_} -> m |> to_string() |> String.contains?("Guest") end) |> Enum.take(3) |> Enum.map(fn {_,f,a,_} -> "#{f}/#{a}" end)
-      IO.puts(:stderr, "GAP call on #{inspect(nc) |> String.slice(0, 40)} args=#{inspect(args) |> String.slice(0, 40)} @ #{Enum.join(st, " <- ")}")
+      st = Process.info(self(), :current_stacktrace) |> elem(1) |> Enum.filter(fn {m,_,_,_} -> m |> to_string() |> String.contains?("Guest") end) |> Enum.take(6) |> Enum.map(fn {_,f,a,_} -> "#{f}/#{a}" end)
+      IO.puts(:stderr, "GAP call on #{inspect(nc) |> String.slice(0, 40)} args=#{inspect(args) |> String.slice(0, 200)} @ #{Enum.join(st, " <- ")}")
     end
     if System.get_env("GAPSOFT"), do: :undefined, else: guest_error("not a function")
   end
@@ -1751,6 +1872,9 @@ defmodule TinyLasers.Gate.Runtime do
   def binop(:bxor, a, b), do: bitop(a, b, &Bitwise.bxor/2)
   def binop(:bsl, a, b), do: bitop(a, b, fn x, y -> Bitwise.bsl(x, Bitwise.band(y, 31)) end)
   def binop(:bsr, a, b), do: bitop(a, b, fn x, y -> Bitwise.bsr(x, Bitwise.band(y, 31)) end)
+  # `a >>> b`: ToUint32(a) shifted right by (b & 31), result UNSIGNED (JS's only unsigned op).
+  def binop(:bsru, a, b), do: Bitwise.bsr(Bitwise.band(to_int32(a), 0xFFFFFFFF), Bitwise.band(to_int32(b), 31)) * 1.0
+  def binop(:pow, a, b), do: arith(a, b, fn x, y -> :math.pow(x, y) end)
   # relational comparison with a mismatched/non-number operand (`1 < undefined`) is false in JS (NaN).
   def binop(op, _a, _b) when op in [:<, :>, :"<=", :">="], do: false
   # arithmetic on non-number operands: JS coerces via ToNumber; a non-coercible operand yields NaN

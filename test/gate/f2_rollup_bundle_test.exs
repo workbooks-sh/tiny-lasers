@@ -25,9 +25,9 @@ defmodule TinyLasers.Gate.F2RollupBundleTest do
     console = "var console = { log: function(){ print(arguments[0]); } };\n"
     bundle = File.read!(Path.join(@conf, "rollup/rollup_bundle.cjs"))
 
-    body = Lower.program(Js.parse(console <> prelude <> bundle), %{"print" => 0, "__host" => 1})
+    body = Lower.module_quoted(Js.parse(console <> prelude <> bundle), %{"print" => 0, "__host" => 1})
     mod = Module.concat([TinyLasers.Gate.Guest, "RollupBundle#{System.unique_integer([:positive])}"])
-    [{m, bin}] = Code.compile_quoted(quote do (defmodule unquote(mod) do def run, do: unquote(body) end) end)
+    [{m, bin} | _] = Code.compile_quoted(quote do (defmodule unquote(mod) do unquote(body) end) end)
 
     # confinement: the compiled rollup engine references ONLY the Runtime (host work — the wasm parser — is a
     # granted capability handle, never a host module ref in the guest binary).

@@ -22,7 +22,7 @@ defmodule TinyLasers.Gate.Walk do
   @globals ~w(Object Array Math JSON String Number Boolean Error TypeError RangeError SyntaxError
               Set Map WeakSet WeakMap Symbol Promise Buffer Proxy Reflect Date TextDecoder TextEncoder
               Uint8Array Int8Array Uint16Array Int16Array Uint32Array Int32Array Float32Array Float64Array ArrayBuffer DataView)
-  @global_fns ~w(parseInt parseFloat isNaN isFinite encodeURIComponent decodeURIComponent encodeURI decodeURI)
+  @global_fns ~w(parseInt parseFloat isNaN isFinite encodeURIComponent decodeURIComponent encodeURI decodeURI BigInt)
 
   # ── entry ──────────────────────────────────────────────────────────────────────────────────────────────
   @doc "Interpret a parsed Program AST. `granted` maps host-capability names → cap ids (like Lower)."
@@ -103,7 +103,7 @@ defmodule TinyLasers.Gate.Walk do
   end
   defp hoist_node(env, sid, %{"type" => "FunctionDeclaration", "id" => %{"name" => n}} = f) do
     box = ensure_box(env, sid, n)
-    Runtime.box_set(box, make_fn(f["params"], f["body"], env, f["async"] == true, false))
+    Runtime.box_set(box, make_fn(f["params"], f["body"], env, f["async"] == true, false, f["generator"] == true))
   end
   defp hoist_node(env, sid, %{"type" => "ClassDeclaration", "id" => %{"name" => n}}), do: ensure_box(env, sid, n)
   defp hoist_node(env, sid, %{"type" => t} = n) when t in ["IfStatement", "ForStatement", "ForInStatement",
@@ -146,14 +146,16 @@ defmodule TinyLasers.Gate.Walk do
     if Runtime.truthy(eval(t, env)), do: exec(c, env), else: (if a, do: exec(a, env))
   end
 
-  defp exec(%{"type" => "ForStatement"} = n, env) do
+  defp exec(%{"type" => "ForStatement"} = n, env), do: exec_for(n, env, nil)
+
+  defp exec_for(n, env, lbl) do
     e2 = push(env)
     case n["init"] do
       %{"type" => "VariableDeclaration"} = d -> hoist([hd(e2)], [d]); exec(d, e2)
       nil -> :ok
       i -> eval(i, e2)
     end
-    loop_for(n, e2)
+    loop_for(n, e2, lbl)
   end
 
   defp exec(%{"type" => "WhileStatement", "test" => t, "body" => b}, env), do: loop_while(t, b, env, nil)
@@ -238,6 +240,12 @@ defmodule TinyLasers.Gate.Walk do
     Enum.reduce(props, Runtime.cell_new([]), fn p, acc ->
       case p do
         %{"type" => "SpreadElement", "argument" => a} -> Runtime.omerge(acc, eval(a, env))
+        # accessor property `{ get x() {…} }` — install a getter marker (cell_oget invokes it on read).
+        # Setters are stored as plain fns only to keep the key visible; property WRITES shadow them (v0 limit).
+        %{"kind" => "get", "key" => k, "value" => v} ->
+          key = if p["computed"], do: eval(k, env), else: key_of(k)
+          Runtime.oput(acc, key, {:getter, eval(v, env)})
+        %{"kind" => "set"} -> acc
         %{"key" => k, "value" => v, "computed" => computed} ->
           key = if computed, do: eval(k, env), else: key_of(k)
           Runtime.oput(acc, key, eval(v, env))
@@ -246,7 +254,16 @@ defmodule TinyLasers.Gate.Walk do
   end
 
   defp eval(%{"type" => t} = f, env) when t in ["FunctionExpression", "ArrowFunctionExpression"],
-    do: make_fn(f["params"], f["body"], env, f["async"] == true, t == "ArrowFunctionExpression")
+    do: make_fn(f["params"], f["body"], env, f["async"] == true, t == "ArrowFunctionExpression", f["generator"] == true)
+
+  # `a?.b()` / `a?.[k]` parse as ChainExpression wrapping the call/member (whose own `optional` flags
+  # short-circuit) — unwrap, or the catch-all would silently evaluate the whole chain to undefined.
+  defp eval(%{"type" => "ChainExpression", "expression" => e}, env), do: eval(e, env)
+
+  defp eval(%{"type" => "YieldExpression", "argument" => a} = y, env) do
+    v = if a, do: eval(a, env), else: :undefined
+    if y["delegate"], do: Runtime.gen_yield_star(v), else: Runtime.gen_yield(v)
+  end
 
   defp eval(%{"type" => t} = n, env) when t in ["ClassExpression", "ClassDeclaration"], do: eval_class(n, env)
 
@@ -328,7 +345,12 @@ defmodule TinyLasers.Gate.Walk do
       :undefined
     else
       key = if m["computed"], do: eval(m["property"], env), else: key_of(m["property"])
-      Runtime.method(obj, key, eval_args(args, env))
+      # `o.f?.()` — the ?. guards the FUNCTION, not the receiver: a missing property yields undefined.
+      if optional && Runtime.optcall_missing?(obj, key) do
+        :undefined
+      else
+        Runtime.method(obj, key, eval_args(args, env))
+      end
     end
   end
   defp eval_call(callee, args, env, optional) do
@@ -407,7 +429,7 @@ defmodule TinyLasers.Gate.Walk do
   defp bind_pattern(_, _, _, _), do: :ok
 
   # ── functions ───────────────────────────────────────────────────────────────────────────────────────────
-  defp make_fn(params, body, defenv, async?, arrow?) do
+  defp make_fn(params, body, defenv, async?, arrow?, gen? \\ false) do
     Runtime.closure(fn this, args ->
       scope = push(defenv)
       unless arrow? do
@@ -416,7 +438,13 @@ defmodule TinyLasers.Gate.Walk do
       end
       Enum.each(Enum.flat_map(params || [], &pattern_names/1), fn n -> ensure_box([hd(scope)], hd(scope), n) end)
       bind_params(params || [], args, scope)
-      run_body(body, scope, async?)
+      if gen? do
+        Runtime.gen_begin()
+        run_body(body, scope, false)
+        Runtime.gen_end()
+      else
+        run_body(body, scope, async?)
+      end
     end)
   end
 
@@ -504,7 +532,13 @@ defmodule TinyLasers.Gate.Walk do
       params = fnode["params"] || []
       Enum.each(Enum.flat_map(params, &pattern_names/1), fn nm -> ensure_box([hd(s)], hd(s), nm) end)
       bind_params(params, args, s)
-      run_body(fnode["body"], s, fnode["async"] == true)
+      if fnode["generator"] == true do
+        Runtime.gen_begin()
+        run_body(fnode["body"], s, false)
+        Runtime.gen_end()
+      else
+        run_body(fnode["body"], s, fnode["async"] == true)
+      end
     end)
   end
 
@@ -518,12 +552,12 @@ defmodule TinyLasers.Gate.Walk do
   end
 
   # ── loops ───────────────────────────────────────────────────────────────────────────────────────────────
-  defp loop_for(%{"test" => t, "update" => u, "body" => b}, env), do: catch_break(nil, fn -> for_iter(t, u, b, env) end)
-  defp for_iter(t, u, b, env) do
+  defp loop_for(%{"test" => t, "update" => u, "body" => b}, env, lbl), do: catch_break(lbl, fn -> for_iter(t, u, b, env, lbl) end)
+  defp for_iter(t, u, b, env, lbl) do
     if t == nil or Runtime.truthy(eval(t, env)) do
-      catch_continue(nil, fn -> exec(b, env) end)
+      catch_continue(lbl, fn -> exec(b, env) end)
       if u, do: eval(u, env)
-      for_iter(t, u, b, env)
+      for_iter(t, u, b, env, lbl)
     end
   end
 
@@ -567,6 +601,14 @@ defmodule TinyLasers.Gate.Walk do
     end
   end
 
+  # a label on a LOOP threads down so `continue <label>` is caught at that loop's iteration boundary
+  # (`break <label>` is already caught by the LabeledStatement's catch_break above).
+  defp exec_labeled(%{"type" => "ForStatement"} = n, env, lbl), do: exec_for(n, env, lbl)
+  defp exec_labeled(%{"type" => "WhileStatement", "test" => t, "body" => b}, env, lbl), do: loop_while(t, b, env, lbl)
+  defp exec_labeled(%{"type" => "DoWhileStatement", "test" => t, "body" => b}, env, lbl),
+    do: catch_break(lbl, fn -> do_once(b, env, lbl); while_iter(t, b, env, lbl) end)
+  defp exec_labeled(%{"type" => "ForOfStatement"} = n, env, lbl), do: for_each(n, :of, env, lbl)
+  defp exec_labeled(%{"type" => "ForInStatement"} = n, env, lbl), do: for_each(n, :in, env, lbl)
   defp exec_labeled(body, env, _lbl), do: exec(body, env)
 
   # ── switch ──────────────────────────────────────────────────────────────────────────────────────────────
