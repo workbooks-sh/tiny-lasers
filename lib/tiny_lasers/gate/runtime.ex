@@ -423,6 +423,12 @@ defmodule TinyLasers.Gate.Runtime do
   defp bytes_bin(b) when is_binary(b), do: b
   defp bytes_bin(_), do: ""
 
+  # coerce a byte source (Buffer/typed array/array-of-bytes/binary) to a binary (TextDecoder.decode).
+  defp to_bin_bytes({:bytes, b}), do: b
+  defp to_bin_bytes(b) when is_binary(b), do: b
+  defp to_bin_bytes({:arr, _} = a), do: al(a) |> Enum.map(&(trunc(to_number(&1)) |> Bitwise.band(0xFF))) |> :erlang.list_to_binary()
+  defp to_bin_bytes(_), do: ""
+
   @doc "Granted `__host(op, params)` capability bridge → dispatches to a host module (e.g. the rollup
   wasm parser via HostRollup) and returns the result as a guest object. Confined: the guest holds only the
   integer capability handle; the host work (running wasm) happens here, never referenced in guest code."
@@ -812,6 +818,20 @@ defmodule TinyLasers.Gate.Runtime do
   def method({:bytes, _} = bytes, "subarray", [a0 | rest]), do: (b = bytes_bin(bytes); s = trunc(to_number(a0)); e = (case rest do [e0 | _] -> trunc(to_number(e0)); _ -> byte_size(b) end); {:bytes, binary_part(b, s, max(min(e, byte_size(b)) - s, 0))})
   def method({:bytes, _} = bytes, "slice", args), do: method(bytes, "subarray", args)
 
+  # Date stub methods (deterministic; timing only).
+  def method({:date, ms}, m, _) when m in ["getTime", "valueOf"], do: ms
+  def method({:date, _}, "toISOString", _), do: "1970-01-01T00:00:00.000Z"
+  def method({:date, _}, "toString", _), do: "Thu Jan 01 1970 00:00:00 GMT+0000"
+  def method({:date, _}, m, _) when m in ["getFullYear"], do: 1970.0
+  def method({:date, _}, _m, _), do: 0.0
+  def method({:global, "Date"}, "now", _), do: 0.0
+
+  # TextDecoder/TextEncoder: guest strings are UTF-8 binaries.
+  def method({:textdecoder}, "decode", [b | _]), do: to_bin_bytes(b)
+  def method({:textdecoder}, "decode", []), do: ""
+  def method({:textencoder}, "encode", [s | _]), do: {:bytes, to_str(s)}
+  def method({:textencoder}, "encode", []), do: {:bytes, ""}
+
   # a method call on a Proxy: get the (trapped) property, invoke with this=proxy.
   def method({:proxy, _, _} = px, name, args), do: invoke(oget(px, name), px, args)
 
@@ -990,6 +1010,7 @@ defmodule TinyLasers.Gate.Runtime do
 
   @doc "ToNumber coercion (public: unary + uses it)."
   def to_number(x) when is_number(x), do: x
+  def to_number({:date, ms}), do: ms
   def to_number(x) when x in [:infinity, :neg_infinity, :nan], do: x
   def to_number(true), do: 1.0
   def to_number(false), do: 0.0
@@ -1353,6 +1374,12 @@ defmodule TinyLasers.Gate.Runtime do
   # Proxy: {:proxy, target, handler}. Property get/set + method calls route through the handler's traps
   # (falling back to the target). rollup's output bundle is a Proxy over the chunk map.
   def construct({:global, "Proxy"}, [target, handler | _]), do: {:proxy, target, handler}
+  # Date — a deterministic stub (epoch 0). rollup uses it only for timing (Number(new Date())), not output,
+  # so a fixed value keeps the bundle byte-identical.
+  def construct({:global, "Date"}, args), do: {:date, (case args do [n | _] when is_number(n) -> n; _ -> 0.0 end)}
+  # TextDecoder/TextEncoder — guest strings are UTF-8 binaries, so decode/encode are near-identity.
+  def construct({:global, "TextDecoder"}, _), do: {:textdecoder}
+  def construct({:global, "TextEncoder"}, _), do: {:textencoder}
   # typed arrays are backed by a plain guest array (indexed get/set, length, subarray all work on {:arr,_}).
   # new TA(n) -> n zeros; new TA([...]) / new TA(otherTA) -> element copy.
   def construct({:global, ta}, args)
@@ -1699,6 +1726,9 @@ defmodule TinyLasers.Gate.Runtime do
   def typeof({:promise, _}), do: "object"
   def typeof({:bytes, _}), do: "object"
   def typeof({:proxy, t, _}), do: typeof(t)
+  def typeof({:date, _}), do: "object"
+  def typeof({:textdecoder}), do: "object"
+  def typeof({:textencoder}), do: "object"
   def typeof(_), do: "object"
 
   # ── DoS primitives (emitted only for the red-team's containment tests) ──
