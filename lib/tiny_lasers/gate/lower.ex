@@ -100,30 +100,42 @@ defmodule TinyLasers.Gate.Lower do
   end
 
   # for (init; test; update) body  — lowered to a tail-recursive anonymous fn (BEAM-native loop, GC'd).
+  # Elixir closures capture by value, so every variable MUTATED in the loop (the counter AND any outer
+  # accumulator) is threaded through the recursion as explicit state: rebound at the top of each iteration,
+  # passed forward at the tail, and rebound in the enclosing scope from the loop's final state.
   defp stmt(%{"type" => "ForStatement"} = n, scope) do
     {initq, s1} = if n["init"], do: for_init(n["init"], scope), else: {:undefined, scope}
+
+    mutated =
+      [n["test"], n["update"], n["body"]]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.flat_map(&assigned_names/1)
+      |> Kernel.++(assigned_names(n["init"]))
+      |> Enum.uniq()
+
+    statevars = Enum.map(mutated, &lvar/1)
+    state_tuple = {:{}, [], statevars}
     loop = Macro.var(:gg_loop, __MODULE__)
+
     testq = if n["test"], do: expr(n["test"], s1), else: true
     {bodyq, _} = stmt(n["body"], s1)
     updateq = if n["update"], do: expr(n["update"], s1), else: :undefined
-    # capture the loop's mutable locals by threading them through the recursion is complex; for v0 we rely
-    # on process-dict-free rebinding NOT being needed across iterations except the loop var, which update
-    # mutates. We model loop vars via a small mutable cell in the Runtime to keep the lowering simple.
+
     q =
       quote do
         unquote(initq)
 
-        unquote(loop) = fn me ->
+        unquote(loop) = fn me, unquote(state_tuple) ->
           if unquote(@runtime).truthy(unquote(testq)) do
             unquote(bodyq)
             unquote(updateq)
-            me.(me)
+            me.(me, unquote(state_tuple))
           else
-            :undefined
+            unquote(state_tuple)
           end
         end
 
-        unquote(loop).(unquote(loop))
+        unquote(state_tuple) = unquote(loop).(unquote(loop), unquote(state_tuple))
       end
 
     {q, scope}
@@ -254,6 +266,45 @@ defmodule TinyLasers.Gate.Lower do
 
   defp block(list) when is_list(list), do: {:__block__, [], list}
   defp block(q), do: q
+
+  # Identifier names that are ASSIGNMENT TARGETS anywhere in a subtree (for-loop state threading). Stops at
+  # nested function boundaries (their assignments live in their own scope). Covers `=`/compound assignment,
+  # `++`/`--`, `var` declarations, and `o.x = v` (which rebinds the base identifier `o`).
+  defp assigned_names(nil), do: []
+
+  defp assigned_names(%{"type" => t}) when t in ["FunctionExpression", "FunctionDeclaration", "ArrowFunctionExpression"],
+    do: []
+
+  defp assigned_names(%{"type" => "AssignmentExpression", "left" => l} = n) do
+    target =
+      case l do
+        %{"type" => "Identifier", "name" => name} -> [name]
+        %{"type" => "MemberExpression", "object" => %{"type" => "Identifier", "name" => name}} -> [name]
+        _ -> []
+      end
+
+    target ++ assigned_names(n["right"])
+  end
+
+  defp assigned_names(%{"type" => "UpdateExpression", "argument" => %{"type" => "Identifier", "name" => name}}),
+    do: [name]
+
+  defp assigned_names(%{"type" => "VariableDeclaration", "declarations" => ds}) do
+    Enum.flat_map(ds, fn d ->
+      name = case d["id"] do %{"name" => n} -> [n]; _ -> [] end
+      name ++ assigned_names(d["init"])
+    end)
+  end
+
+  defp assigned_names(%{} = node) do
+    node
+    |> Map.drop(["type"])
+    |> Map.values()
+    |> Enum.flat_map(&assigned_names/1)
+  end
+
+  defp assigned_names(list) when is_list(list), do: Enum.flat_map(list, &assigned_names/1)
+  defp assigned_names(_), do: []
 
   # ── helpers ──
   defp ident(n, scope) do

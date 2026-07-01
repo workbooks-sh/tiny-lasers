@@ -33,6 +33,13 @@ defmodule TinyLasers.Gate.F2VerticalTest do
     assert %{result: {:ok, 15.0}} = Js.run(src)
   end
 
+  test "for/while loops thread mutable state (counter + accumulator + object rebuild)" do
+    assert %{result: {:ok, 45.0}} = Js.run("var s = 0; for (var i = 0; i < 10; i = i + 1) { s = s + i; } s")
+    assert %{result: {:ok, 10.0}} = Js.run("var s = 0; for (var i = 0; i < 5; i++) { s = s + i; } s")
+    assert %{result: {:ok, 6.0}} = Js.run("var a = { n: 0 }; for (var i = 0; i < 4; i++) { a = { n: a.n + i }; } a.n")
+    assert %{result: {:ok, 7.0}} = Js.run("var n = 1; var c = 0; while (n < 100) { n = n * 2; c = c + 1; } c")
+  end
+
   test "the compiled guest references ONLY the Runtime — confinement holds (H2)" do
     src = """
     function merge(a, b) { return { x: a.x, y: b.y }; }
