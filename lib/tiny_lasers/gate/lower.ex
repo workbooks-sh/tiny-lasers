@@ -392,7 +392,58 @@ defmodule TinyLasers.Gate.Lower do
     {q, scope}
   end
 
+  # ES6 `class C { constructor(){…} m(){…} static s(){…} get g(){…} }` desugars to F2's existing prototype
+  # machinery: a constructor FUNCTION + method assignments onto `C.prototype` (instance) / `C` (static) /
+  # Object.defineProperty (get/set). (magic-string's classes are flat — no extends/super.)
+  defp stmt(%{"type" => t} = n, scope) when t in ["ClassDeclaration", "ClassExpression"] do
+    name = (n["id"] && n["id"]["name"]) || "__ggclass"
+    members = (n["body"] && n["body"]["body"]) || []
+    ctor = Enum.find(members, &(&1["kind"] == "constructor"))
+
+    cid = %{"type" => "Identifier", "name" => name}
+    proto = member_of(cid, ident_key("prototype"), false)
+
+    ctor_decl = %{
+      "type" => "FunctionDeclaration",
+      "id" => cid,
+      "params" => (ctor && ctor["value"]["params"]) || [],
+      "body" => (ctor && ctor["value"]["body"]) || %{"type" => "BlockStatement", "body" => []}
+    }
+
+    member_stmts =
+      for mth <- members, mth["kind"] != "constructor" do
+        target = if mth["static"], do: cid, else: proto
+        key = mth["key"]
+
+        case mth["kind"] do
+          k when k in ["method", nil] ->
+            expr_stmt(%{"type" => "AssignmentExpression", "operator" => "=",
+              "left" => member_of(target, key, mth["computed"]), "right" => mth["value"]})
+
+          k when k in ["get", "set"] ->
+            # Object.defineProperty(target, key, { <get|set>: fn })
+            desc = %{"type" => "ObjectExpression", "properties" => [
+              %{"type" => "Property", "key" => ident_key(k), "value" => mth["value"], "computed" => false, "kind" => "init"}
+            ]}
+            expr_stmt(call_expr(member_of(obj_id("Object"), ident_key("defineProperty"), false),
+              [target_key_expr(target, key, mth["computed"]), desc]))
+        end
+      end
+
+    stmts([ctor_decl | member_stmts], scope)
+  end
+
   defp stmt(other, scope), do: {expr(other, scope), scope}
+
+  defp member_of(obj, key, computed), do: %{"type" => "MemberExpression", "object" => obj, "property" => key, "computed" => computed}
+  defp ident_key(name), do: %{"type" => "Identifier", "name" => name}
+  defp obj_id(name), do: %{"type" => "Identifier", "name" => name}
+  defp expr_stmt(e), do: %{"type" => "ExpressionStatement", "expression" => e}
+  defp call_expr(callee, args), do: %{"type" => "CallExpression", "callee" => callee, "arguments" => args}
+  # the defineProperty key argument: a string literal for a plain name, else the computed expression.
+  defp target_key_expr(_target, %{"name" => n} = _key, false), do: %{"type" => "Literal", "value" => n}
+  defp target_key_expr(_target, key, true), do: key
+  defp target_key_expr(_target, key, false), do: key
 
   defp for_init(%{"type" => "VariableDeclaration"} = d, scope), do: stmt(d, scope)
   defp for_init(e, scope), do: {expr(e, scope), scope}
