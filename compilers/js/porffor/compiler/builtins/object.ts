@@ -221,7 +221,7 @@ export const __Porffor_object_fromHost = (handle: i32): any => {
   const n: i32 = Porffor.wasm`local.get ${handle}
 call ho_count`;
   if (n > 0) {
-    const buf: i32 = Porffor.malloc(16376);
+    const buf: i32 = Porffor.malloc(2040);
     let cur: i32 = buf;
     let i: i32 = 0;
     while (i < n) {
@@ -238,21 +238,22 @@ f64.convert_i32_u
 local.set ${key}
 i32.const 195
 local.set ${key+1}`;
-      const h: i32 = __Porffor_object_hash(key);
+      // read value/type BY INDEX (matches ho_key_at) — host stores under the compile-time ctHash which
+      // __Porffor_object_hash does not reproduce, so a recomputed-hash read misses for some keys.
       let val: any = 0;
       Porffor.wasm`
 local.get ${handle}
-local.get ${h}
-call ho_get_value
+local.get ${i}
+call ho_value_at
 local.set ${val}
 local.get ${handle}
-local.get ${h}
-call ho_get_type
+local.get ${i}
+call ho_type_at
 local.set ${val+1}`;
       __Porffor_object_set(out, key, val);
       const len: i32 = Porffor.wasm.i32.load(cur, 0, 0);
       cur = (cur + 4 + len + 3) & -4;
-      if (cur >= buf + 16368) cur = buf;
+      if (cur >= buf + 2032) cur = buf;
       i += 1;
     }
   }

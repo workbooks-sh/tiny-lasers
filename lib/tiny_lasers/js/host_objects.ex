@@ -50,8 +50,29 @@ defmodule TinyLasers.Js.HostObjects do
       "ho_has" => fn [h, hash] -> ho_has(h, hash) end,
       "ho_delete" => fn [h, hash] -> ho_delete(h, hash) end,
       "ho_count" => fn [h] -> ho_count(h) end,
-      "ho_key_at" => fn [h, idx, buf_ptr] -> ho_key_at(h, idx, buf_ptr) end
+      "ho_key_at" => fn [h, idx, buf_ptr] -> ho_key_at(h, idx, buf_ptr) end,
+      "ho_value_at" => fn [h, idx] -> ho_value_at(h, idx) end,
+      "ho_type_at" => fn [h, idx] -> ho_type_at(h, idx) end
     }
+  end
+
+  # value/type at the idx-th own key (insertion order), keyed off the SAME stored hash as ho_key_at — so a
+  # materializer can read by index without recomputing a hash (the stored hash is the compile-time ctHash,
+  # which a runtime __Porffor_object_hash does NOT reproduce).
+  defp ho_value_at(h, idx) do
+    obj = get_obj(h)
+    case Map.get(obj.e, Enum.at(obj.order, trunc(idx))) do
+      {value, _type} -> value
+      nil -> 0.0
+    end
+  end
+
+  defp ho_type_at(h, idx) do
+    obj = get_obj(h)
+    case Map.get(obj.e, Enum.at(obj.order, trunc(idx))) do
+      {_value, type} -> type
+      nil -> @t_undefined
+    end
   end
 
   @doc "Reset the per-run object table."

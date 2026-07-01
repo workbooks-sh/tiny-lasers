@@ -23,6 +23,8 @@ createImport('timeOrigin', 0, 1);
   createImport('ho_regkey', [ i32, i32, i32, i32 ], []);
   createImport('ho_count', [ i32 ], [ i32 ]);
   createImport('ho_key_at', [ i32, i32, i32 ], [ i32 ]);
+  createImport('ho_value_at', [ i32, i32 ], [ f64 ]);
+  createImport('ho_type_at', [ i32, i32 ], [ i32 ]);
 }
 
 import process from 'node:process';
