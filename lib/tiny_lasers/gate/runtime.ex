@@ -229,6 +229,12 @@ defmodule TinyLasers.Gate.Runtime do
   @doc "Property read. Objects: by key. Arrays: numeric index + `length`. Non-objects: `:undefined`."
   # cell property read WITH prototype-chain fallback: ES5 classes put methods on `Ctor.prototype`; a `new
   # Ctor()` instance resolves a missing own-property from its linked prototype (see construct/2, fn_proto/1).
+  def oget({:cell, id} = c, "size") do
+    case Process.get({:gg_cellcoll, id}) do
+      nil -> cell_oget(c, "size", c)
+      coll -> oget(coll, "size")
+    end
+  end
   def oget({:cell, _} = c, k), do: cell_oget(c, key_str(k), c)
 
   # resolve a cell property through the prototype chain; a `{:getter, fn}` marker is invoked with `this` = the
@@ -923,10 +929,15 @@ defmodule TinyLasers.Gate.Runtime do
   # a mutable-cell instance: `hasOwnProperty`, else a function-valued property is a method with this=the cell.
   def method({:cell, _} = c, "hasOwnProperty", [k | _]), do: Map.has_key?(cell_read(c) |> elem(1), key_str(k))
 
-  def method({:cell, _} = c, name, args) do
-    case oget(c, name) do
-      {:fn, _} = f -> invoke(f, c, args)
-      _ ->
+  def method({:cell, id} = c, name, args) do
+    coll = Process.get({:gg_cellcoll, id})
+    cond do
+      match?({:fn, _}, oget(c, name)) -> invoke(oget(c, name), c, args)
+      # a cell backed by a Set/Map (class extends Set/Map): delegate collection methods. Mutators return the
+      # instance (this) for chaining; queries return the result.
+      coll != nil and name in ["add", "set"] -> method(coll, name, args); c
+      coll != nil and name in ["has", "get", "delete", "clear", "forEach", "keys", "values", "entries"] -> method(coll, name, args)
+      true ->
         if System.get_env("GAPLOG"), do: IO.puts(:stderr, "GAP cellmeth #{inspect(name)} keys=#{inspect(okeys(c)) |> String.slice(0, 90)}")
         if System.get_env("GAPSOFT"), do: :undefined, else: guest_error("not a function")
     end
@@ -1626,6 +1637,18 @@ defmodule TinyLasers.Gate.Runtime do
   @doc "Invoke a guest function with an explicit `this` receiver (method call). Ungranted callees error."
   def invoke({:fn, f}, this, args) when is_function(f, 2), do: f.(this, args)
   def invoke({:host, cap_id}, _this, args), do: host_call(cap_id, args)
+  # `super()` to a built-in — `class X extends Set/Map` etc. Back the instance cell with a real collection
+  # (so this.add/.has/.size delegate); other built-ins merge their constructed cell's keys into `this`.
+  def invoke({:global, coll}, {:cell, id} = this, args) when coll in ["Set", "WeakSet", "Map", "WeakMap"] do
+    Process.put({:gg_cellcoll, id}, construct({:global, coll}, args))
+    this
+  end
+  def invoke({:global, _} = g, {:cell, _} = this, args) do
+    case construct(g, args) do
+      {:cell, _} = c -> Enum.each(okeys(c), fn k -> oput(this, k, oget(c, k)) end); this
+      _ -> this
+    end
+  end
   def invoke(nc, _this, args) do
     if System.get_env("GAPLOG"), do: IO.puts(:stderr, "GAP invoke on #{inspect(nc)|>String.slice(0,40)} args=#{inspect(args)|>String.slice(0,50)}")
     guest_error("not a function")

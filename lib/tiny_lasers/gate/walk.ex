@@ -303,7 +303,10 @@ defmodule TinyLasers.Gate.Walk do
       :undefined
     else
       key = if m["computed"], do: eval(p, env), else: key_of(p)
-      Runtime.oget(obj, key)
+      res = Runtime.oget(obj, key)
+      if System.get_env("MEMDBG") && key in ["magicString", "context", "scope"] && res == :undefined,
+        do: IO.puts(:stderr, "MEM .#{key} UNDEF on #{inspect(obj) |> String.slice(0, 30)} keys=#{inspect(Runtime.okeys(obj)) |> String.slice(0, 80)}")
+      res
     end
   end
 
@@ -449,6 +452,7 @@ defmodule TinyLasers.Gate.Walk do
     members = (n["body"] && n["body"]["body"]) || []
     ctor = Enum.find(members, &(&1["kind"] == "constructor"))
     sup = if n["superClass"], do: eval(n["superClass"], env), else: nil
+    if System.get_env("CLSDBG") && match?({:global, _}, sup), do: IO.puts(:stderr, "CLASS #{name} extends #{inspect(sup)} hasCtor=#{ctor != nil}")
 
     cenv = push(env)
 
@@ -457,11 +461,16 @@ defmodule TinyLasers.Gate.Walk do
         s = push(cenv)
         declare(s, "this", this)
         if sup, do: declare(s, "__superval", sup)
-        cbody = (ctor && ctor["value"]["body"]) || %{"type" => "BlockStatement", "body" => []}
         cparams = (ctor && ctor["value"]["params"]) || []
         Enum.each(Enum.flat_map(cparams, &pattern_names/1), fn nm -> ensure_box([hd(s)], hd(s), nm) end)
         bind_params(cparams, args, s)
-        run_ctor_body(cbody, s)
+        cond do
+          ctor -> run_ctor_body(ctor["value"]["body"], s)
+          # a derived class with NO explicit constructor gets the implicit `constructor(...args){ super(...args) }`
+          # — run the parent ctor with all args so its field initialization happens.
+          sup -> Runtime.invoke(sup, this, args)
+          true -> :ok
+        end
         this
       end)
 
