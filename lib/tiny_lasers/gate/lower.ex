@@ -715,6 +715,12 @@ defmodule TinyLasers.Gate.Lower do
           unquote(assign_to(m, v, scope))
           unquote(v)
         end
+
+      # destructuring ASSIGNMENT (not declaration): `[a, b] = x`, `({a, b} = o)` — minified rollup uses these.
+      # Reuse the declaration destructuring machinery; the expression evaluates to the whole RHS value.
+      %{"type" => t} = pat when t in ["ArrayPattern", "ObjectPattern"] ->
+        v = Macro.var(:__ggav, __MODULE__)
+        {:__block__, [], [quote(do: unquote(v) = unquote(rq))] ++ destr_targets(pat, v, scope) ++ [v]}
     end
   end
 
@@ -1215,6 +1221,13 @@ defmodule TinyLasers.Gate.Lower do
 
   defp destr_targets(%{"type" => "Identifier", "name" => n}, valq, scope), do: [bind_local(n, valq, scope)]
 
+  # a destructuring TARGET that is a member expression (`[a.b] = …`, `({x: o.k} = …)`) — write through the
+  # member chain rather than binding a local.
+  defp destr_targets(%{"type" => "MemberExpression"} = m, valq, scope) do
+    v = uniqvar()
+    [quote(do: unquote(v) = unquote(valq)), assign_to(m, v, scope)]
+  end
+
   defp destr_targets(%{"type" => "AssignmentPattern", "left" => l, "right" => r}, valq, scope) do
     v = uniqvar()
     [
@@ -1278,6 +1291,9 @@ defmodule TinyLasers.Gate.Lower do
 
   defp lit(v) when is_integer(v), do: v * 1.0
   defp lit(v) when is_float(v), do: v
+  # BigInt literal (tagged by the parser's replacer). No bigint term in F2 yet — represent as a float so the
+  # value flows; exact >2^53 bigint math is a later rung, taken only if a reachable op actually needs it.
+  defp lit(%{"$bigint" => s}), do: (case Integer.parse(s) do {i, _} -> i * 1.0; _ -> 0.0 end)
   defp lit(v) when is_binary(v), do: v
   defp lit(true), do: true
   defp lit(false), do: false
