@@ -385,6 +385,23 @@ defmodule TinyLasers.Gate.Runtime do
   defp global?({:regex, _re, _src, flags}), do: String.contains?(flags, "g")
 
   # string × regex methods (marked's hot surface): replace/match/split/test/exec
+  # function replacement: Elixir's Regex.replace passes captures as SEPARATE args (variable arity), so drive
+  # it with Regex.scan and splice manually — the JS callback gets (fullMatch, ...groups).
+  def method(s, "replace", [{:regex, re, _, _} = rx, f]) when is_binary(s) and (elem(f, 0) == :fn or elem(f, 0) == :host) do
+    idxs = Regex.scan(re, s, return: :index)
+    idxs = if global?(rx), do: idxs, else: Enum.take(idxs, 1)
+
+    {chunks, last} =
+      Enum.reduce(idxs, {[], 0}, fn caps, {acc, pos} ->
+        [{ms, ml} | _] = caps
+        [full | groups] = Enum.map(caps, fn {i, l} -> if i < 0, do: :undefined, else: binary_part(s, i, l) end)
+        repl = to_str(call(f, [full | groups] ++ [ms * 1.0, s]))
+        {[acc, binary_part(s, pos, ms - pos), repl], ms + ml}
+      end)
+
+    IO.iodata_to_binary([chunks, binary_part(s, last, byte_size(s) - last)])
+  end
+
   def method(s, "replace", [{:regex, re, _, _} = rx, repl]) when is_binary(s) do
     Regex.replace(re, s, regex_replacement(repl), global: global?(rx))
   end
