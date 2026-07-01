@@ -383,11 +383,16 @@ defmodule TinyLasers.Gate.Runtime do
   def regex(source, flags) when is_binary(source) do
     opts = flags |> String.graphemes() |> Enum.filter(&(&1 in ~w(i m s u x))) |> Enum.join()
 
-    case Regex.compile(source, opts) do
+    # keep `source` (the JS-visible .source) as-is, but translate JS-only regex syntax before PCRE compile.
+    case Regex.compile(js_re_to_pcre(source), opts) do
       {:ok, re} -> {:regex, re, source, flags}
       {:error, _} -> {:regex, ~r/(?!)/, source, flags}
     end
   end
+
+  # `[^]` is JS for "any char incl. newline" but is an empty (invalid) class in PCRE — rewrite to `[\s\S]`.
+  # acorn's skipWhiteSpace `/\/\*[^]*?\*\//` relies on it.
+  defp js_re_to_pcre(src), do: String.replace(src, "[^]", "[\\s\\S]")
 
   def regex(_source, _flags), do: {:regex, ~r/(?!)/, "", ""}
 
