@@ -133,6 +133,22 @@ defmodule TinyLasers.Gate.Runtime do
   @doc "Empty direct-term object."
   def olit, do: {[], %{}}
 
+  # ── boxed closure variables: JS closures share a captured MUTABLE variable BY REFERENCE (counters,
+  # accumulators, the module pattern, marked's edit() helper `u = u.replace(...)`). A local that is captured
+  # by a nested function AND mutated is stored in a 1-slot box so all closures see the mutation. ──
+  @doc "Create a box holding an initial value."
+  def box(v) do
+    id = Process.get(:gg_box_next, 0)
+    Process.put(:gg_box_next, id + 1)
+    Process.put({:gg_box, id}, v)
+    {:box, id}
+  end
+
+  @doc "Read a box."
+  def box_get({:box, id}), do: Process.get({:gg_box, id}, :undefined)
+  @doc "Write a box (returns the value, JS assignment semantics)."
+  def box_set({:box, id}, v), do: (Process.put({:gg_box, id}, v); v)
+
   @doc "Property write. A cell mutates in place (shared); an immutable object returns a NEW object."
   def oput({:cell, _} = c, k, v), do: cell_put(c, k, v)
 

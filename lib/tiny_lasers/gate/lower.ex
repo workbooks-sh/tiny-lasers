@@ -30,12 +30,18 @@ defmodule TinyLasers.Gate.Lower do
 
   def program(%{"type" => "Program", "body" => body}, granted) do
     vars = collect_vars(body) |> Enum.uniq()
-    scope0 = %{locals: Enum.reduce(vars, MapSet.new(), &MapSet.put(&2, &1)), granted: granted, funcs: MapSet.new()}
+    boxed = boxed_set(vars, body)
+    scope0 = %{locals: Enum.reduce(vars, MapSet.new(), &MapSet.put(&2, &1)), granted: granted, funcs: MapSet.new(), boxed: boxed}
     {stmts, _scope} = stmts(body, scope0)
-    # top-level `this` is undefined; pre-bind all hoisted vars to :undefined (JS var hoisting).
-    # top-level `this` IS the global object (a script's `this` === globalThis), so a UMD wrapper's
-    # `t((e=this).marked={})` attaches to it.
-    prelude = [quote(do: unquote(Macro.var(:__ggthis, __MODULE__)) = {:globalobj}) | Enum.map(vars, fn v -> quote(do: unquote(lvar(v)) = :undefined) end)]
+    # top-level `this` IS the global object; pre-bind hoisted vars (a boxed var gets a box — JS var hoisting).
+    prelude =
+      [quote(do: unquote(Macro.var(:__ggthis, __MODULE__)) = {:globalobj})] ++
+        Enum.map(vars, fn v ->
+          if MapSet.member?(boxed, v),
+            do: quote(do: unquote(lvar(v)) = unquote(@runtime).box(:undefined)),
+            else: quote(do: unquote(lvar(v)) = :undefined)
+        end)
+
     {:__block__, [], prelude ++ stmts}
   end
 
@@ -69,7 +75,12 @@ defmodule TinyLasers.Gate.Lower do
         init = d["init"]
         s2 = %{s | locals: MapSet.put(s.locals, n)}
         vq = if init, do: expr(init, s2), else: :undefined
-        q = quote(do: unquote(lvar(n)) = unquote(vq))
+        # a boxed var's box is pre-created at scope entry; the declaration SETS the box (never rebinds).
+        q =
+          if s2[:boxed] && MapSet.member?(s2.boxed, n),
+            do: quote(do: unquote(@runtime).box_set(unquote(lvar(n)), unquote(vq))),
+            else: quote(do: unquote(lvar(n)) = unquote(vq))
+
         {[q | acc], s2}
       end)
 
@@ -462,7 +473,9 @@ defmodule TinyLasers.Gate.Lower do
 
     case l do
       %{"type" => "Identifier", "name" => n} ->
-        quote(do: unquote(lvar(n)) = unquote(rq))
+        if scope[:boxed] && MapSet.member?(scope.boxed, n),
+          do: quote(do: unquote(@runtime).box_set(unquote(lvar(n)), unquote(rq))),
+          else: quote(do: unquote(lvar(n)) = unquote(rq))
 
       %{"type" => "MemberExpression"} = m ->
         # JS assignment evaluates to the ASSIGNED VALUE. `assign_to` rebuilds the member chain and rebinds the
@@ -546,10 +559,14 @@ defmodule TinyLasers.Gate.Lower do
     end
   end
 
-  # i++ / i-- / ++i / --i on an identifier: rebind. (prefix vs postfix return value rarely load-bearing here.)
+  # i++ / i-- / ++i / --i on an identifier: rebind (or box_set if boxed).
   defp expr(%{"type" => "UpdateExpression", "operator" => op, "argument" => %{"name" => n}} = _u, scope) do
     delta = if op == "++", do: 1.0, else: -1.0
-    quote(do: unquote(lvar(n)) = unquote(@runtime).binop(:+, unquote(ident(n, scope)), unquote(delta)))
+    newv = quote(do: unquote(@runtime).binop(:+, unquote(ident(n, scope)), unquote(delta)))
+
+    if scope[:boxed] && MapSet.member?(scope.boxed, n),
+      do: quote(do: unquote(@runtime).box_set(unquote(lvar(n)), unquote(newv))),
+      else: quote(do: unquote(lvar(n)) = unquote(newv))
   end
 
   defp expr(%{"type" => "CallExpression"} = c, scope) do
@@ -578,14 +595,27 @@ defmodule TinyLasers.Gate.Lower do
     bodyvars = collect_vars(body) |> Enum.uniq() |> Enum.reject(&(&1 in names))
     inner = Enum.reduce(names ++ bodyvars, scope.locals, &MapSet.put(&2, &1))
 
-    hoistq = Enum.map(bodyvars, fn v -> quote(do: unquote(lvar(v)) = :undefined) end)
+    # a param/var captured by a nested function AND mutated is BOXED so the closures share the mutation.
+    boxed = boxed_set(names ++ bodyvars, body)
+
+    hoistq =
+      Enum.map(bodyvars, fn v ->
+        if MapSet.member?(boxed, v),
+          do: quote(do: unquote(lvar(v)) = unquote(@runtime).box(:undefined)),
+          else: quote(do: unquote(lvar(v)) = :undefined)
+      end)
 
     binds =
       names
       |> Enum.with_index()
-      |> Enum.map(fn {p, i} -> quote(do: unquote(lvar(p)) = unquote(@runtime).arg(unquote(argvar), unquote(i))) end)
+      |> Enum.map(fn {p, i} ->
+        av = quote(do: unquote(@runtime).arg(unquote(argvar), unquote(i)))
+        if MapSet.member?(boxed, p),
+          do: quote(do: unquote(lvar(p)) = unquote(@runtime).box(unquote(av))),
+          else: quote(do: unquote(lvar(p)) = unquote(av))
+      end)
 
-    bscope = %{scope | locals: inner}
+    bscope = %{scope | locals: inner, boxed: MapSet.union(scope[:boxed] || MapSet.new(), boxed)}
 
     # #6 direct-return optimization: if returns appear ONLY at the body's tail (or not at all), compile
     # without the try/catch/throw machinery — the block's value IS the result. Avoids one throw+catch per call
@@ -692,6 +722,8 @@ defmodule TinyLasers.Gate.Lower do
 
   defp ident(n, scope) do
     cond do
+      # a boxed local reads through its box (shared mutable closure variable)
+      scope[:boxed] && MapSet.member?(scope.boxed, n) -> quote(do: unquote(@runtime).box_get(unquote(lvar(n))))
       MapSet.member?(scope.locals, n) -> lvar(n)
       # global namespaces (Object.keys, Math.floor, JSON.parse…) and bare global functions (parseInt…). Only
       # if not shadowed by a local/func — these are plain guest values ({:global}/{:globalfn} tags), not host refs.
@@ -724,6 +756,42 @@ defmodule TinyLasers.Gate.Lower do
   defp collect_vars(%{} = node), do: node |> Map.drop(["type"]) |> Map.values() |> Enum.flat_map(&collect_vars/1)
   defp collect_vars(list) when is_list(list), do: Enum.flat_map(list, &collect_vars/1)
   defp collect_vars(_), do: []
+
+  # ── closure-variable boxing analysis ──
+  # names referenced INSIDE any nested function of `node` (captured variables).
+  @fn_types ["FunctionExpression", "FunctionDeclaration", "ArrowFunctionExpression"]
+
+  defp nested_refs(%{"type" => t} = n) when t in @fn_types, do: all_idents(n["body"]) ++ all_idents(n["params"])
+  defp nested_refs(%{} = node), do: node |> Map.drop(["type"]) |> Map.values() |> Enum.flat_map(&nested_refs/1)
+  defp nested_refs(list) when is_list(list), do: Enum.flat_map(list, &nested_refs/1)
+  defp nested_refs(_), do: []
+
+  defp all_idents(%{"type" => "Identifier", "name" => n}), do: [n]
+  defp all_idents(%{} = node), do: node |> Map.drop(["type"]) |> Map.values() |> Enum.flat_map(&all_idents/1)
+  defp all_idents(list) when is_list(list), do: Enum.flat_map(list, &all_idents/1)
+  defp all_idents(_), do: []
+
+  # names ASSIGNED anywhere (=, compound, ++/--, var-init) INCLUDING inside nested functions.
+  defp all_assigned(%{"type" => "AssignmentExpression", "left" => %{"type" => "Identifier", "name" => n}} = a),
+    do: [n | all_assigned(a["right"])]
+
+  defp all_assigned(%{"type" => "UpdateExpression", "argument" => %{"type" => "Identifier", "name" => n}}), do: [n]
+
+  defp all_assigned(%{"type" => "VariableDeclaration", "declarations" => ds}),
+    do: Enum.flat_map(ds, fn d -> all_assigned(d["init"]) end)
+
+  defp all_assigned(%{} = node), do: node |> Map.drop(["type"]) |> Map.values() |> Enum.flat_map(&all_assigned/1)
+  defp all_assigned(list) when is_list(list), do: Enum.flat_map(list, &all_assigned/1)
+  defp all_assigned(_), do: []
+
+  # vars declared in `decls` that are captured by a nested function -> box them. JS closures capture by
+  # REFERENCE, so boxing is needed both for shared MUTATION (counters/accumulators, marked's `u = u.replace`)
+  # AND for self/forward references (`var n = { m: function(){ return n } }`, where n is captured before it is
+  # assigned). Read-only non-captured locals stay plain (no box overhead).
+  defp boxed_set(decls, body) do
+    captured = MapSet.new(nested_refs(body))
+    decls |> Enum.filter(&MapSet.member?(captured, &1)) |> MapSet.new()
+  end
 
   defp strip_breaks(stmts), do: Enum.reject(stmts || [], &(&1["type"] == "BreakStatement"))
   defp block_of(stmts), do: %{"type" => "BlockStatement", "body" => stmts}
