@@ -21,9 +21,15 @@ defmodule TinyLasers.Gate.Lower do
 
   @runtime TinyLasers.Gate.Runtime
 
-  @doc "Lower a full ESTree Program (decoded acorn JSON, string keys) into a quoted `run/0` body."
-  def program(%{"type" => "Program", "body" => body}) do
-    {stmts, _scope} = stmts(body, %{locals: MapSet.new()})
+  @doc """
+  Lower a full ESTree Program (decoded acorn JSON, string keys) into a quoted `run/0` body. `granted` maps a
+  capability NAME to its integer cap id; a granted name compiles to a `{:host, id}` handle (never a module
+  atom), anything else unknown to `:undefined`.
+  """
+  def program(ast, granted \\ %{})
+
+  def program(%{"type" => "Program", "body" => body}, granted) do
+    {stmts, _scope} = stmts(body, %{locals: MapSet.new(), granted: granted})
     {:__block__, [], stmts}
   end
 
@@ -381,7 +387,12 @@ defmodule TinyLasers.Gate.Lower do
 
   # ── helpers ──
   defp ident(n, scope) do
-    if MapSet.member?(scope.locals, n), do: lvar(n), else: :undefined
+    cond do
+      MapSet.member?(scope.locals, n) -> lvar(n)
+      # a granted capability compiles to its integer handle — never a host module atom
+      is_map(scope[:granted]) and Map.has_key?(scope.granted, n) -> {:{}, [], [:host, scope.granted[n]]}
+      true -> :undefined
+    end
   end
 
   defp lvar(n), do: Macro.var(String.to_atom("gg_" <> n), __MODULE__)

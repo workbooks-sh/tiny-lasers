@@ -36,7 +36,9 @@ defmodule TinyLasers.Gate.Js do
   """
   def run(src, opts \\ []) when is_binary(src) do
     ast = parse(src)
-    body = Lower.program(ast)
+    caps = Keyword.get(opts, :caps, default_caps())
+    granted = Keyword.get(opts, :granted, default_granted())
+    body = Lower.program(ast, granted)
     modname = Module.concat([TinyLasers.Gate.Guest, "M#{System.unique_integer([:positive])}"])
 
     quoted =
@@ -48,7 +50,6 @@ defmodule TinyLasers.Gate.Js do
 
     [{mod, bin}] = Code.compile_quoted(quoted)
 
-    caps = Keyword.get(opts, :caps, default_caps())
     ctx = %{caps: caps, tenant_root: "/tenant", fs: %{}}
 
     parent = self()
@@ -82,4 +83,6 @@ defmodule TinyLasers.Gate.Js do
   defp default_caps do
     %{0 => %{fun: &Runtime.cap_print/2}}
   end
+
+  defp default_granted, do: %{"print" => 0}
 end
