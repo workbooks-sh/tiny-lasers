@@ -845,7 +845,7 @@ defmodule TinyLasers.Gate.Lower do
   # handled by the late-bound function registry (a function name resolves to Runtime.greg_get at each use),
   # so no Y-combinator is needed here. `this` binds the method receiver; ThisExpression lowers to __ggthis.
   defp func(params, body, scope) do
-    names = Enum.map(params, fn %{"name" => n} -> n end)
+    names = Enum.flat_map(params, &pattern_names/1)
     argvar = Macro.var(:__ggargs, __MODULE__)
     thisvar = Macro.var(:__ggthis, __MODULE__)
     # hoist this function's `var` declarations (JS function scope), pre-bound to :undefined.
@@ -873,21 +873,31 @@ defmodule TinyLasers.Gate.Lower do
         do: [quote(do: unquote(lvar("arguments")) = unquote(@runtime).avec(unquote(argvar)))],
         else: []
 
-    binds =
-      names
-      |> Enum.with_index()
-      |> Enum.map(fn {p, i} ->
-        av = quote(do: unquote(@runtime).arg(unquote(argvar), unquote(i)))
-        if MapSet.member?(boxed, p),
-          do: quote(do: unquote(lvar(p)) = unquote(@runtime).box(unquote(av))),
-          else: quote(do: unquote(lvar(p)) = unquote(av))
-      end)
-
     # a param/var here SHADOWS an outer boxed var of the same name — the inner one is a distinct variable, so
     # drop shadowed names from the inherited boxed set before unioning this scope's boxed vars.
     shadow = MapSet.union(MapSet.new(names ++ bodyvars), fndecls)
     inherited = MapSet.difference(scope[:boxed] || MapSet.new(), shadow)
     bscope = %{scope | locals: inner, boxed: MapSet.difference(MapSet.union(inherited, boxed), fndecls)}
+
+    # a boxed PARAM-bound name needs its box pre-created before the (possibly destructuring) bind writes it.
+    param_box_inits =
+      for v <- Enum.uniq(names), MapSet.member?(bscope.boxed, v),
+        do: quote(do: unquote(lvar(v)) = unquote(@runtime).box(:undefined))
+
+    # each param — Identifier / default (AssignmentPattern) / {…}/[…] destructuring / ...rest — binds from its
+    # positional arg (or the tail array for a rest param) via the shared pattern machinery.
+    binds =
+      params
+      |> Enum.with_index()
+      |> Enum.flat_map(fn {p, i} ->
+        case p do
+          %{"type" => "RestElement", "argument" => a} ->
+            destr_targets(a, quote(do: unquote(@runtime).avec(Enum.drop(unquote(argvar), unquote(i)))), bscope)
+
+          _ ->
+            destr_targets(p, quote(do: unquote(@runtime).arg(unquote(argvar), unquote(i))), bscope)
+        end
+      end)
 
     # #6 direct-return optimization: if returns appear ONLY at the body's tail (or not at all), compile
     # without the try/catch/throw machinery — the block's value IS the result. Avoids one throw+catch per call
@@ -915,7 +925,7 @@ defmodule TinyLasers.Gate.Lower do
 
       quote do
         unquote(@runtime).closure(fn unquote(thisvar), unquote(argvar) ->
-          unquote_splicing(hoistq ++ binds ++ argbind ++ value_stmts)
+          unquote_splicing(hoistq ++ param_box_inits ++ binds ++ argbind ++ value_stmts)
         end)
       end
     else
@@ -924,7 +934,7 @@ defmodule TinyLasers.Gate.Lower do
       quote do
         unquote(@runtime).closure(fn unquote(thisvar), unquote(argvar) ->
           try do
-            unquote_splicing(hoistq ++ binds ++ argbind ++ bq)
+            unquote_splicing(hoistq ++ param_box_inits ++ binds ++ argbind ++ bq)
             :undefined
           catch
             :throw, {:gg_return, v} -> v
