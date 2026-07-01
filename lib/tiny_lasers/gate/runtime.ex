@@ -141,6 +141,13 @@ defmodule TinyLasers.Gate.Runtime do
     end
   end
 
+  # string properties: `.length` and index access `s[i]` (JS returns a 1-char string).
+  def oget(s, "length") when is_binary(s), do: byte_size(s) * 1.0
+  def oget(s, i) when is_binary(s) and is_number(i) do
+    idx = trunc(i)
+    if idx >= 0 and idx < byte_size(s), do: binary_part(s, idx, 1), else: :undefined
+  end
+
   def oget(_not_obj, _k), do: :undefined
 
   @doc "Spread-merge b into a (Object.assign({}, a, b) shape). Returns a NEW object, b's keys last/override."
@@ -337,6 +344,14 @@ defmodule TinyLasers.Gate.Runtime do
   @doc "A guest function as a DIRECTLY-HELD closure (GC'd, no table). The fun takes `(this, args)`; safe —
   the guest can only invoke it via `call/2` or `invoke/3`, and no codegen path extracts and `apply`s it."
   def closure(f) when is_function(f, 2), do: {:fn, f}
+
+  # top-level function registry: late binding so forward references + mutual recursion work (fn A calls fn B
+  # declared after it). Functions are few and per-run, so a small process-dict table is fine (the GC concern
+  # was OBJECTS, not functions). A guest can only reach these by NAME resolved at compile time to greg_get.
+  @doc "Register a top-level guest function by name."
+  def greg_set(name, closure), do: Process.put({:gg_fn, name}, closure)
+  @doc "Resolve a top-level guest function by name (late) — `:undefined` if never declared."
+  def greg_get(name), do: Process.get({:gg_fn, name}, :undefined)
 
   @doc "Invoke a guest function with an explicit `this` receiver (method call). Ungranted callees error."
   def invoke({:fn, f}, this, args) when is_function(f, 2), do: f.(this, args)

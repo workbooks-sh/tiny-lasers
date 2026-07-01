@@ -29,7 +29,7 @@ defmodule TinyLasers.Gate.Lower do
   def program(ast, granted \\ %{})
 
   def program(%{"type" => "Program", "body" => body}, granted) do
-    {stmts, _scope} = stmts(body, %{locals: MapSet.new(), granted: granted})
+    {stmts, _scope} = stmts(body, %{locals: MapSet.new(), granted: granted, funcs: MapSet.new()})
     # top-level `this` is undefined; bind it so a stray ThisExpression outside any function is defined.
     top_this = quote(do: unquote(Macro.var(:__ggthis, __MODULE__)) = :undefined)
     {:__block__, [], [top_this | stmts]}
@@ -50,7 +50,7 @@ defmodule TinyLasers.Gate.Lower do
   end
 
   defp hoist(%{"type" => "FunctionDeclaration", "id" => %{"name" => n}}, s),
-    do: %{s | locals: MapSet.put(s.locals, n)}
+    do: %{s | funcs: MapSet.put(s[:funcs] || MapSet.new(), n)}
 
   defp hoist(%{"type" => "VariableDeclaration", "declarations" => ds}, s) do
     Enum.reduce(ds, s, fn %{"id" => %{"name" => n}}, acc -> %{acc | locals: MapSet.put(acc.locals, n)} end)
@@ -72,9 +72,11 @@ defmodule TinyLasers.Gate.Lower do
     {{:__block__, [], Enum.reverse(rev)}, sc}
   end
 
+  # top-level (and nested) function declarations register in the late-bound function registry, so forward
+  # references and mutual recursion work regardless of source order.
   defp stmt(%{"type" => "FunctionDeclaration", "id" => %{"name" => n}} = f, scope) do
-    fq = func(n, f["params"], f["body"], scope)
-    {quote(do: unquote(lvar(n)) = unquote(fq)), %{scope | locals: MapSet.put(scope.locals, n)}}
+    fq = func(f["params"], f["body"], scope)
+    {quote(do: unquote(@runtime).greg_set(unquote(n), unquote(fq))), %{scope | funcs: MapSet.put(scope[:funcs] || MapSet.new(), n)}}
   end
 
   defp stmt(%{"type" => "ReturnStatement", "argument" => arg}, scope) do
@@ -142,12 +144,17 @@ defmodule TinyLasers.Gate.Lower do
     state_tuple = {:{}, [], statevars}
     loop = Macro.var(:gg_loop, __MODULE__)
 
+    # a var declared INSIDE the loop body (not already bound in the enclosing scope) must be initialized
+    # before the initial state tuple is built, else it is unbound.
+    inits = for v <- mutated, not MapSet.member?(scope.locals, v), do: quote(do: unquote(lvar(v)) = :undefined)
+
     testq = if n["test"], do: expr(n["test"], s1), else: true
     {bodyq, _} = stmt(n["body"], s1)
     updateq = if n["update"], do: expr(n["update"], s1), else: :undefined
 
     q =
       quote do
+        unquote_splicing(inits)
         unquote(initq)
 
         unquote(loop) = fn me, unquote(state_tuple) ->
@@ -364,7 +371,7 @@ defmodule TinyLasers.Gate.Lower do
   end
 
   defp expr(%{"type" => t} = f, scope) when t in ["FunctionExpression", "ArrowFunctionExpression"],
-    do: func(f["id"]["name"], f["params"], f["body"], scope)
+    do: func(f["params"], f["body"], scope)
 
   defp expr(nil, _), do: :undefined
   defp expr(_other, _scope), do: :undefined
@@ -373,23 +380,14 @@ defmodule TinyLasers.Gate.Lower do
   # `self_name` (for named declarations/expressions) is bound INSIDE the body to a self-passing closure, so a
   # named function can recurse — Elixir anonymous funs can't reference their own binding name, so we use the
   # Y-combinator form `rec = fn me, args -> ...me... end` and expose `gg_<name>` as `closure(fn a-> me.(me,a) end)`.
-  defp func(self_name, params, body, scope) do
+  # a guest function as a directly-held closure with the (this, args) ABI. Recursion/forward/mutual refs are
+  # handled by the late-bound function registry (a function name resolves to Runtime.greg_get at each use),
+  # so no Y-combinator is needed here. `this` binds the method receiver; ThisExpression lowers to __ggthis.
+  defp func(params, body, scope) do
     names = Enum.map(params, fn %{"name" => n} -> n end)
-    # NOT of the form "gg_<name>" so it can never collide with a guest identifier's local var.
     argvar = Macro.var(:__ggargs, __MODULE__)
     thisvar = Macro.var(:__ggthis, __MODULE__)
-    me = Macro.var(:__ggme, __MODULE__)
-    rec = Macro.var(:__ggrec, __MODULE__)
-
-    inner =
-      names
-      |> Enum.reduce(scope.locals, &MapSet.put(&2, &1))
-      |> then(fn s -> if self_name, do: MapSet.put(s, self_name), else: s end)
-
-    self_bind =
-      if self_name,
-        do: [quote(do: unquote(lvar(self_name)) = unquote(@runtime).closure(fn t, a -> unquote(me).(unquote(me), t, a) end))],
-        else: []
+    inner = Enum.reduce(names, scope.locals, &MapSet.put(&2, &1))
 
     binds =
       names
@@ -402,20 +400,15 @@ defmodule TinyLasers.Gate.Lower do
         e -> quote(do: unquote(@runtime).ret(unquote(expr(e, %{scope | locals: inner}))))
       end
 
-    # `this` is bound from the receiver passed by the method-call ABI; `ThisExpression` lowers to __ggthis.
     quote do
-      unquote(rec) = fn unquote(me), unquote(thisvar), unquote(argvar) ->
+      unquote(@runtime).closure(fn unquote(thisvar), unquote(argvar) ->
         try do
-          unquote_splicing(self_bind ++ binds)
+          unquote_splicing(binds)
           unquote(bodyq)
           :undefined
         catch
           :throw, {:gg_return, v} -> v
         end
-      end
-
-      unquote(@runtime).closure(fn unquote(thisvar), unquote(argvar) ->
-        unquote(rec).(unquote(rec), unquote(thisvar), unquote(argvar))
       end)
     end
   end
@@ -471,6 +464,8 @@ defmodule TinyLasers.Gate.Lower do
   defp ident(n, scope) do
     cond do
       MapSet.member?(scope.locals, n) -> lvar(n)
+      # a top-level function name resolves LATE via the registry (forward refs + mutual recursion)
+      is_map(scope) and scope[:funcs] && MapSet.member?(scope.funcs, n) -> quote(do: unquote(@runtime).greg_get(unquote(n)))
       # a granted capability compiles to its integer handle — never a host module atom
       is_map(scope[:granted]) and Map.has_key?(scope.granted, n) -> {:{}, [], [:host, scope.granted[n]]}
       true -> :undefined
