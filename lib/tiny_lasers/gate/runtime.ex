@@ -518,6 +518,17 @@ defmodule TinyLasers.Gate.Runtime do
   @doc "Guest `throw e` — a catchable guest exception carrying the guest value."
   def throw_val(v), do: throw({:gg_throw, v})
 
+  @doc "for-of iteration items: array elements, or a string's chars (1-char binaries)."
+  def iter({:arr, list}), do: list
+  def iter(s) when is_binary(s), do: for <<c::utf8 <- s>>, do: <<c::utf8>>
+  def iter(_), do: []
+
+  @doc "for-in enumeration keys: object own-keys, array index strings, or none."
+  def enum_keys({keys, map}) when is_map(map), do: keys
+  def enum_keys({:cell, _} = c), do: elem(cell_read(c), 0)
+  def enum_keys({:arr, list}), do: Enum.map(0..(length(list) - 1)//1, &Integer.to_string/1)
+  def enum_keys(_), do: []
+
   @doc "`typeof` — a fixed set of result binaries (never guest-controlled atoms)."
   def typeof(v) when is_number(v), do: "number"
   def typeof(v) when is_binary(v), do: "string"

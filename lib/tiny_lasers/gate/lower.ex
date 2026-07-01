@@ -109,9 +109,12 @@ defmodule TinyLasers.Gate.Lower do
       {q, scope}
     else
       state = {:{}, [], Enum.map(mutated, &lvar/1)}
+      inits = for v <- mutated, not MapSet.member?(scope.locals, v), do: quote(do: unquote(lvar(v)) = :undefined)
 
       q =
         quote do
+          unquote_splicing(inits)
+
           unquote(state) =
             if unquote(@runtime).truthy(unquote(t)) do
               unquote(cons)
@@ -192,10 +195,13 @@ defmodule TinyLasers.Gate.Lower do
       |> Enum.uniq()
 
     state = {:{}, [], Enum.map(mutated, &lvar/1)}
+    inits = for v <- mutated, not MapSet.member?(scope.locals, v), do: quote(do: unquote(lvar(v)) = :undefined)
     bind_param = if param, do: quote(do: unquote(lvar(param)) = __gg_thrown), else: quote(do: _ = __gg_thrown)
 
     tryq =
       quote do
+        unquote_splicing(inits)
+
         unquote(state) =
           try do
             unquote(blockq)
@@ -229,10 +235,61 @@ defmodule TinyLasers.Gate.Lower do
     stmt(%{"type" => "ForStatement", "init" => nil, "test" => n["test"], "update" => nil, "body" => n["body"]}, scope)
   end
 
+  defp stmt(%{"type" => "DoWhileStatement"} = n, scope) do
+    # do body while(test): run body once, then a while. Approximate by running body then the while loop.
+    {b1, _} = stmt(n["body"], scope)
+    {w, _} = stmt(%{"type" => "WhileStatement", "test" => n["test"], "body" => n["body"]}, scope)
+    {quote(do: (unquote(b1); unquote(w))), scope}
+  end
+
+  defp stmt(%{"type" => "ForOfStatement"} = n, scope), do: for_each(n, :of, scope)
+  defp stmt(%{"type" => "ForInStatement"} = n, scope), do: for_each(n, :in, scope)
+
   defp stmt(other, scope), do: {expr(other, scope), scope}
 
   defp for_init(%{"type" => "VariableDeclaration"} = d, scope), do: stmt(d, scope)
   defp for_init(e, scope), do: {expr(e, scope), scope}
+
+  # for (var x of iterable) / for (var k in obj): iterate items/keys, binding the loop var each round, and
+  # threading body-mutated vars through the recursion (like ForStatement). The loop var is bound from the
+  # item, not threaded.
+  defp for_each(n, kind, scope) do
+    vn =
+      case n["left"] do
+        %{"type" => "VariableDeclaration", "declarations" => [%{"id" => %{"name" => v}} | _]} -> v
+        %{"type" => "Identifier", "name" => v} -> v
+        _ -> "__ggforvar"
+      end
+
+    s1 = %{scope | locals: MapSet.put(scope.locals, vn)}
+    itemsfn = if kind == :of, do: :iter, else: :enum_keys
+    itemsq = quote(do: unquote(@runtime).unquote(itemsfn)(unquote(expr(n["right"], scope))))
+
+    mutated = (assigned_names(n["body"]) -- [vn]) |> Enum.uniq()
+    inits = for v <- mutated, not MapSet.member?(scope.locals, v), do: quote(do: unquote(lvar(v)) = :undefined)
+    state = {:{}, [], Enum.map(mutated, &lvar/1)}
+    loop = Macro.var(:gg_feach, __MODULE__)
+    {bodyq, _} = stmt(n["body"], s1)
+
+    q =
+      quote do
+        unquote_splicing(inits)
+
+        unquote(loop) = fn
+          me, [__ggitem | __ggrest], unquote(state) ->
+            unquote(lvar(vn)) = __ggitem
+            unquote(bodyq)
+            me.(me, __ggrest, unquote(state))
+
+          _me, [], unquote(state) ->
+            unquote(state)
+        end
+
+        unquote(state) = unquote(loop).(unquote(loop), unquote(itemsq), unquote(state))
+      end
+
+    {q, scope}
+  end
 
   # ── expressions ──
   # regex literal /pattern/flags — acorn attaches a "regex" map; compile through the confined regex capability.
@@ -278,6 +335,14 @@ defmodule TinyLasers.Gate.Lower do
         end
       end)
     end
+  end
+
+  defp expr(%{"type" => "TemplateLiteral", "quasis" => qs, "expressions" => es}, scope) do
+    quasis = Enum.map(qs, fn q -> (q["value"] && q["value"]["cooked"]) || "" end)
+    exprs = Enum.map(es, &expr(&1, scope))
+    # interleave q0, e0, q1, e1, …, qn  then string-concat via binop(:+)
+    parts = interleave(quasis, exprs)
+    Enum.reduce(parts, "", fn part, acc -> quote(do: unquote(@runtime).binop(:+, unquote(acc), unquote(part))) end)
   end
 
   defp expr(%{"type" => "ArrayExpression", "elements" => els}, scope) do
@@ -346,6 +411,13 @@ defmodule TinyLasers.Gate.Lower do
     quote(do: unquote(@runtime).oget(unquote(oq), unquote(kq)))
   end
 
+  # compound assignment (+=, -=, *=, …): x op= y  ==>  x = x op y (desugar to the "=" case).
+  defp expr(%{"type" => "AssignmentExpression", "operator" => op, "left" => l, "right" => r} = n, scope)
+       when op != "=" do
+    binop = String.trim_trailing(op, "=")
+    expr(%{n | "operator" => "=", "right" => %{"type" => "BinaryExpression", "operator" => binop, "left" => l, "right" => r}}, scope)
+  end
+
   # assignment: `id = v` rebinds the local; `id.prop = v` / `id[k] = v` rebinds id to the updated object.
   defp expr(%{"type" => "AssignmentExpression", "operator" => "=", "left" => l, "right" => r}, scope) do
     rq = expr(r, scope)
@@ -400,7 +472,27 @@ defmodule TinyLasers.Gate.Lower do
   defp expr(%{"type" => "UnaryExpression", "operator" => "-", "argument" => a}, scope),
     do: quote(do: unquote(@runtime).binop(:-, 0.0, unquote(expr(a, scope))))
 
-  # i++ / i-- as statements-in-expression: rebind the identifier
+  # ++ / -- on a member: this.pos++ / o.n-- — read, +/-1, write back (in-place on a cell).
+  defp expr(%{"type" => "UpdateExpression", "operator" => op, "argument" => %{"type" => "MemberExpression"} = m}, scope) do
+    delta = if op == "++", do: 1.0, else: -1.0
+    kq = if m["computed"], do: expr(m["property"], scope), else: key_of(m["property"])
+
+    case m["object"] do
+      %{"type" => "Identifier", "name" => bn} ->
+        quote(do: unquote(lvar(bn)) = unquote(@runtime).oput_idx(unquote(ident(bn, scope)), unquote(kq),
+          unquote(@runtime).binop(:+, unquote(@runtime).oget(unquote(ident(bn, scope)), unquote(kq)), unquote(delta))))
+
+      base ->
+        b = Macro.var(:__ggub, __MODULE__)
+        quote do
+          unquote(b) = unquote(expr(base, scope))
+          unquote(@runtime).oput_idx(unquote(b), unquote(kq),
+            unquote(@runtime).binop(:+, unquote(@runtime).oget(unquote(b), unquote(kq)), unquote(delta)))
+        end
+    end
+  end
+
+  # i++ / i-- / ++i / --i on an identifier: rebind. (prefix vs postfix return value rarely load-bearing here.)
   defp expr(%{"type" => "UpdateExpression", "operator" => op, "argument" => %{"name" => n}} = _u, scope) do
     delta = if op == "++", do: 1.0, else: -1.0
     quote(do: unquote(lvar(n)) = unquote(@runtime).binop(:+, unquote(ident(n, scope)), unquote(delta)))
@@ -514,6 +606,10 @@ defmodule TinyLasers.Gate.Lower do
   end
 
   defp lvar(n), do: Macro.var(String.to_atom("gg_" <> n), __MODULE__)
+
+  defp interleave([q | qs], [e | es]), do: [q, e | interleave(qs, es)]
+  defp interleave(qs, []), do: qs
+  defp interleave([], _), do: []
 
   defp method_prop?(%{"method" => true}), do: true
   defp method_prop?(%{"value" => %{"type" => t}}) when t in ["FunctionExpression", "ArrowFunctionExpression"], do: true
