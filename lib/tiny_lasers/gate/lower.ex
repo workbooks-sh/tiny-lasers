@@ -988,7 +988,7 @@ defmodule TinyLasers.Gate.Lower do
       |> Enum.flat_map(fn {p, i} ->
         case p do
           %{"type" => "RestElement", "argument" => a} ->
-            destr_targets(a, quote(do: unquote(@runtime).avec(Enum.drop(unquote(argvar), unquote(i)))), bscope)
+            destr_targets(a, quote(do: unquote(@runtime).args_rest(unquote(argvar), unquote(i))), bscope)
 
           _ ->
             destr_targets(p, quote(do: unquote(@runtime).arg(unquote(argvar), unquote(i))), bscope)

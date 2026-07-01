@@ -384,6 +384,9 @@ defmodule TinyLasers.Gate.Runtime do
     {:arr, id}
   end
 
+  @doc "A rest parameter's array: the args from index `i` onward. (Keeps Enum.drop out of emitted guest code.)"
+  def args_rest(args, i) when is_list(args), do: avec(Enum.drop(args, i))
+
   defp al({:arr, id}), do: Process.get({:gg_vec, id}, {[], %{}}) |> elem(0)
   defp ap({:arr, id}), do: Process.get({:gg_vec, id}, {[], %{}}) |> elem(1)
   defp aset({:arr, id} = a, list, props), do: (Process.put({:gg_vec, id}, {list, props}); a)
