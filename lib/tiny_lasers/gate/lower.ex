@@ -505,6 +505,12 @@ defmodule TinyLasers.Gate.Lower do
     end
   end
 
+  # comma operator `a, b, c` — evaluate all, value is the last. (Minified code uses these everywhere, incl.
+  # marked's whole export line `r.marked=I, r.parse=H, …`.)
+  defp expr(%{"type" => "SequenceExpression", "expressions" => es}, scope) do
+    {:__block__, [], Enum.map(es, &expr(&1, scope))}
+  end
+
   defp expr(%{"type" => "ConditionalExpression"} = n, scope) do
     quote do
       if unquote(@runtime).truthy(unquote(expr(n["test"], scope))),
