@@ -369,7 +369,7 @@ defmodule TinyLasers.Gate.Runtime do
   def method({:globalobj} = g, name, args) do
     case oget(g, name) do
       {:fn, _} = f -> invoke(f, g, args)
-      _ -> guest_error("not a function")
+      _ -> if System.get_env("GAPLOG"), do: IO.puts(:stderr, "GAP globalmeth #{inspect(name)}"); guest_error("not a function")
     end
   end
 
@@ -684,12 +684,16 @@ defmodule TinyLasers.Gate.Runtime do
       "fill" -> aset_l(a, Enum.map(list, fn _ -> a0 end)); a
       "at" -> idx = trunc(num(a0)); idx = if idx < 0, do: length(list) + idx, else: idx; Enum.at(list, idx, :undefined)
       "splice" -> arr_splice(a, list, args)
+      # iterator methods — returned as arrays (for-of over an array works; strict iterator identity unneeded).
+      "entries" -> avec(list |> Enum.with_index() |> Enum.map(fn {v, i} -> avec([i * 1.0, v]) end))
+      "keys" -> avec(Enum.map(0..max(length(list) - 1, -1)//1, &(&1 * 1.0)))
+      "values" -> avec(list)
       m when m in ["toString", "valueOf"] -> list |> Enum.map(&to_str/1) |> Enum.join(",")
       _ ->
         # a function-valued named property (rare): call it; else it is not a function.
         case Map.get(ap(a), name, :undefined) do
           {:fn, _} = f -> invoke(f, a, args)
-          _ -> guest_error("not a function")
+          _ -> if System.get_env("GAPLOG"), do: IO.puts(:stderr, "GAP arrmeth #{inspect(name)}"); guest_error("not a function")
         end
     end
   end
@@ -930,7 +934,14 @@ defmodule TinyLasers.Gate.Runtime do
   # calling a method that doesn't resolve (incl. on `:undefined`, e.g. `os.cmd(...)`) is a guest TypeError,
   # NOT a host escape — the receiver was never a host reference.
   def method(r, nm, _a) do
-    if System.get_env("GAPLOG"), do: IO.puts(:stderr, "GAP method #{inspect(nm)} on #{inspect(r) |> String.slice(0, 40)}")
+    if System.get_env("GAPLOG") do
+      extra = if System.get_env("GAPTRACE") do
+        Process.info(self(), :current_stacktrace) |> elem(1)
+        |> Enum.filter(fn {m,_,_,_} -> m |> to_string() =~ ~r/Runtime|Guest/ end) |> Enum.take(6)
+        |> Enum.map_join(" <- ", fn {_,f,a,_} -> "#{f}/#{a}" end)
+      else "" end
+      IO.puts(:stderr, "GAP method #{inspect(nm)} on #{inspect(r) |> String.slice(0, 40)} #{extra}")
+    end
     if System.get_env("GAPSOFT"), do: :undefined, else: guest_error("not a function")
   end
 
@@ -1212,7 +1223,10 @@ defmodule TinyLasers.Gate.Runtime do
   @doc "Invoke a guest function with an explicit `this` receiver (method call). Ungranted callees error."
   def invoke({:fn, f}, this, args) when is_function(f, 2), do: f.(this, args)
   def invoke({:host, cap_id}, _this, args), do: host_call(cap_id, args)
-  def invoke(_not_callable, _this, _args), do: guest_error("not a function")
+  def invoke(nc, _this, args) do
+    if System.get_env("GAPLOG"), do: IO.puts(:stderr, "GAP invoke on #{inspect(nc)|>String.slice(0,40)} args=#{inspect(args)|>String.slice(0,50)}")
+    guest_error("not a function")
+  end
 
   # ── closures (handles, never raw funs) ──
 
@@ -1448,7 +1462,14 @@ defmodule TinyLasers.Gate.Runtime do
   end
 
   @doc "A guest-level exception. NOT a host escape — the driver catches it as a guest error."
-  def guest_error(reason), do: throw({:gg_guest_error, reason})
+  def guest_error(reason) do
+    if System.get_env("GAPTRACE") do
+      st = Process.info(self(), :current_stacktrace) |> elem(1)
+           |> Enum.filter(fn {m,_,_,_} -> m |> to_string() =~ ~r/Runtime|Guest/ end) |> Enum.take(8)
+      IO.puts(:stderr, "GERR #{inspect(reason)}: #{Enum.map_join(st, " <- ", fn {_,f,a,_} -> "#{f}/#{a}" end)}")
+    end
+    throw({:gg_guest_error, reason})
+  end
 
   @doc "Guest `return` — throws to the enclosing function-body catch. Routed through the Runtime so the
   emitted guest module references no external module (keeps the 'only Runtime' confinement invariant literal)."
