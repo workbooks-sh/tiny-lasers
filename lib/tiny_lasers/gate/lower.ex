@@ -158,7 +158,7 @@ defmodule TinyLasers.Gate.Lower do
       # break/continue present: throw-based control flow. The loop's mutated vars are boxed (boxed_set), so the
       # state persists across the throw — no tuple threading needed.
       tag = System.unique_integer([:positive])
-      s1 = Map.put(s0, :loops, [{label, tag} | (scope[:loops] || [])])
+      s1 = Map.put(s0, :loops, [{label, tag, :loop} | (scope[:loops] || [])])
       loop = Macro.var(:gg_loop, __MODULE__)
       testq = if n["test"], do: expr(n["test"], s1), else: true
       {bodyq, _} = stmt(n["body"], s1)
@@ -232,15 +232,29 @@ defmodule TinyLasers.Gate.Lower do
     end
   end
 
-  # resolve a break/continue target to its loop tag: labeled → the matching enclosing loop; unlabeled → innermost.
-  defp loop_tag(%{"name" => lbl}, scope) do
-    case Enum.find(scope[:loops] || [], fn {l, _} -> l == lbl end) do
-      {_, tag} -> tag
-      nil -> (case scope[:loops] do [{_, tag} | _] -> tag; _ -> 0 end)
+  # break targets the innermost breakable (loop OR switch); labeled → the matching one.
+  defp break_tag(%{"name" => lbl}, scope) do
+    case Enum.find(scope[:loops] || [], fn {l, _, _} -> l == lbl end) do
+      {_, tag, _} -> tag
+      nil -> first_tag(scope[:loops])
     end
   end
 
-  defp loop_tag(_nil, scope), do: (case scope[:loops] do [{_, tag} | _] -> tag; _ -> 0 end)
+  defp break_tag(_nil, scope), do: first_tag(scope[:loops])
+
+  # continue targets the innermost LOOP (switches are skipped); labeled → the matching loop.
+  defp cont_tag(%{"name" => lbl}, scope) do
+    case Enum.find(scope[:loops] || [], fn {l, _, k} -> l == lbl and k == :loop end) do
+      {_, tag, _} -> tag
+      nil -> loop_only_tag(scope[:loops])
+    end
+  end
+
+  defp cont_tag(_nil, scope), do: loop_only_tag(scope[:loops])
+
+  defp first_tag([{_, tag, _} | _]), do: tag
+  defp first_tag(_), do: 0
+  defp loop_only_tag(stack), do: (case Enum.find(stack || [], fn {_, _, k} -> k == :loop end) do {_, tag, _} -> tag; _ -> 0 end)
 
   defp stmt(%{"type" => "ThrowStatement", "argument" => arg}, scope),
     do: {quote(do: unquote(@runtime).throw_val(unquote(expr(arg, scope)))), scope}
@@ -252,10 +266,10 @@ defmodule TinyLasers.Gate.Lower do
   # break/continue throw to the target loop's catch. Unlabeled → innermost loop; labeled → the loop with that
   # label. (Boxed loop state survives the throw; see boxed_set/control_loop_vars.)
   defp stmt(%{"type" => "BreakStatement", "label" => l}, scope),
-    do: {quote(do: unquote(@runtime).brk(unquote(loop_tag(l, scope)))), scope}
+    do: {quote(do: unquote(@runtime).brk(unquote(break_tag(l, scope)))), scope}
 
   defp stmt(%{"type" => "ContinueStatement", "label" => l}, scope),
-    do: {quote(do: unquote(@runtime).cont(unquote(loop_tag(l, scope)))), scope}
+    do: {quote(do: unquote(@runtime).cont(unquote(cont_tag(l, scope)))), scope}
 
   # try { block } catch (e) { handler } finally { finalizer }. Mutations thread out as returned state (like
   # if/for). Guest throws ({:gg_throw}) and guest errors ({:gg_guest_error}) are catchable; {:gg_return}
@@ -332,25 +346,50 @@ defmodule TinyLasers.Gate.Lower do
   # switch(d){ case v: body; break; … default: … } — lowered to a `d === v` if/else-if chain (break ends a
   # case; NON-fall-through, the common form). Bind d to a temp, fold the cases into nested IfStatements, reuse
   # the if-threading for mutated vars.
+  # JS switch with correct FALL-THROUGH: find the first matching case (or default), then run every following
+  # case body until a `break`. Lowered as a matched-flag sequence: `matched ||= (d === caseVal)`, then
+  # `if matched: body`. `break` (unlabeled) targets this switch's tag; case bodies mutate BOXED vars (switch_vars)
+  # so they survive the `if matched` guards. `default` triggers when no tested case matches (checked over all).
   defp stmt(%{"type" => "SwitchStatement"} = n, scope) do
-    dvar = %{"type" => "Identifier", "name" => "__ggswitch"}
-    decl = %{"type" => "VariableDeclaration", "declarations" => [%{"id" => dvar, "init" => n["discriminant"]}]}
-
+    label = scope[:pending_label]
+    tag = System.unique_integer([:positive])
+    s = Map.merge(scope, %{loops: [{label, tag, :switch} | scope[:loops] || []], pending_label: nil})
+    dq = expr(n["discriminant"], s)
     cases = n["cases"] || []
-    {defaults, tested} = Enum.split_with(cases, &(&1["test"] == nil))
-    default_body = if defaults != [], do: block_of(strip_breaks(hd(defaults)["consequent"])), else: nil
+    m = Macro.var(:__ggm, __MODULE__)
+    d = Macro.var(:__ggd, __MODULE__)
+    nomatch = Macro.var(:__ggnomatch, __MODULE__)
 
-    chain =
-      Enum.reduce(Enum.reverse(tested), default_body, fn c, acc ->
-        %{
-          "type" => "IfStatement",
-          "test" => %{"type" => "BinaryExpression", "operator" => "===", "left" => dvar, "right" => c["test"]},
-          "consequent" => block_of(strip_breaks(c["consequent"])),
-          "alternate" => acc
-        }
+    matchq = fn c -> quote(do: unquote(@runtime).binop(:===, unquote(d), unquote(expr(c["test"], s)))) end
+
+    # nomatch = true iff NO tested case matches (nested ifs — avoid Elixir `or`/`not`, which emit :erlang.error
+    # boolean checks and would break the guest's Runtime-only confinement).
+    nomatch_q =
+      cases
+      |> Enum.reject(&(&1["test"] == nil))
+      |> Enum.reduce(true, fn c, acc -> quote(do: if(unquote(matchq.(c)), do: false, else: unquote(acc))) end)
+
+    case_stmts =
+      Enum.map(cases, fn c ->
+        {bodyq, _} = stmt(block_of(c["consequent"] || []), s)
+        cond_expr = if c["test"] == nil, do: nomatch, else: matchq.(c)
+        quote(do: (unquote(m) = if(unquote(m), do: true, else: unquote(cond_expr)); if(unquote(m), do: unquote(bodyq))))
       end)
 
-    stmt(%{"type" => "BlockStatement", "body" => [decl | (chain && [chain]) || []]}, scope)
+    q =
+      quote do
+        unquote(d) = unquote(dq)
+        unquote(nomatch) = unquote(nomatch_q)
+        unquote(m) = false
+
+        try do
+          (unquote_splicing(case_stmts))
+        catch
+          :throw, {:gg_break, unquote(tag)} -> :ok
+        end
+      end
+
+    {q, scope}
   end
 
   defp stmt(other, scope), do: {expr(other, scope), scope}
@@ -948,9 +987,23 @@ defmodule TinyLasers.Gate.Lower do
   defp boxed_set(decls, body) do
     # captured-by-a-nested-fn OR mutated inside a loop that uses break/continue (those loops use throw-based
     # control flow, which unwinds the tuple-threaded state — so the affected vars must live in boxes instead).
-    boxable = MapSet.union(MapSet.new(nested_refs(body)), MapSet.new(control_loop_vars(body)))
+    boxable =
+      MapSet.new(nested_refs(body))
+      |> MapSet.union(MapSet.new(control_loop_vars(body)))
+      |> MapSet.union(MapSet.new(switch_vars(body)))
+
     decls |> Enum.filter(&MapSet.member?(boxable, &1)) |> MapSet.new()
   end
+
+  # vars assigned inside any switch case — boxed so case-body mutations survive the flag-guarded fall-through
+  # lowering (an `if matched, do: body` doesn't export the body's bindings).
+  defp switch_vars(%{"type" => "SwitchStatement"} = n), do: Enum.flat_map(n["cases"] || [], &assigned_names(&1["consequent"])) ++ switch_vars_children(n)
+  defp switch_vars(%{"type" => t}) when t in ["FunctionExpression", "FunctionDeclaration", "ArrowFunctionExpression"], do: []
+  defp switch_vars(%{} = node), do: switch_vars_children(node)
+  defp switch_vars(list) when is_list(list), do: Enum.flat_map(list, &switch_vars/1)
+  defp switch_vars(_), do: []
+  defp switch_vars_children(node) when is_map(node), do: node |> Map.drop(["type"]) |> Map.values() |> Enum.flat_map(&switch_vars/1)
+  defp switch_vars_children(_), do: []
 
   @loop_types ["ForStatement", "WhileStatement", "DoWhileStatement", "ForOfStatement", "ForInStatement"]
 
