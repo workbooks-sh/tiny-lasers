@@ -30,7 +30,9 @@ defmodule TinyLasers.Gate.Lower do
 
   def program(%{"type" => "Program", "body" => body}, granted) do
     {stmts, _scope} = stmts(body, %{locals: MapSet.new(), granted: granted})
-    {:__block__, [], stmts}
+    # top-level `this` is undefined; bind it so a stray ThisExpression outside any function is defined.
+    top_this = quote(do: unquote(Macro.var(:__ggthis, __MODULE__)) = :undefined)
+    {:__block__, [], [top_this | stmts]}
   end
 
   # ── statement lists thread lexical scope (which names are locals) ──
@@ -240,6 +242,7 @@ defmodule TinyLasers.Gate.Lower do
     quote(do: unquote(@runtime).regex(unquote(src), unquote(flags)))
   end
   defp expr(%{"type" => "Identifier", "name" => n}, scope), do: ident(n, scope)
+  defp expr(%{"type" => "ThisExpression"}, _scope), do: Macro.var(:__ggthis, __MODULE__)
 
   defp expr(%{"type" => "ObjectExpression", "properties" => props}, scope) do
     Enum.reduce(props, quote(do: unquote(@runtime).olit()), fn p, acc ->
@@ -374,6 +377,7 @@ defmodule TinyLasers.Gate.Lower do
     names = Enum.map(params, fn %{"name" => n} -> n end)
     # NOT of the form "gg_<name>" so it can never collide with a guest identifier's local var.
     argvar = Macro.var(:__ggargs, __MODULE__)
+    thisvar = Macro.var(:__ggthis, __MODULE__)
     me = Macro.var(:__ggme, __MODULE__)
     rec = Macro.var(:__ggrec, __MODULE__)
 
@@ -384,7 +388,7 @@ defmodule TinyLasers.Gate.Lower do
 
     self_bind =
       if self_name,
-        do: [quote(do: unquote(lvar(self_name)) = unquote(@runtime).closure(fn a -> unquote(me).(unquote(me), a) end))],
+        do: [quote(do: unquote(lvar(self_name)) = unquote(@runtime).closure(fn t, a -> unquote(me).(unquote(me), t, a) end))],
         else: []
 
     binds =
@@ -398,8 +402,9 @@ defmodule TinyLasers.Gate.Lower do
         e -> quote(do: unquote(@runtime).ret(unquote(expr(e, %{scope | locals: inner}))))
       end
 
+    # `this` is bound from the receiver passed by the method-call ABI; `ThisExpression` lowers to __ggthis.
     quote do
-      unquote(rec) = fn unquote(me), unquote(argvar) ->
+      unquote(rec) = fn unquote(me), unquote(thisvar), unquote(argvar) ->
         try do
           unquote_splicing(self_bind ++ binds)
           unquote(bodyq)
@@ -409,7 +414,9 @@ defmodule TinyLasers.Gate.Lower do
         end
       end
 
-      unquote(@runtime).closure(fn unquote(argvar) -> unquote(rec).(unquote(rec), unquote(argvar)) end)
+      unquote(@runtime).closure(fn unquote(thisvar), unquote(argvar) ->
+        unquote(rec).(unquote(rec), unquote(thisvar), unquote(argvar))
+      end)
     end
   end
 

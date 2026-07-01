@@ -83,6 +83,12 @@ defmodule TinyLasers.Gate.F2VerticalTest do
     assert %{ext: [], bifs: []} = TinyLasers.Gate.dangerous_refs(bin)
   end
 
+  test "this-binding in methods (read)" do
+    assert %{result: {:ok, 7.0}} = Js.run("var o = { v: 7, get: function(){ return this.v; } }; o.get()")
+    assert %{result: {:ok, 15.0}} = Js.run("var o = { n: 10, add: function(x){ return this.n + x; } }; o.add(5)")
+    assert %{result: {:ok, 7.0}} = Js.run("var o = { a: 3, b: 4, sum: function(){ return this.a + this.b; } }; o.sum()")
+  end
+
   test "the compiled guest references ONLY the Runtime — confinement holds (H2)" do
     src = """
     function merge(a, b) { return { x: a.x, y: b.y }; }

@@ -303,7 +303,7 @@ defmodule TinyLasers.Gate.Runtime do
   # user object with a FUNCTION-valued property: `o.f(args)` calls the stored closure (no `this` binding yet).
   def method({_keys, map} = o, name, args) when is_map(map) do
     case oget(o, name) do
-      {:fn, _} = f -> call(f, args)
+      {:fn, _} = f -> invoke(f, o, args)
       _ -> guest_error("not a function")
     end
   end
@@ -334,9 +334,14 @@ defmodule TinyLasers.Gate.Runtime do
     binary_part(s, min(start, byte_size(s)), min(len, byte_size(s) - min(start, byte_size(s))))
   end
 
-  @doc "A guest function as a DIRECTLY-HELD closure (GC'd, no table). Safe: the guest can only invoke it via
-  `call/2`; no codegen path extracts and `apply`s the raw fun."
-  def closure(f) when is_function(f, 1), do: {:fn, f}
+  @doc "A guest function as a DIRECTLY-HELD closure (GC'd, no table). The fun takes `(this, args)`; safe —
+  the guest can only invoke it via `call/2` or `invoke/3`, and no codegen path extracts and `apply`s it."
+  def closure(f) when is_function(f, 2), do: {:fn, f}
+
+  @doc "Invoke a guest function with an explicit `this` receiver (method call). Ungranted callees error."
+  def invoke({:fn, f}, this, args) when is_function(f, 2), do: f.(this, args)
+  def invoke({:host, cap_id}, _this, args), do: host_call(cap_id, args)
+  def invoke(_not_callable, _this, _args), do: guest_error("not a function")
 
   # ── closures (handles, never raw funs) ──
 
@@ -356,7 +361,7 @@ defmodule TinyLasers.Gate.Runtime do
   capability handle. Anything else is a guest TypeError — NOT a host escape.
   There is no path here from guest data to an arbitrary MFA.
   """
-  def call({:fn, f}, args) when is_function(f, 1), do: f.(args)
+  def call({:fn, f}, args) when is_function(f, 2), do: f.(:undefined, args)
 
   def call({:fun, id}, args) do
     case Process.get(:gg_funs) |> Map.get(id) do
