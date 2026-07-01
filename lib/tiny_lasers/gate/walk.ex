@@ -303,10 +303,7 @@ defmodule TinyLasers.Gate.Walk do
       :undefined
     else
       key = if m["computed"], do: eval(p, env), else: key_of(p)
-      res = Runtime.oget(obj, key)
-      if System.get_env("MEMDBG") && key in ["magicString", "context", "scope"] && res == :undefined,
-        do: IO.puts(:stderr, "MEM .#{key} UNDEF on #{inspect(obj) |> String.slice(0, 30)} keys=#{inspect(Runtime.okeys(obj)) |> String.slice(0, 80)}")
-      res
+      Runtime.oget(obj, key)
     end
   end
 
@@ -452,7 +449,6 @@ defmodule TinyLasers.Gate.Walk do
     members = (n["body"] && n["body"]["body"]) || []
     ctor = Enum.find(members, &(&1["kind"] == "constructor"))
     sup = if n["superClass"], do: eval(n["superClass"], env), else: nil
-    if System.get_env("CLSDBG") && match?({:global, _}, sup), do: IO.puts(:stderr, "CLASS #{name} extends #{inspect(sup)} hasCtor=#{ctor != nil}")
 
     cenv = push(env)
 
