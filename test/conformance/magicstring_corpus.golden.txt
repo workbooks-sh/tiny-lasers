@@ -1,0 +1,23 @@
+basic=hello world
+overwrite=goodbye world
+update=hello there
+append=abcDEF
+prepend=XYZabc
+appendLeft=a[L]bc
+appendRight=a[R]bc
+prependLeft=a[PL]bc
+prependRight=a[PR]bc
+remove=world
+slice=hello
+trim=hi
+indent=  a
+  b
+  c
+clone=hello|hello!
+snip=hello
+isEmpty=false
+isEmptyTrue=true
+length=11
+multi-overwrite=XY
+multi-remove=acdf
+mixed=one TWO three END

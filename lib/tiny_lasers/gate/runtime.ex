@@ -288,15 +288,16 @@ defmodule TinyLasers.Gate.Runtime do
 
   def oget(_not_obj, _k), do: :undefined
 
-  @doc "Spread-merge b into a (Object.assign({}, a, b) shape). Returns a NEW object, b's keys last/override."
-  def omerge({ak, amap}, {bk, bmap}) do
-    {keys, map} =
-      Enum.reduce(bk, {ak, amap}, fn k, {ks, m} ->
-        if Map.has_key?(m, k), do: {ks, Map.put(m, k, bmap[k])}, else: {ks ++ [k], Map.put(m, k, bmap[k])}
-      end)
-
-    {keys, map}
+  @doc "Spread-merge b's own keys into cell a in order (`{...a, ...b}` / Object.assign). Mutates & returns a."
+  def omerge({:cell, _} = a, b) do
+    Enum.reduce(spread_keys(b), a, fn k, acc -> oput(acc, k, oget(b, k)) end)
   end
+
+  # own-enumerable keys of a spread source; non-objects (undefined/null/number/string) contribute nothing.
+  defp spread_keys({:cell, _} = c), do: okeys(c)
+  defp spread_keys({keys, map}) when is_map(map), do: keys
+  defp spread_keys({:globalobj}), do: okeys({:globalobj})
+  defp spread_keys(_), do: []
 
   def omerge({:cell, _} = c, b), do: omerge(cell_read(c), b)
   def omerge(a, {:cell, _} = c), do: omerge(a, cell_read(c))
@@ -371,6 +372,16 @@ defmodule TinyLasers.Gate.Runtime do
   defp ap({:arr, id}), do: Process.get({:gg_vec, id}, {[], %{}}) |> elem(1)
   defp aset({:arr, id} = a, list, props), do: (Process.put({:gg_vec, id}, {list, props}); a)
   defp aset_l({:arr, _} = a, list), do: aset(a, list, ap(a))
+
+  # overwrite `dst` from index `off` with `src` elements (typed-array .set), keeping the rest.
+  defp ta_set(dst, src, off) do
+    dst = List.to_tuple(dst)
+    Enum.reduce(Enum.with_index(src), dst, fn {v, i}, acc ->
+      idx = off + i
+      if idx >= 0 and idx < tuple_size(acc), do: put_elem(acc, idx, v), else: acc
+    end)
+    |> Tuple.to_list()
+  end
 
   @doc "Array literal from evaluated elements."
   def alit(elems) when is_list(elems), do: avec(elems)
@@ -619,6 +630,10 @@ defmodule TinyLasers.Gate.Runtime do
       "lastIndexOf" -> idx = list |> Enum.reverse() |> Enum.find_index(&(&1 === a0)); if idx, do: (length(list) - 1 - idx) * 1.0, else: -1.0
       "includes" -> Enum.any?(list, &(&1 === a0))
       "slice" -> avec(slice_list(list, a0 || 0.0, Enum.drop(args, 1)))
+      # typed-array subarray: a view expressed as a fresh backing array (sufficient for read/decode use).
+      "subarray" -> avec(slice_list(list, a0 || 0.0, Enum.drop(args, 1)))
+      # typed-array bulk set: write src elements starting at offset.
+      "set" -> src = (case a0 do {:arr,_} -> al(a0); _ -> [] end); off = trunc(to_number(Enum.at(args, 1) || 0.0)); aset_l(a, ta_set(list, src, off)); :undefined
       "concat" -> avec(list ++ arr_flat(args))
       "flat" -> avec(arr_flat(list))
       "map" -> avec(Enum.with_index(list) |> Enum.map(fn {v, i} -> call(a0, [v, i * 1.0, a]) end))
@@ -975,6 +990,17 @@ defmodule TinyLasers.Gate.Runtime do
     do: cell_new([{"message", to_str(List.first(args) || "")}, {"name", err}])
 
   def construct({:global, "Array"}, args), do: avec(args)
+  # typed arrays are backed by a plain guest array (indexed get/set, length, subarray all work on {:arr,_}).
+  # new TA(n) -> n zeros; new TA([...]) / new TA(otherTA) -> element copy.
+  def construct({:global, ta}, args)
+      when ta in ["Uint8Array", "Int8Array", "Uint16Array", "Int16Array", "Uint32Array",
+                  "Int32Array", "Float32Array", "Float64Array"] do
+    case args do
+      [{:arr, _} = av | _] -> avec(al(av))
+      [n | _] when is_number(n) -> avec(List.duplicate(0.0, trunc(n)))
+      _ -> avec([])
+    end
+  end
   def construct({:global, "Object"}, _), do: cell_new([])
   def construct({:global, "Set"}, args) do
     id = __id()

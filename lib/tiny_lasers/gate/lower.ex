@@ -60,7 +60,24 @@ defmodule TinyLasers.Gate.Lower do
   end
 
   defp hoist(%{"type" => "FunctionDeclaration", "id" => %{"name" => n}} = f, s),
-    do: %{s | funcs: MapSet.put(s[:funcs] || MapSet.new(), n), fnmap: Map.put(s[:fnmap] || %{}, n, fnkey(n, f))}
+    do: greg_hoist(s, n, fnkey(n, f))
+
+  # class declarations hoist their name into the enclosing scope like a FunctionDeclaration (via the ctor's
+  # greg key), so a `new C()` appearing before `class C {}` in source order resolves. fnkey uses the class's
+  # `start`, which the synthetic ctor_decl (in stmt/2) mirrors — keeping the greg key identical on both sides.
+  defp hoist(%{"type" => "ClassDeclaration", "id" => %{"name" => n}} = c, s),
+    do: greg_hoist(s, n, fnkey(n, c))
+
+  # register a greg-backed declaration (function/class): add to funcs/fnmap, AND drop the name from any
+  # INHERITED boxed set — a same-named boxed var in an enclosing scope must not shadow this fresh local
+  # declaration (else references resolve to the outer box instead of the greg registry). See magic-string's
+  # `MagicString` class colliding with a program-level `var MagicString = module.exports`.
+  defp greg_hoist(s, n, key) do
+    s
+    |> Map.put(:funcs, MapSet.put(s[:funcs] || MapSet.new(), n))
+    |> Map.put(:fnmap, Map.put(s[:fnmap] || %{}, n, key))
+    |> Map.put(:boxed, MapSet.delete(s[:boxed] || MapSet.new(), n))
+  end
 
   defp hoist(%{"type" => "VariableDeclaration", "declarations" => ds}, s) do
     Enum.reduce(ds, s, fn d, acc ->
@@ -409,6 +426,8 @@ defmodule TinyLasers.Gate.Lower do
     ctor_decl = %{
       "type" => "FunctionDeclaration",
       "id" => cid,
+      # carry the class's `start` so the ctor's greg key (fnkey) matches the enclosing-scope hoist below.
+      "start" => n["start"],
       "params" => (ctor && ctor["value"]["params"]) || [],
       "body" => (ctor && ctor["value"]["body"]) || %{"type" => "BlockStatement", "body" => []}
     }
@@ -999,7 +1018,7 @@ defmodule TinyLasers.Gate.Lower do
   defp assigned_names(_), do: []
 
   # ── helpers ──
-  @globals ~w(Object Array Math JSON String Number Boolean Error TypeError RangeError SyntaxError Set Map)
+  @globals ~w(Object Array Math JSON String Number Boolean Error TypeError RangeError SyntaxError Set Map Uint8Array Int8Array Uint16Array Int16Array Uint32Array Int32Array Float32Array Float64Array)
   @global_fns ~w(parseInt parseFloat isNaN isFinite encodeURIComponent decodeURIComponent encodeURI decodeURI)
 
   defp ident(n, scope) do
@@ -1039,7 +1058,7 @@ defmodule TinyLasers.Gate.Lower do
   defp fndecl_names(%{"type" => "BlockStatement", "body" => body}), do: fndecl_names(body)
   defp fndecl_names(list) when is_list(list) do
     list
-    |> Enum.filter(&(is_map(&1) and &1["type"] == "FunctionDeclaration"))
+    |> Enum.filter(&(is_map(&1) and &1["type"] in ["FunctionDeclaration", "ClassDeclaration"] and &1["id"]))
     |> Enum.map(& &1["id"]["name"])
     |> MapSet.new()
   end
