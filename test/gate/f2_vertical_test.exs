@@ -50,6 +50,27 @@ defmodule TinyLasers.Gate.F2VerticalTest do
     assert %{result: {:ok, 6.0}} = Js.run("var o = { v: 3, dbl: function(x){ return x * 2; } }; o.dbl(o.v)")
   end
 
+  test "a non-trivial real program: recursive fib + recursive quicksort + objects, BEAM-native and confined" do
+    prog = """
+    function fib(n) { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); }
+    function qsort(a) {
+      if (a.length < 2) { return a; }
+      var pivot = a[0]; var less = []; var more = [];
+      for (var i = 1; i < a.length; i++) {
+        if (a[i] < pivot) { less.push(a[i]); } else { more.push(a[i]); }
+      }
+      return qsort(less).concat([pivot]).concat(qsort(more));
+    }
+    var sorted = qsort([5, 3, 8, 1, 9, 2, 7]);
+    var out = { fib10: fib(10), first: sorted[0], last: sorted[6], len: sorted.length };
+    out.fib10 + out.first + out.last + out.len
+    """
+
+    %{result: res, binary: bin} = Js.run(prog)
+    assert res == {:ok, 72.0}
+    assert %{ext: [], bifs: []} = TinyLasers.Gate.dangerous_refs(bin)
+  end
+
   test "the compiled guest references ONLY the Runtime — confinement holds (H2)" do
     src = """
     function merge(a, b) { return { x: a.x, y: b.y }; }

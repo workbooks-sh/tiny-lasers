@@ -65,7 +65,7 @@ defmodule TinyLasers.Gate.Lower do
   end
 
   defp stmt(%{"type" => "FunctionDeclaration", "id" => %{"name" => n}} = f, scope) do
-    fq = func(f["params"], f["body"], scope)
+    fq = func(n, f["params"], f["body"], scope)
     {quote(do: unquote(lvar(n)) = unquote(fq)), %{scope | locals: MapSet.put(scope.locals, n)}}
   end
 
@@ -82,21 +82,38 @@ defmodule TinyLasers.Gate.Lower do
     {{:__block__, [], qs}, scope}
   end
 
+  # if/else must THREAD variables mutated in either branch out to the enclosing scope — Elixir `if` does not
+  # export branch bindings, so each branch ends by returning the tuple of all branch-mutated vars, which we
+  # rebind. (A var unmutated in a branch just returns its incoming value.) Correct for mutation-in-conditional
+  # inside loops (e.g. qsort's `if (a[i]<p) lo.push(...) else hi.push(...)`).
   defp stmt(%{"type" => "IfStatement"} = n, scope) do
     t = expr(n["test"], scope)
     {cons, _} = stmt(n["consequent"], scope)
-    alt = if n["alternate"], do: elem(stmt(n["alternate"], scope), 0), else: :undefined
+    alt = if n["alternate"], do: elem(stmt(n["alternate"], scope), 0), else: nil
 
-    q =
-      quote do
-        if unquote(@runtime).truthy(unquote(t)) do
-          unquote(cons)
-        else
-          unquote(alt)
+    mutated =
+      (assigned_names(n["consequent"]) ++ assigned_names(n["alternate"])) |> Enum.uniq()
+
+    if mutated == [] do
+      q = quote(do: if(unquote(@runtime).truthy(unquote(t)), do: unquote(cons), else: unquote(alt || :undefined)))
+      {q, scope}
+    else
+      state = {:{}, [], Enum.map(mutated, &lvar/1)}
+
+      q =
+        quote do
+          unquote(state) =
+            if unquote(@runtime).truthy(unquote(t)) do
+              unquote(cons)
+              unquote(state)
+            else
+              unquote(alt)
+              unquote(state)
+            end
         end
-      end
 
-    {q, scope}
+      {q, scope}
+    end
   end
 
   # for (init; test; update) body  — lowered to a tail-recursive anonymous fn (BEAM-native loop, GC'd).
@@ -263,17 +280,31 @@ defmodule TinyLasers.Gate.Lower do
   end
 
   defp expr(%{"type" => t} = f, scope) when t in ["FunctionExpression", "ArrowFunctionExpression"],
-    do: func(f["params"], f["body"], scope)
+    do: func(f["id"]["name"], f["params"], f["body"], scope)
 
   defp expr(nil, _), do: :undefined
   defp expr(_other, _scope), do: :undefined
 
-  # ── functions: real Elixir closures behind fun_new; returns via throw/catch ──
-  defp func(params, body, scope) do
+  # ── functions: real Elixir closures behind closure/1; returns via throw/catch ──
+  # `self_name` (for named declarations/expressions) is bound INSIDE the body to a self-passing closure, so a
+  # named function can recurse — Elixir anonymous funs can't reference their own binding name, so we use the
+  # Y-combinator form `rec = fn me, args -> ...me... end` and expose `gg_<name>` as `closure(fn a-> me.(me,a) end)`.
+  defp func(self_name, params, body, scope) do
     names = Enum.map(params, fn %{"name" => n} -> n end)
-    inner = Enum.reduce(names, scope.locals, &MapSet.put(&2, &1))
     # NOT of the form "gg_<name>" so it can never collide with a guest identifier's local var.
     argvar = Macro.var(:__ggargs, __MODULE__)
+    me = Macro.var(:__ggme, __MODULE__)
+    rec = Macro.var(:__ggrec, __MODULE__)
+
+    inner =
+      names
+      |> Enum.reduce(scope.locals, &MapSet.put(&2, &1))
+      |> then(fn s -> if self_name, do: MapSet.put(s, self_name), else: s end)
+
+    self_bind =
+      if self_name,
+        do: [quote(do: unquote(lvar(self_name)) = unquote(@runtime).closure(fn a -> unquote(me).(unquote(me), a) end))],
+        else: []
 
     binds =
       names
@@ -287,15 +318,17 @@ defmodule TinyLasers.Gate.Lower do
       end
 
     quote do
-      unquote(@runtime).closure(fn unquote(argvar) ->
+      unquote(rec) = fn unquote(me), unquote(argvar) ->
         try do
-          unquote_splicing(binds)
+          unquote_splicing(self_bind ++ binds)
           unquote(bodyq)
           :undefined
         catch
           :throw, {:gg_return, v} -> v
         end
-      end)
+      end
+
+      unquote(@runtime).closure(fn unquote(argvar) -> unquote(rec).(unquote(rec), unquote(argvar)) end)
     end
   end
 

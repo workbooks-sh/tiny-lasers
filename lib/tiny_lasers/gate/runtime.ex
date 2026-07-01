@@ -185,6 +185,11 @@ defmodule TinyLasers.Gate.Runtime do
   def method({:arr, list}, "includes", [x | _]), do: Enum.any?(list, &(&1 === x))
   def method({:arr, list}, "slice", [a | rest]), do: {:arr, slice_list(list, a, rest)}
 
+  def method({:arr, list}, "concat", args) do
+    tail = Enum.flat_map(args, fn {:arr, l} -> l; other -> [other] end)
+    {:arr, list ++ tail}
+  end
+
   def method({:arr, list}, "map", [f | _]),
     do: {:arr, Enum.with_index(list) |> Enum.map(fn {v, i} -> call(f, [v, i * 1.0]) end)}
 
