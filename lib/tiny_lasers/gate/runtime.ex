@@ -875,6 +875,11 @@ defmodule TinyLasers.Gate.Runtime do
   the guest can only invoke it via `call/2` or `invoke/3`, and no codegen path extracts and `apply`s it."
   def closure(f) when is_function(f, 2), do: {:fn, f}
 
+  defp instanceof_chain(nil, _target), do: false
+  defp instanceof_chain(proto, target) do
+    proto == target or instanceof_chain((case proto do {:cell, pid} -> Process.get({:gg_instproto, pid}); _ -> nil end), target)
+  end
+
   # a function's prototype cell (stable per closure) — the ES5 method bag for `new Ctor()` instances.
   defp fn_proto({:fn, f}) do
     case Process.get(:gg_fnproto, %{}) |> Map.get(f) do
@@ -1009,6 +1014,9 @@ defmodule TinyLasers.Gate.Runtime do
   def binop(:==, a, b), do: loose_eq(a, b)
   def binop(:!=, a, b), do: not loose_eq(a, b)
   def binop(:in, k, obj), do: has_own(obj, k)
+  # `x instanceof Ctor` — walk x's prototype chain (from `new`/Object.create linkage) for Ctor.prototype.
+  def binop(:instanceof, {:cell, id}, {:fn, _} = ctor), do: instanceof_chain(Process.get({:gg_instproto, id}), fn_proto(ctor))
+  def binop(:instanceof, _a, _b), do: false
   # bitwise ops — JS coerces via ToInt32; result is a signed 32-bit int returned as a float.
   def binop(:band, a, b), do: bitop(a, b, &Bitwise.band/2)
   def binop(:bor, a, b), do: bitop(a, b, &Bitwise.bor/2)
