@@ -473,7 +473,7 @@ defmodule TinyLasers.Gate.Runtime do
   def method({_keys, map} = o, name, args) when is_map(map) do
     case oget(o, name) do
       {:fn, _} = f -> invoke(f, o, args)
-      _ -> guest_error("not a function")
+      _ -> if System.get_env("GAPLOG"), do: IO.puts(:stderr, "GAP objmeth #{inspect(name)}"); guest_error("not a function")
     end
   end
 
@@ -483,7 +483,7 @@ defmodule TinyLasers.Gate.Runtime do
   def method({:cell, _} = c, name, args) do
     case oget(c, name) do
       {:fn, _} = f -> invoke(f, c, args)
-      _ -> guest_error("not a function")
+      _ -> if System.get_env("GAPLOG"), do: IO.puts(:stderr, "GAP cellmeth #{inspect(name)}"); guest_error("not a function")
     end
   end
 
@@ -616,7 +616,10 @@ defmodule TinyLasers.Gate.Runtime do
 
   # calling a method that doesn't resolve (incl. on `:undefined`, e.g. `os.cmd(...)`) is a guest TypeError,
   # NOT a host escape — the receiver was never a host reference.
-  def method(_recv, _name, _args), do: guest_error("not a function")
+  def method(r, nm, _a) do
+    if System.get_env("GAPLOG"), do: IO.puts(:stderr, "GAP method #{inspect(nm)} on #{inspect(r) |> String.slice(0, 40)}")
+    guest_error("not a function")
+  end
 
   defp pop_last([]), do: {:mut, {:arr, []}, :undefined}
   defp pop_last(list), do: {:mut, {:arr, Enum.drop(list, -1)}, List.last(list)}
@@ -729,7 +732,10 @@ defmodule TinyLasers.Gate.Runtime do
   end
 
   def call({:host, cap_id}, args), do: host_call(cap_id, args)
-  def call(_not_callable, _args), do: guest_error("not a function")
+  def call(nc, _args) do
+    if System.get_env("GAPLOG"), do: IO.puts(:stderr, "GAP call on #{inspect(nc) |> String.slice(0, 40)}")
+    guest_error("not a function")
+  end
 
   @doc """
   Invoke a granted host capability by integer id. An id that was not granted is a

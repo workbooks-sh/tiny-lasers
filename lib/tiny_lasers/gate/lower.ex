@@ -587,24 +587,59 @@ defmodule TinyLasers.Gate.Lower do
       |> Enum.with_index()
       |> Enum.map(fn {p, i} -> quote(do: unquote(lvar(p)) = unquote(@runtime).arg(unquote(argvar), unquote(i))) end)
 
-    bodyq =
+    bscope = %{scope | locals: inner}
+
+    # #6 direct-return optimization: if returns appear ONLY at the body's tail (or not at all), compile
+    # without the try/catch/throw machinery — the block's value IS the result. Avoids one throw+catch per call
+    # (the dominant per-call cost; ~millions for recursive marked code). Functions with early/nested returns
+    # keep the throw path.
+    stmts_list =
       case body do
-        %{"type" => "BlockStatement", "body" => b} -> elem(stmts(b, %{scope | locals: inner}), 0) |> block()
-        e -> quote(do: unquote(@runtime).ret(unquote(expr(e, %{scope | locals: inner}))))
+        %{"type" => "BlockStatement", "body" => b} -> b
+        e -> [%{"type" => "ReturnStatement", "argument" => e}]
       end
 
-    quote do
-      unquote(@runtime).closure(fn unquote(thisvar), unquote(argvar) ->
-        try do
-          unquote_splicing(hoistq ++ binds)
-          unquote(bodyq)
-          :undefined
-        catch
-          :throw, {:gg_return, v} -> v
+    nreturns = count_returns(stmts_list)
+    last = List.last(stmts_list)
+    tail_return? = nreturns == 0 or (nreturns == 1 and last && last["type"] == "ReturnStatement")
+
+    if tail_return? do
+      {value_stmts, _} =
+        if last && last["type"] == "ReturnStatement" do
+          {init, _} = stmts(Enum.drop(stmts_list, -1), bscope)
+          {init ++ [expr(last["argument"] || %{"type" => "Literal", "value" => nil}, bscope)], bscope}
+        else
+          {sq, sc} = stmts(stmts_list, bscope)
+          {sq ++ [:undefined], sc}
         end
-      end)
+
+      quote do
+        unquote(@runtime).closure(fn unquote(thisvar), unquote(argvar) ->
+          unquote_splicing(hoistq ++ binds ++ value_stmts)
+        end)
+      end
+    else
+      {bq, _} = stmts(stmts_list, bscope)
+
+      quote do
+        unquote(@runtime).closure(fn unquote(thisvar), unquote(argvar) ->
+          try do
+            unquote_splicing(hoistq ++ binds ++ bq)
+            :undefined
+          catch
+            :throw, {:gg_return, v} -> v
+          end
+        end)
+      end
     end
   end
+
+  # count ReturnStatements in a subtree, NOT descending into nested functions.
+  defp count_returns(%{"type" => t}) when t in ["FunctionExpression", "FunctionDeclaration", "ArrowFunctionExpression"], do: 0
+  defp count_returns(%{"type" => "ReturnStatement"} = n), do: 1 + count_returns(n["argument"])
+  defp count_returns(%{} = node), do: node |> Map.drop(["type"]) |> Map.values() |> Enum.map(&count_returns/1) |> Enum.sum()
+  defp count_returns(list) when is_list(list), do: list |> Enum.map(&count_returns/1) |> Enum.sum()
+  defp count_returns(_), do: 0
 
   defp block(list) when is_list(list), do: {:__block__, [], list}
   defp block(q), do: q
