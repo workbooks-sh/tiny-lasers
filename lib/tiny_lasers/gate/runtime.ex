@@ -541,9 +541,13 @@ defmodule TinyLasers.Gate.Runtime do
   def method(s, "toUpperCase", _) when is_binary(s), do: String.upcase(s)
   def method(s, "toLowerCase", _) when is_binary(s), do: String.downcase(s)
   def method(s, "slice", [a | rest]) when is_binary(s), do: str_slice(s, a, rest)
-  def method(s, "indexOf", [sub | _]) when is_binary(s) do
-    case :binary.match(s, to_str(sub)) do
-      {pos, _} -> pos * 1.0
+  def method(s, "indexOf", [sub | rest]) when is_binary(s) do
+    # honor the optional fromIndex (JS `str.indexOf(sub, from)`); acorn's regex-flag validation relies on it.
+    from = case rest do [f | _] when is_number(f) -> min(max(trunc(f), 0), byte_size(s)); _ -> 0 end
+    scope = binary_part(s, from, byte_size(s) - from)
+
+    case :binary.match(scope, to_str(sub)) do
+      {pos, _} -> (pos + from) * 1.0
       :nomatch -> -1.0
     end
   end
