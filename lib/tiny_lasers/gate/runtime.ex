@@ -262,10 +262,16 @@ defmodule TinyLasers.Gate.Runtime do
   def oget({:regex, _, _, _} = r, "lastIndex"), do: relast_get(r) * 1.0
 
   # string properties: `.length` and index access `s[i]` (JS returns a 1-char string).
-  def oget(s, "length") when is_binary(s), do: byte_size(s) * 1.0
+  # string length/index are by CODE POINT (JS string semantics), with an all-ASCII fast path (bytes==code
+  # points → the O(1) byte op is already correct). acorn's unicode identifier tokenizer needs this.
+  def oget(s, "length") when is_binary(s), do: str_len(s) * 1.0
   def oget(s, i) when is_binary(s) and is_number(i) do
     idx = trunc(i)
-    if idx >= 0 and idx < byte_size(s), do: binary_part(s, idx, 1), else: :undefined
+    cond do
+      idx < 0 -> :undefined
+      ascii?(s) -> (if idx < byte_size(s), do: binary_part(s, idx, 1), else: :undefined)
+      true -> (case Enum.at(String.to_charlist(s), idx) do nil -> :undefined; cp -> List.to_string([cp]) end)
+    end
   end
 
   @doc "global namespace/property reads (Math.PI, Number.MAX_VALUE, Object.prototype)."
@@ -530,14 +536,15 @@ defmodule TinyLasers.Gate.Runtime do
   end
 
   def method(s, "charCodeAt", [i | _]) when is_binary(s) do
-    case :binary.at(s, trunc(i)) do
-      b when is_integer(b) -> b * 1.0
+    idx = trunc(i)
+    cond do
+      idx < 0 -> :undefined
+      ascii?(s) -> (if idx < byte_size(s), do: :binary.at(s, idx) * 1.0, else: :undefined)
+      true -> (case Enum.at(String.to_charlist(s), idx) do nil -> :undefined; cp -> cp * 1.0 end)
     end
-  rescue
-    ArgumentError -> :undefined
   end
 
-  def method(s, "length", _) when is_binary(s), do: byte_size(s) * 1.0
+  def method(s, "length", _) when is_binary(s), do: str_len(s) * 1.0
   def method(s, "toUpperCase", _) when is_binary(s), do: String.upcase(s)
   def method(s, "toLowerCase", _) when is_binary(s), do: String.downcase(s)
   def method(s, "slice", [a | rest]) when is_binary(s), do: str_slice(s, a, rest)
@@ -861,24 +868,36 @@ defmodule TinyLasers.Gate.Runtime do
     Enum.slice(list, start, max(stop - start, 0))
   end
 
+  # code-point count (JS string length) with an all-ASCII fast path.
+  defp str_len(s), do: if ascii?(s), do: byte_size(s), else: length(String.to_charlist(s))
+  # all-ASCII check (the common case → the byte ops are already correct): no byte has the high bit set.
+  defp ascii?(<<>>), do: true
+  defp ascii?(<<b, rest::binary>>) when b < 128, do: ascii?(rest)
+  defp ascii?(_), do: false
+
+  # slice/substring on CODE POINTS (JS semantics), ASCII fast path via binary_part.
   defp str_slice(s, a, rest) do
-    n = byte_size(s)
+    n = str_len(s)
     start = trunc(num(a))
     start = if start < 0, do: max(n + start, 0), else: min(start, n)
     stop = case rest do
       [b | _] when b != :undefined -> e = trunc(num(b)); if e < 0, do: max(n + e, 0), else: min(e, n)
       _ -> n
     end
-    binary_part(s, start, max(stop - start, 0))
+    cp_sub(s, start, max(stop - start, 0))
   end
 
   # substring(a,b): clamps to [0,len], swaps if a>b (JS semantics), no negatives.
   defp str_substring(s, a, rest) do
-    len = byte_size(s)
+    len = str_len(s)
     a = a |> trunc() |> max(0) |> min(len)
     b = case rest do [x | _] when is_number(x) -> x |> trunc() |> max(0) |> min(len); _ -> len end
     lo = min(a, b)
-    binary_part(s, lo, max(a, b) - lo)
+    cp_sub(s, lo, max(a, b) - lo)
+  end
+
+  defp cp_sub(s, start, len) do
+    if ascii?(s), do: binary_part(s, start, len), else: (String.to_charlist(s) |> Enum.slice(start, len) |> List.to_string())
   end
 
   defp str_pad(s, len, rest, side) do
