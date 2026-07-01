@@ -555,7 +555,7 @@ defmodule TinyLasers.Gate.Runtime do
   def method({:set, _} = st, "forEach", [f | _]), do: (Enum.each(set_list(st), fn v -> call(f, [v, v]) end); :undefined)
   # Map
   def method({:map, _} = mp, "get", [k | _]), do: (case List.keyfind(map_pairs(mp), k, 0) do {_, v} -> v; _ -> :undefined end)
-  def method({:map, id} = mp, "set", [k, v | _]), do: (Process.put({:gg_map, id}, List.keystore(map_pairs(mp), 0, {k, v})); mp)
+  def method({:map, id} = mp, "set", [k, v | _]), do: (Process.put({:gg_map, id}, List.keystore(map_pairs(mp), k, 0, {k, v})); mp)
   def method({:map, _} = mp, "has", [k | _]), do: List.keymember?(map_pairs(mp), k, 0)
   def method({:map, id} = mp, "delete", [k | _]), do: (had = method(mp, "has", [k]); Process.put({:gg_map, id}, List.keydelete(map_pairs(mp), k, 0)); had)
   def method({:map, id}, "clear", _), do: (Process.put({:gg_map, id}, []); :undefined)
@@ -1177,7 +1177,10 @@ defmodule TinyLasers.Gate.Runtime do
   def binop(:-, a, b), do: arith(a, b, &Kernel.-/2)
   def binop(:*, a, b), do: arith(a, b, &Kernel.*/2)
   def binop(:rem, a, b), do: arith(a, b, fn x, y -> if y == 0, do: :nan, else: x - y * Float.floor(x / y) end)
-  def binop(_op, _a, _b), do: guest_error("bad operands")
+  def binop(op, a, b) do
+    if System.get_env("GAPLOG"), do: IO.puts(:stderr, "GAP binop #{inspect(op)} a=#{inspect(a)|>String.slice(0,30)} b=#{inspect(b)|>String.slice(0,30)}")
+    guest_error("bad operands")
+  end
 
   defp nullish?(:null), do: true
   defp nullish?(:undefined), do: true
@@ -1220,6 +1223,11 @@ defmodule TinyLasers.Gate.Runtime do
       true -> :nan
     end
   end
+
+  @doc "JS nullish: only null/undefined (for `??` and `?.`). Distinct from falsy."
+  def is_nullish(:undefined), do: true
+  def is_nullish(:null), do: true
+  def is_nullish(_), do: false
 
   def truthy(false), do: false
   def truthy(:undefined), do: false

@@ -742,6 +742,14 @@ defmodule TinyLasers.Gate.Lower do
     quote(do: unquote(@runtime).oget(unquote(oq), unquote(kq)))
   end
 
+  # logical assignment (&&=, ||=, ??=): x op= y  ==>  x = x <logical> y. Must lower as a LogicalExpression
+  # (short-circuit / nullish), NOT a BinaryExpression — `&&`/`||`/`??` are not binary operators.
+  defp expr(%{"type" => "AssignmentExpression", "operator" => op, "left" => l, "right" => r} = n, scope)
+       when op in ["&&=", "||=", "??="] do
+    logop = String.trim_trailing(op, "=")
+    expr(%{n | "operator" => "=", "right" => %{"type" => "LogicalExpression", "operator" => logop, "left" => l, "right" => r}}, scope)
+  end
+
   # compound assignment (+=, -=, *=, …): x op= y  ==>  x = x op y (desugar to the "=" case).
   defp expr(%{"type" => "AssignmentExpression", "operator" => op, "left" => l, "right" => r} = n, scope)
        when op != "=" do
@@ -813,6 +821,9 @@ defmodule TinyLasers.Gate.Lower do
     cond do
       mutated == [] and op == "&&" -> quote(do: (fn v -> if unquote(@runtime).truthy(v), do: unquote(rq), else: v end).(unquote(lq)))
       mutated == [] and op == "||" -> quote(do: (fn v -> if unquote(@runtime).truthy(v), do: v, else: unquote(rq) end).(unquote(lq)))
+      # `a ?? b`: b only when a is null/undefined (nullish), NOT merely falsy.
+      mutated == [] and op == "??" -> quote(do: (fn v -> if unquote(@runtime).is_nullish(v), do: unquote(rq), else: v end).(unquote(lq)))
+      op == "??" -> cond_thread(quote(do: unquote(@runtime).is_nullish(__gglv)), rq, quote(do: __gglv), mutated, scope, quote(do: __gglv = unquote(lq)), false)
       true -> cond_thread(quote(do: unquote(@runtime).truthy(__gglv)), rq, quote(do: __gglv), mutated, scope, quote(do: __gglv = unquote(lq)), op == "||")
     end
   end
