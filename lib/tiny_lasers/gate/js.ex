@@ -76,7 +76,7 @@ defmodule TinyLasers.Gate.Js do
       {:done, res, output} ->
         %{result: res, output: output, binary: bin, mod: mod}
     after
-      10_000 -> %{result: {:timeout, nil}, output: [], binary: bin, mod: mod}
+      Keyword.get(opts, :timeout, 10_000) -> (Process.exit(pid, :kill); %{result: {:timeout, nil}, output: [], binary: bin, mod: mod})
     end
   end
 
