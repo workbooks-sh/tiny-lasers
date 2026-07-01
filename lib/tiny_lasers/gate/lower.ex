@@ -595,6 +595,16 @@ defmodule TinyLasers.Gate.Lower do
   defp expr(%{"type" => "UnaryExpression", "operator" => "-", "argument" => a}, scope),
     do: quote(do: unquote(@runtime).binop(:-, 0.0, unquote(expr(a, scope))))
 
+  # unary `+x` → ToNumber(x) (marked's ordered-list `start = +bullet.slice(0,-1)`); `~x` → bitwise NOT; `void x`.
+  defp expr(%{"type" => "UnaryExpression", "operator" => "+", "argument" => a}, scope),
+    do: quote(do: unquote(@runtime).to_number(unquote(expr(a, scope))))
+
+  defp expr(%{"type" => "UnaryExpression", "operator" => "~", "argument" => a}, scope),
+    do: quote(do: unquote(@runtime).binop(:bxor, -1.0, unquote(expr(a, scope))))
+
+  defp expr(%{"type" => "UnaryExpression", "operator" => "void", "argument" => a}, scope),
+    do: quote(do: (unquote(expr(a, scope)); :undefined))
+
   # ++ / -- on a member: this.pos++ / o.n-- — read, +/-1, write back (in-place on a cell).
   defp expr(%{"type" => "UpdateExpression", "operator" => op, "argument" => %{"type" => "MemberExpression"} = m}, scope) do
     delta = if op == "++", do: 1.0, else: -1.0

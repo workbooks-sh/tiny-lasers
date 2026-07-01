@@ -762,16 +762,17 @@ defmodule TinyLasers.Gate.Runtime do
     end
   end
 
-  defp to_number(x) when is_number(x), do: x
-  defp to_number(true), do: 1.0
-  defp to_number(false), do: 0.0
-  defp to_number(s) when is_binary(s) do
+  @doc "ToNumber coercion (public: unary + uses it)."
+  def to_number(x) when is_number(x), do: x
+  def to_number(true), do: 1.0
+  def to_number(false), do: 0.0
+  def to_number(s) when is_binary(s) do
     case Float.parse(String.trim(s)) do
       {n, ""} -> n
       _ -> case Integer.parse(String.trim(s)) do {n, ""} -> n * 1.0; _ -> :undefined end
     end
   end
-  defp to_number(_), do: :undefined
+  def to_number(_), do: :undefined
 
   # Function.prototype.apply/call/bind (marked + minified helpers use these heavily).
   def method({:fn, _} = f, "apply", args) do
