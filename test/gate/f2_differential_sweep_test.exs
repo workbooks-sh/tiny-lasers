@@ -109,7 +109,22 @@ defmodule TinyLasers.Gate.F2DifferentialSweepTest do
     {"live-set-break", ~S'var s = new Set([1]); var n = 0; for (var v of s) { n++; if (v < 5) s.add(v + 1); if (v === 3) break; } print(n + "," + s.size);'},
     {"set-from-set", ~S'var a = new Set([1, 2, 2, 3]); var b = new Set(a); b.add(4); print(a.size + "," + b.size);'},
     {"map-from-map", ~S'var m = new Map([["k", 1]]); var m2 = new Map(m); m2.set("j", 2); print(m.size + "," + m2.size + "," + m2.get("k"));'},
-    {"array-from-map-mapper", ~S'var m = new Map([["a", 1], ["b", 2]]); print(Array.from(m, function(kv) { return kv[0] + "=" + kv[1]; }).join(","));'}
+    {"array-from-map-mapper", ~S'var m = new Map([["a", 1], ["b", 2]]); print(Array.from(m, function(kv) { return kv[0] + "=" + kv[1]; }).join(","));'},
+
+    # named function expressions (self-recursion), class fields, and cross-scope var isolation (svelte's
+    # minified compiler: recursive walkers, $state fields, and acorn's `for (var t = true)` loop-locals that
+    # must NOT alias a same-named helper in another function).
+    {"nfe-recursion", ~S'var f = function fact(n) { return n <= 1 ? 1 : n * fact(n - 1); }; print(f(5));'},
+    {"nfe-iife", ~S'var r = (function rec(n) { return n.c ? n.v + rec(n.c) : n.v; })({ v: 1, c: { v: 2, c: { v: 3 } } }); print(r);'},
+    {"class-fields", ~S'class C { has = false; count = 0; constructor(n) { this.count = n; } bump() { this.count += 1; return this.count; } } var c = new C(5); print(c.has + "," + c.bump());'},
+    {"static-field", ~S'class C { static kind = "widget"; } print(C.kind);'},
+    {"private-field", ~S'class C { #x = 7; get() { return this.#x; } set(v) { this.#x = v; } } var c = new C(); c.set(9); print(c.get());'},
+    {"cross-scope-var-shadow", ~S'function a() { var pick = { g: function() { return t; } }; function t() { return "A"; } b(); return pick.g()(); } function b() { for (var t = true, s = ""; false; ) {} t = false; return t; } print(a());'},
+    {"forvar-postloop-read", ~S'function rw() { for (var w = "", t = true, n = 0; n < 3; n++) { t = false; w += n; } return w + "|" + t; } print(rw());'},
+    {"flatMap", ~S'print([1, 2, 3].flatMap(function(x) { return [x, x * 10]; }).join(","));'},
+    {"startsWith-pos", ~S'var s = "        each"; print(s.startsWith("each", 8) + "," + s.startsWith("each", 0));'},
+    {"matchAll", ~S'var out = []; for (var m of "a1b2c3".matchAll(/([a-z])(\d)/g)) out.push(m[1] + m[2]); print(out.join(","));'},
+    {"div-by-zero", ~S'print((1 / 0) + "," + (-1 / 0) + "," + (0 / 0) + "," + (6 / 2));'}
   ]
 
   test "every construct case prints identically through Walk and Lower" do

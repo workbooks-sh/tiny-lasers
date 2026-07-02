@@ -1340,6 +1340,25 @@ defmodule TinyLasers.Gate.Lower do
     end
   end
 
+  # a NAMED function expression binds its own name inside its body (`(function rec(n){ …rec(n-1)… })`) —
+  # svelte's minified walker recurses this way. Register the closure under a start-unique greg key and let
+  # the body resolve the name late-bound (same registry mechanism as declarations); outer scope unaffected.
+  defp expr(%{"type" => "FunctionExpression", "id" => %{"name" => nm}} = f, scope) when is_binary(nm) do
+    key = fnkey(nm, f)
+
+    bscope =
+      scope
+      |> Map.put(:funcs, MapSet.put(scope[:funcs] || MapSet.new(), nm))
+      |> Map.put(:fnmap, Map.put(scope[:fnmap] || %{}, nm, key))
+
+    q = func(f["params"], f["body"], bscope, f["async"] == true, false, f["generator"] == true)
+
+    quote do
+      unquote(@runtime).greg_set(unquote(key), unquote(q))
+      unquote(@runtime).greg_get(unquote(key))
+    end
+  end
+
   defp expr(%{"type" => t} = f, scope) when t in ["FunctionExpression", "ArrowFunctionExpression"],
     do: func(f["params"], f["body"], scope, f["async"] == true, t == "ArrowFunctionExpression", f["generator"] == true)
 
@@ -2022,6 +2041,9 @@ defmodule TinyLasers.Gate.Lower do
   defp method_prop?(%{"value" => %{"type" => t}}) when t in ["FunctionExpression", "ArrowFunctionExpression"], do: true
   defp method_prop?(_), do: false
 
+  # a private name (#x) mangles to a "#x" string key — unreachable from normal property syntax, so private
+  # semantics hold without a brand-check mechanism.
+  defp key_of(%{"type" => "PrivateIdentifier", "name" => n}), do: "#" <> n
   defp key_of(%{"type" => "Identifier", "name" => n}), do: n
   defp key_of(%{"type" => "Literal", "value" => v}) when is_binary(v), do: v
   defp key_of(%{"type" => "Literal", "value" => v}), do: to_string(v)

@@ -897,8 +897,36 @@ defmodule TinyLasers.Gate.Runtime do
   def method(s, "repeat", _) when is_binary(s), do: ""
   def method(s, "padStart", [len | rest]) when is_binary(s), do: str_pad(s, len, rest, :leading)
   def method(s, "padEnd", [len | rest]) when is_binary(s), do: str_pad(s, len, rest, :trailing)
-  def method(s, "startsWith", [p | _]) when is_binary(s), do: String.starts_with?(s, to_str(p))
-  def method(s, "endsWith", [p | _]) when is_binary(s), do: String.ends_with?(s, to_str(p))
+  # matchAll: every match as an exec-style entry (captures + index/input props) in an array — our for-of and
+  # spread iterate arrays, which covers the iterator protocol uses (svelte scans templates with it).
+  def method(s, "matchAll", [{:regex, re, _src, _flags} | _]) when is_binary(s) do
+    Regex.scan(re, s, return: :index)
+    |> Enum.map(fn [{ms, ml} | groups] ->
+      caps = Enum.map([{ms, ml} | groups], fn {i, l} -> if i < 0, do: :undefined, else: binary_part(s, i, l) end)
+      avec(caps, %{"index" => ms * 1.0, "input" => s})
+    end)
+    |> avec()
+  end
+
+  # startsWith/endsWith take an optional POSITION argument (svelte's template matcher is
+  # `template.startsWith("each", index)` — ignoring it made every block keyword miss).
+  def method(s, "startsWith", [p | rest]) when is_binary(s) do
+    case rest do
+      [pos | _] when is_number(pos) -> String.starts_with?(str_slice_from(s, trunc(pos)), to_str(p))
+      _ -> String.starts_with?(s, to_str(p))
+    end
+  end
+
+  def method(s, "endsWith", [p | rest]) when is_binary(s) do
+    case rest do
+      [epos | _] when is_number(epos) -> String.ends_with?(str_slice_to(s, trunc(epos)), to_str(p))
+      _ -> String.ends_with?(s, to_str(p))
+    end
+  end
+
+  defp str_slice_from(s, pos) when pos <= 0, do: s
+  defp str_slice_from(s, pos), do: (case String.split_at(s, pos) do {_, tail} -> tail end)
+  defp str_slice_to(s, epos), do: (case String.split_at(s, max(epos, 0)) do {head, _} -> head end)
   def method(s, "includes", [p | _]) when is_binary(s), do: String.contains?(s, to_str(p))
   def method(s, "replaceAll", [p, r | _]) when is_binary(s) and is_binary(p), do: String.replace(s, p, to_str(r))
   def method(s, "concat", args) when is_binary(s), do: s <> (args |> Enum.map(&to_str/1) |> Enum.join())
@@ -943,6 +971,8 @@ defmodule TinyLasers.Gate.Runtime do
       "concat" -> avec(list ++ arr_flat(args))
       "flat" -> avec(arr_flat(list))
       "map" -> avec(Enum.with_index(list) |> Enum.map(fn {v, i} -> call(a0, [v, i * 1.0, a]) end))
+      # flatMap: map then flatten ONE level (svelte's codegen builds statement lists this way).
+      "flatMap" -> avec(Enum.with_index(list) |> Enum.flat_map(fn {v, i} -> (r = call(a0, [v, i * 1.0, a]); case r do {:arr, _} -> al(r); _ -> [r] end) end))
       "filter" -> avec(Enum.filter(list, fn v -> truthy(call(a0, [v])) end))
       "forEach" -> Enum.with_index(list) |> Enum.each(fn {v, i} -> call(a0, [v, i * 1.0, a]) end); :undefined
       "find" -> Enum.find(list, :undefined, fn v -> truthy(call(a0, [v])) end)
@@ -1318,10 +1348,15 @@ defmodule TinyLasers.Gate.Runtime do
   def method({:fn, _} = f, "bind", []), do: closure(fn _ignored_this, args -> invoke(f, :undefined, args) end)
 
   # a property call on a function object: `marked.parse(md)` — look up the function-valued property + invoke.
-  def method({:fn, _} = fnv, name, args) do
+  def method({:fn, fref} = fnv, name, args) do
     case oget(fnv, name) do
       {:fn, _} = g -> invoke(g, fnv, args)
-      other -> if System.get_env("GAPLOG"), do: IO.puts(:stderr, "GAP fnmeth #{inspect(name)} -> #{inspect(other)|>String.slice(0,30)}"); guest_error("not a function")
+      other ->
+        if System.get_env("GAPLOG") do
+          keys = Process.get(:gg_fnprops, %{}) |> Map.get(fref, {[], %{}}) |> elem(0) |> Enum.take(8)
+          IO.puts(:stderr, "GAP fnmeth #{inspect(name)} -> #{inspect(other)|>String.slice(0,30)} fnkeys=#{inspect(keys)}")
+        end
+        guest_error("not a function")
     end
   end
 
@@ -1857,7 +1892,19 @@ defmodule TinyLasers.Gate.Runtime do
   def binop(:-, a, b) when is_number(a) and is_number(b), do: a - b
   def binop(:*, a, b) when is_number(a) and is_number(b), do: a * b
   def binop(:/, a, b) when is_number(a) and is_number(b) and b != 0, do: a / b
-  def binop(:/, _a, _b), do: guest_error("division by zero")
+  # JS division never throws: x/0 = ±Infinity, 0/0 = NaN (acorn's number reader divides by zero on purpose).
+  def binop(:/, a, b) do
+    na = to_number(a)
+    nb = to_number(b)
+
+    cond do
+      not is_number(na) or not is_number(nb) -> :nan
+      nb != 0 -> na / nb
+      na == 0 -> :nan
+      na > 0 -> :infinity
+      true -> :neg_infinity
+    end
+  end
   # ±Infinity in relational comparisons (rank-ordered; NaN comparisons are always false, handled by fallback).
   def binop(op, a, b) when op in [:<, :>, :"<=", :">="] and (a == :infinity or a == :neg_infinity or b == :infinity or b == :neg_infinity) do
     case {rel_key(a), rel_key(b)} do
@@ -2057,6 +2104,13 @@ defmodule TinyLasers.Gate.Runtime do
            |> Enum.filter(fn {m,_,_,_} -> m |> to_string() =~ ~r/Runtime|Guest/ end) |> Enum.take(8)
       IO.puts(:stderr, "GERR #{inspect(reason)}: #{Enum.map_join(st, " <- ", fn {_,f,a,_} -> "#{f}/#{a}" end)}")
     end
+
+    # GGPOS=1: Walk stamps the current statement's source byte offset — the error names WHERE in the guest.
+    case Process.get(:gg_pos) do
+      nil -> :ok
+      pos -> if System.get_env("GGPOS"), do: IO.puts(:stderr, "GPOS #{inspect(reason)} @ byte #{pos}")
+    end
+
     throw({:gg_guest_error, reason})
   end
 

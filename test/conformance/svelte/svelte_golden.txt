@@ -1,0 +1,41 @@
+5.56.4|import 'svelte/internal/disclose-version';
+import * as $ from 'svelte/internal/client';
+
+var root = $.from_html(`<li> </li>`);
+var root_1 = $.from_html(`<h1> </h1> <button>bump</button> <ul></ul>`, 1);
+
+export default function App($$anchor, $$props) {
+	let items = $.prop($$props, 'items', 19, () => ["a", "b"]),
+		title = $.prop($$props, 'title', 3, "list");
+
+	let count = $.state(0);
+
+	function bump() {
+		$.set(count, $.get(count) + 1);
+	}
+
+	var fragment = root_1();
+	var h1 = $.first_child(fragment);
+	var text = $.child(h1);
+
+	$.reset(h1);
+
+	var button = $.sibling(h1, 2);
+	var ul = $.sibling(button, 2);
+
+	$.each(ul, 21, items, $.index, ($$anchor, item, i) => {
+		var li = root();
+		var text_1 = $.child(li);
+
+		$.reset(li);
+		$.template_effect(() => $.set_text(text_1, `${i}: ${$.get(item) ?? ''}`));
+		$.append($$anchor, li);
+	});
+
+	$.reset(ul);
+	$.template_effect(() => $.set_text(text, `${title() ?? ''} (${$.get(count) ?? ''})`));
+	$.delegated('click', button, bump);
+	$.append($$anchor, fragment);
+}
+
+$.delegate(['click']);

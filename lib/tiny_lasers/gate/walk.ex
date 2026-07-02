@@ -88,6 +88,11 @@ defmodule TinyLasers.Gate.Walk do
   end
 
   defp set_var(env, name, val) do
+    if System.get_env("GGWATCH") == name do
+      st = Process.info(self(), :current_stacktrace) |> elem(1) |> Enum.take(6) |> Enum.map_join(" <- ", fn {_, f, a, _} -> "#{f}/#{a}" end)
+      IO.puts(:stderr, "WATCH set #{name} = #{inspect(val) |> String.slice(0, 30)} found_box=#{find_box(env, name) != nil} @ pos=#{inspect(Process.get(:gg_pos))} #{st}")
+    end
+
     case find_box(env, name) do
       nil -> declare([List.last(env)], name, val)
       box -> Runtime.box_set(box, val)
@@ -117,15 +122,30 @@ defmodule TinyLasers.Gate.Walk do
   defp hoist_children(env, sid, %{"type" => _} = n), do: hoist_node(env, sid, n)
   defp hoist_children(_env, _sid, _), do: :ok
 
-  defp ensure_box(env, sid, name) do
-    case find_box(env, name) do
+  # hoist a name into scope `sid`. Check ONLY that scope — NOT the ancestor chain: a `var`/function
+  # declaration creates a binding in ITS OWN function scope, shadowing any same-named outer binding. Searching
+  # the whole chain (the old behaviour) made a nested function's `var t2` REUSE an outer scope's `t2` box, so
+  # two unrelated functions shared one mutable cell (acorn's readWord1 `for (var t2 = true)` clobbered an
+  # aria-query helper of the same name — a cross-scope aliasing bug that only surfaces at bundle scale).
+  defp ensure_box(_env, sid, name) do
+    case Map.get(scope_map(sid), name) do
       nil -> declare([sid], name, :undefined)
       box -> box
     end
   end
 
   # ── statements ──────────────────────────────────────────────────────────────────────────────────────────
-  defp exec_all(nodes, env), do: Enum.each(nodes, &exec(&1, env))
+  # GGPOS=1: stamp each statement's byte offset so guest errors localize to the source (see guest_error).
+  defp exec_all(nodes, env) do
+    if System.get_env("GGPOS") do
+      Enum.each(nodes, fn n ->
+        if is_map(n) && n["start"], do: Process.put(:gg_pos, n["start"])
+        exec(n, env)
+      end)
+    else
+      Enum.each(nodes, &exec(&1, env))
+    end
+  end
 
   defp exec(%{"type" => "VariableDeclaration", "declarations" => ds}, env) do
     Enum.each(ds, fn d ->
@@ -150,11 +170,23 @@ defmodule TinyLasers.Gate.Walk do
 
   defp exec_for(n, env, lbl) do
     e2 = push(env)
+
     case n["init"] do
+      # `for (var …)` is FUNCTION-scoped: run_body already hoisted these names into the function scope, so
+      # ASSIGN (declare?=false → set_var walks the chain to that box) rather than declaring into the loop
+      # scope — a loop-scope shadow would strand post-loop reads at :undefined (acorn's readWord1 reads its
+      # for-init vars AFTER the loop).
+      %{"type" => "VariableDeclaration", "kind" => "var", "declarations" => ds} ->
+        Enum.each(ds, fn dd ->
+          val = if dd["init"], do: eval(dd["init"], e2), else: :undefined
+          bind_pattern(dd["id"], val, e2, false)
+        end)
+      # let/const stay loop-local.
       %{"type" => "VariableDeclaration"} = d -> hoist([hd(e2)], [d]); exec(d, e2)
       nil -> :ok
       i -> eval(i, e2)
     end
+
     loop_for(n, e2, lbl)
   end
 
@@ -254,7 +286,7 @@ defmodule TinyLasers.Gate.Walk do
   end
 
   defp eval(%{"type" => t} = f, env) when t in ["FunctionExpression", "ArrowFunctionExpression"],
-    do: make_fn(f["params"], f["body"], env, f["async"] == true, t == "ArrowFunctionExpression", f["generator"] == true)
+    do: make_fn(f["params"], f["body"], env, f["async"] == true, t == "ArrowFunctionExpression", f["generator"] == true, f["id"] && f["id"]["name"])
 
   # `a?.b()` / `a?.[k]` parse as ChainExpression wrapping the call/member (whose own `optional` flags
   # short-circuit) — unwrap, or the catch-all would silently evaluate the whole chain to undefined.
@@ -429,23 +461,34 @@ defmodule TinyLasers.Gate.Walk do
   defp bind_pattern(_, _, _, _), do: :ok
 
   # ── functions ───────────────────────────────────────────────────────────────────────────────────────────
-  defp make_fn(params, body, defenv, async?, arrow?, gen? \\ false) do
-    Runtime.closure(fn this, args ->
-      scope = push(defenv)
-      unless arrow? do
-        declare(scope, "this", this)
-        declare(scope, "arguments", Runtime.avec(args))
-      end
-      Enum.each(Enum.flat_map(params || [], &pattern_names/1), fn n -> ensure_box([hd(scope)], hd(scope), n) end)
-      bind_params(params || [], args, scope)
-      if gen? do
-        Runtime.gen_begin()
-        run_body(body, scope, false)
-        Runtime.gen_end()
-      else
-        run_body(body, scope, async?)
-      end
-    end)
+  defp make_fn(params, body, defenv, async?, arrow?, gen? \\ false, self_name \\ nil) do
+    # a NAMED function expression binds its own name inside its scope (`(function rec(n){ … rec(n-1) … })`),
+    # — svelte's minified walker recurses this way. The self-value lands in a box set right after creation.
+    selfbox = if self_name, do: Runtime.box(:undefined)
+
+    fnv =
+      Runtime.closure(fn this, args ->
+        scope = push(defenv)
+        if self_name, do: declare(scope, self_name, Runtime.box_get(selfbox))
+
+        unless arrow? do
+          declare(scope, "this", this)
+          declare(scope, "arguments", Runtime.avec(args))
+        end
+        Enum.each(Enum.flat_map(params || [], &pattern_names/1), fn n -> ensure_box([hd(scope)], hd(scope), n) end)
+        bind_params(params || [], args, scope)
+
+        if gen? do
+          Runtime.gen_begin()
+          run_body(body, scope, false)
+          Runtime.gen_end()
+        else
+          run_body(body, scope, async?)
+        end
+      end)
+
+    if self_name, do: Runtime.box_set(selfbox, fnv)
+    fnv
   end
 
   defp bind_params(params, args, env) do
@@ -478,10 +521,16 @@ defmodule TinyLasers.Gate.Walk do
   defp eval_class(n, env) do
     name = (n["id"] && n["id"]["name"]) || "__ggclass"
     members = (n["body"] && n["body"]["body"]) || []
-    ctor = Enum.find(members, &(&1["kind"] == "constructor"))
+    ctor = Enum.find(members, &(&1["type"] == "MethodDefinition" and &1["kind"] == "constructor"))
     sup = if n["superClass"], do: eval(n["superClass"], env), else: nil
 
     cenv = push(env)
+
+    # class FIELDS (PropertyDefinition, svelte 5's compiler uses them heavily): instance fields initialize
+    # per construction inside the ctor closure; static fields assign onto the class after definition.
+    # Private names (#x) become mangled "#x" string keys (unreachable from normal property syntax).
+    {prop_defs, meths} = Enum.split_with(members, &(&1["type"] == "PropertyDefinition"))
+    {static_fields, inst_fields} = Enum.split_with(prop_defs, & &1["static"])
 
     ctor_fn =
       Runtime.closure(fn this, args ->
@@ -489,15 +538,24 @@ defmodule TinyLasers.Gate.Walk do
         declare(s, "this", this)
         declare(s, "arguments", Runtime.avec(args))
         if sup, do: declare(s, "__superval", sup)
+
+        init_fields = fn ->
+          Enum.each(inst_fields, fn f ->
+            key = if f["computed"], do: eval(f["key"], s), else: key_of(f["key"])
+            Runtime.oput(this, key, if(f["value"], do: eval(f["value"], s), else: :undefined))
+          end)
+        end
+
         cparams = (ctor && ctor["value"]["params"]) || []
         Enum.each(Enum.flat_map(cparams, &pattern_names/1), fn nm -> ensure_box([hd(s)], hd(s), nm) end)
         bind_params(cparams, args, s)
         cond do
-          ctor -> run_ctor_body(ctor["value"]["body"], s)
+          # explicit ctor: fields first (approximation of after-super; harmless for value initializers), then body.
+          ctor -> init_fields.(); run_ctor_body(ctor["value"]["body"], s)
           # a derived class with NO explicit constructor gets the implicit `constructor(...args){ super(...args) }`
-          # — run the parent ctor with all args so its field initialization happens.
-          sup -> Runtime.invoke(sup, this, args)
-          true -> :ok
+          # — run the parent ctor with all args (its fields first), then our own fields.
+          sup -> Runtime.invoke(sup, this, args); init_fields.()
+          true -> init_fields.()
         end
         this
       end)
@@ -506,7 +564,7 @@ defmodule TinyLasers.Gate.Walk do
     if sup, do: Runtime.set_proto_chain(ctor_fn, sup)
 
     proto = Runtime.oget(ctor_fn, "prototype")
-    Enum.each(members, fn m ->
+    Enum.each(meths, fn m ->
       unless m["kind"] == "constructor" do
         target = if m["static"], do: ctor_fn, else: proto
         key = if m["computed"], do: eval(m["key"], cenv), else: key_of(m["key"])
@@ -518,6 +576,13 @@ defmodule TinyLasers.Gate.Walk do
           _ -> Runtime.oput(target, key, fnv)
         end
       end
+    end)
+
+    Enum.each(static_fields, fn f ->
+      s2 = push(cenv)
+      declare(s2, "this", ctor_fn)
+      key = if f["computed"], do: eval(f["key"], s2), else: key_of(f["key"])
+      Runtime.oput(ctor_fn, key, if(f["value"], do: eval(f["value"], s2), else: :undefined))
     end)
 
     ctor_fn
@@ -678,6 +743,9 @@ defmodule TinyLasers.Gate.Walk do
   defp lit(nil), do: :null
   defp lit(_), do: :undefined
 
+  # a private name (#x) mangles to a "#x" string key — unreachable from normal property syntax, so private
+  # semantics hold without a brand-check mechanism.
+  defp key_of(%{"type" => "PrivateIdentifier", "name" => n}), do: "#" <> n
   defp key_of(%{"type" => "Identifier", "name" => n}), do: n
   defp key_of(%{"type" => "Literal", "value" => v}) when is_binary(v), do: v
   defp key_of(%{"type" => "Literal", "value" => v}) when is_number(v), do: Runtime.to_str(v * 1.0)
