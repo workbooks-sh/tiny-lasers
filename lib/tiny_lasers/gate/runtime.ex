@@ -1626,6 +1626,14 @@ defmodule TinyLasers.Gate.Runtime do
   # was OBJECTS, not functions). A guest can only reach these by NAME resolved at compile time to greg_get.
   @doc "Register a top-level guest function by name."
   def greg_set(name, closure), do: Process.put({:gg_fn, name}, closure)
+
+  @doc """
+  Chunk-function dispatch for the exploded/parallel compile: sibling guest modules register their chunk
+  functions as plain funs (`cf_reg`) and callers invoke by NAME (`cf`) — so no guest binary ever holds a
+  reference to another module, keeping per-module confinement checks self-contained.
+  """
+  def cf_reg(name, fun) when is_function(fun, 1), do: Process.put({:gg_cf, name}, fun)
+  def cf(name, env), do: Process.get({:gg_cf, name}).(env)
   @doc "Resolve a top-level guest function by name (late) — `:undefined` if never declared."
   def greg_get(name), do: Process.get({:gg_fn, name}, :undefined)
 

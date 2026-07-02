@@ -68,10 +68,31 @@ defmodule TinyLasers.Gate.Lower do
   HANDLES are registered in the greg registry (`gbox$<name>`); each chunk re-binds its local handles from the
   registry on entry, after which the normal boxed-var codegen applies unchanged.
   """
-  def module_quoted(ast, granted \\ %{}, opts \\ [])
+  # explosion thresholds: bodies above @explode_min_bytes source bytes split into @explode_piece_bytes slices
+  # (878KB compiled in 109s as ONE function; ~12KB pieces compile near-linearly).
+  @explode_min_bytes 30_000
+  @explode_piece_bytes 12_000
 
-  def module_quoted(%{"type" => "Program", "body" => body}, granted, opts) do
+  def module_quoted(ast, granted \\ %{}, opts \\ []) do
+    %{main: main, siblings: []} = modules_quoted(ast, granted, Keyword.put(opts, :modules, 1))
+    main
+  end
+
+  @doc """
+  Like `module_quoted/3` but partitions the exploded-function defs round-robin across `opts[:modules]` sibling
+  module bodies so the caller can COMPILE THEM CONCURRENTLY (the Erlang compiler parallelizes across modules,
+  not within one). Chunk functions are invoked by NAME through `Runtime.cf/2`; each sibling exposes
+  `__gg_register/0` (local-closure registration — no guest binary ever references another module, so each
+  module's confinement check stays self-contained). The caller must run every sibling's `__gg_register/0`
+  IN THE RUN PROCESS before `main.run/0` (registration lives in the process dictionary).
+  """
+  def modules_quoted(ast, granted \\ %{}, opts \\ [])
+
+  def modules_quoted(%{"type" => "Program", "body" => body}, granted, opts) do
     chunk_size = Keyword.get(opts, :chunk_size, 25)
+    nmods = max(Keyword.get(opts, :modules, 1), 1)
+    # arm the sibling-def accumulator: func/6 explodes oversized bodies only when this is set.
+    Process.put(:gg_lower_defs, [])
     vars = collect_vars(body) |> Enum.uniq()
     boxed = MapSet.new(vars)
     scope0 = %{locals: MapSet.new(vars), granted: granted, funcs: MapSet.new(), boxed: boxed, fnmap: %{}}
@@ -121,18 +142,60 @@ defmodule TinyLasers.Gate.Lower do
     run_def =
       quote do
         def run() do
+          __gg_register()
           unquote_splicing(box_inits ++ chunk_calls)
           unquote(@runtime).drain_microtasks()
         end
       end
 
+    pairs = Process.get(:gg_lower_defs, []) |> Enum.reverse()
+    Process.delete(:gg_lower_defs)
+
+    # round-robin the exploded defs into nmods buckets; bucket 0 stays in main.
+    buckets =
+      if nmods <= 1 or pairs == [] do
+        [pairs]
+      else
+        pairs
+        |> Enum.with_index()
+        |> Enum.group_by(fn {_, i} -> rem(i, nmods) end)
+        |> Enum.sort()
+        |> Enum.map(fn {_, l} -> Enum.map(l, &elem(&1, 0)) end)
+      end
+
+    [own | sibling_buckets] = buckets
+
+    reg_def = fn ps ->
+      regs =
+        Enum.map(ps, fn {name, _} ->
+          quote(do: unquote(@runtime).cf_reg(unquote(Atom.to_string(name)), fn env -> unquote(name)(env) end))
+        end)
+
+      quote do
+        def __gg_register() do
+          unquote_splicing(regs)
+          :ok
+        end
+      end
+    end
+
     # NOTE: do NOT set the internal no-*-opt compiler flags here. They saved no measurable compile time on the
     # 1.27MB bundle (77-81s either way) and :no_ssa_opt MISCOMPILED the include-phase box/try pattern (a node's
     # parent read yielded undefined unless an opaque remote call happened to sit between two statements —
-    # a heisenbug that cost half a day; see f2_rollup_bundle history).
-    quote do
-      unquote_splicing(chunk_defs ++ [run_def])
-    end
+    # a heisenbug that cost half a day; see f2_rollup_bundle history). It ALSO reproduces with :no_ssa_opt alone.
+    main =
+      quote do
+        unquote_splicing(Enum.map(own, &elem(&1, 1)) ++ chunk_defs ++ [reg_def.(own), run_def])
+      end
+
+    siblings =
+      Enum.map(sibling_buckets, fn ps ->
+        quote do
+          unquote_splicing(Enum.map(ps, &elem(&1, 1)) ++ [reg_def.(ps)])
+        end
+      end)
+
+    %{main: main, siblings: siblings}
   end
 
   # ── statement lists thread lexical scope (which names are locals) ──
@@ -1370,7 +1433,18 @@ defmodule TinyLasers.Gate.Lower do
     tail_return? = nreturns == 0 or (nreturns == 1 and last && last["type"] == "ReturnStatement")
     prelude = hoistq ++ param_box_inits ++ binds ++ argbind
 
+    # the Erlang compiler is strongly SUPERLINEAR in single-function size (878KB body = 109s, 94KB = 0.6s), so
+    # a huge plain function body EXPLODES into sibling module functions: every local is boxed (per-invocation,
+    # so recursion stays correct), the handles travel as one tuple, and gg_return throws cross the chunk calls.
+    explode? =
+      not async? and not gen? and Process.get(:gg_lower_defs) != nil and
+        match?(%{"type" => "BlockStatement"}, body) and
+        is_integer(body["start"]) and is_integer(body["end"]) and
+        body["end"] - body["start"] > @explode_min_bytes
+
     cond do
+      explode? ->
+        explode_func(stmts_list, names, bodyvars, fndecls, uses_args?, thisvar, argvar, bscope, body["start"], params)
       # a GENERATOR runs its body to completion eagerly, collecting yields into a frame (gen_begin/gen_end) and
       # returning the collected array — same eager model as Walk; an early `return` stops collection, its value
       # is discarded (for-of never sees it).
@@ -1440,6 +1514,118 @@ defmodule TinyLasers.Gate.Lower do
           end)
         end
     end
+  end
+
+  # ── function-body EXPLOSION (compile-time wall) ────────────────────────────────────────────────────────
+  # A huge plain function body becomes: per-invocation boxes for EVERY local, an env tuple of the handles,
+  # and N sibling module functions each running a byte-bounded slice of the statements. `return` inside a
+  # slice throws gg_return, which unwinds through the slice call into the main closure's catch. Only active
+  # under module_quoted (the :gg_lower_defs accumulator collects the sibling defs).
+  defp explode_func(stmts_list, names, bodyvars, fndecls, uses_args?, thisvar, argvar, bscope, fnid, params) do
+    own =
+      (Enum.uniq(names ++ bodyvars) |> Enum.reject(&MapSet.member?(fndecls, &1))) ++
+        if(uses_args?, do: ["arguments"], else: [])
+
+    # FREE boxed vars this body mentions (outer function/program locals): a chunk def has no lexical capture,
+    # so their handles travel in the env tuple alongside the body's own boxes. Anything a nested function
+    # captures is boxed by boxed_set, so free-and-referenced ⊆ boxed holds.
+    free =
+      bscope.boxed
+      |> MapSet.difference(MapSet.new(own))
+      |> MapSet.intersection(MapSet.new(all_idents(stmts_list)))
+      |> Enum.sort()
+
+    locals = own ++ free
+    exscope = %{bscope | boxed: MapSet.union(bscope.boxed, MapSet.new(own))}
+
+    box_inits = Enum.map(own, fn v -> quote(do: unquote(lvar(v)) = unquote(@runtime).box(:undefined)) end)
+
+    binds =
+      params
+      |> Enum.with_index()
+      |> Enum.flat_map(fn {p, i} ->
+        case p do
+          %{"type" => "RestElement", "argument" => a} ->
+            destr_targets(a, quote(do: unquote(@runtime).args_rest(unquote(argvar), unquote(i))), exscope)
+
+          _ ->
+            destr_targets(p, quote(do: unquote(@runtime).arg(unquote(argvar), unquote(i))), exscope)
+        end
+      end)
+
+    argbind =
+      if uses_args?,
+        do: [quote(do: unquote(@runtime).box_set(unquote(lvar("arguments")), unquote(@runtime).avec(unquote(argvar))))],
+        else: []
+
+    # global hoist + fn-decls-install-first over the WHOLE body, then byte-bounded slices.
+    hoisted = Enum.reduce(stmts_list, exscope, &hoist/2)
+    {fnnodes, rest} = Enum.split_with(stmts_list, &(is_map(&1) and &1["type"] == "FunctionDeclaration" and &1["id"]))
+    chunks = chunk_by_bytes(fnnodes ++ rest, @explode_piece_bytes)
+    thisq = Macro.var(:__ggthis, __MODULE__)
+
+    {calls, _} =
+      chunks
+      |> Enum.with_index()
+      |> Enum.map_reduce(hoisted, fn {nodes, i}, sc ->
+        {qs, sc2} = stmts(nodes, sc)
+        name = String.to_atom("__gg_f#{fnid}_c#{i}")
+        mentioned = MapSet.new(all_idents(nodes))
+
+        pat_elems =
+          [thisq] ++
+            Enum.map(locals, fn v ->
+              if MapSet.member?(mentioned, v), do: lvar(v), else: Macro.var(:_, __MODULE__)
+            end)
+
+        d =
+          quote do
+            def unquote(name)({unquote_splicing(pat_elems)}) do
+              _ = unquote(thisq)
+              unquote_splicing(qs)
+              :ok
+            end
+          end
+
+        Process.put(:gg_lower_defs, [{name, d} | Process.get(:gg_lower_defs)])
+        envq = {:{}, [], [thisq | Enum.map(locals, &lvar/1)]}
+        # invoke by NAME through the cf registry: the def may land in a SIBLING module (parallel compile),
+        # and callers must hold no reference to it.
+        {quote(do: unquote(@runtime).cf(unquote(Atom.to_string(name)), unquote(envq))), sc2}
+      end)
+
+    quote do
+      unquote(@runtime).closure(fn unquote(thisvar), unquote(argvar) ->
+        unquote_splicing(box_inits ++ binds ++ argbind)
+
+        try do
+          unquote_splicing(calls)
+          :undefined
+        catch
+          :throw, {:gg_return, v} -> v
+        end
+      end)
+    end
+  end
+
+  # group statements into slices of at most `limit` source bytes (a single oversized statement stays whole —
+  # if it is itself a huge function, ITS body explodes recursively).
+  defp chunk_by_bytes(nodes, limit) do
+    nodes
+    |> Enum.chunk_while(
+      {[], 0},
+      fn n, {acc, sz} ->
+        b = (is_map(n) && (n["end"] || 0) - (n["start"] || 0)) || 0
+
+        if sz + b > limit and acc != [],
+          do: {:cont, Enum.reverse(acc), {[n], b}},
+          else: {:cont, {[n | acc], sz + b}}
+      end,
+      fn
+        {[], _} -> {:cont, {[], 0}}
+        {acc, _} -> {:cont, Enum.reverse(acc), {[], 0}}
+      end
+    )
   end
 
   # count ReturnStatements in a subtree, NOT descending into nested functions.

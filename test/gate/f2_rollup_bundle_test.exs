@@ -25,16 +25,40 @@ defmodule TinyLasers.Gate.F2RollupBundleTest do
     console = "var console = { log: function(){ print(arguments[0]); } };\n"
     bundle = File.read!(Path.join(@conf, "rollup/rollup_bundle.cjs"))
 
-    body = Lower.module_quoted(Js.parse(console <> prelude <> bundle), %{"print" => 0, "__host" => 1})
-    mod = Module.concat([TinyLasers.Gate.Guest, "RollupBundle#{System.unique_integer([:positive])}"])
-    [{m, bin} | _] = Code.compile_quoted(quote do (defmodule unquote(mod) do unquote(body) end) end)
+    # PARALLEL compiled lane: exploded defs partitioned across scheduler-count sibling modules, compiled
+    # concurrently (the compile-time wall was 157s in one module; ~7s across 10 — the Erlang compiler is
+    # superlinear per function and parallel only across modules). Chunk calls dispatch by NAME via Runtime.cf,
+    # so no guest module references another.
+    nmods = System.schedulers_online()
 
-    # confinement: the compiled rollup engine references ONLY the Runtime (host work — the wasm parser — is a
-    # granted capability handle, never a host module ref in the guest binary).
-    assert %{ext: [], bifs: []} = TinyLasers.Gate.dangerous_refs(bin)
+    %{main: mainq, siblings: sibqs} =
+      Lower.modules_quoted(Js.parse(console <> prelude <> bundle), %{"print" => 0, "__host" => 1}, modules: nmods)
 
+    uid = System.unique_integer([:positive])
+
+    mods =
+      [{:main, mainq} | Enum.with_index(sibqs) |> Enum.map(fn {q, i} -> {:"sib#{i}", q} end)]
+      |> Task.async_stream(
+        fn {tag, q} ->
+          mod = Module.concat([TinyLasers.Gate.Guest, "RollupBundle#{uid}#{tag}"])
+          [{m, bin} | _] = Code.compile_quoted(quote do (defmodule unquote(mod) do unquote(q) end) end)
+          {tag, m, bin}
+        end,
+        timeout: 600_000, max_concurrency: nmods
+      )
+      |> Enum.map(fn {:ok, r} -> r end)
+
+    # confinement: EVERY module of the compiled rollup engine references ONLY the Runtime (host work — the
+    # wasm parser — is a granted capability handle; sibling chunk fns are reached by name via the cf registry,
+    # never by module reference).
+    for {tag, _, bin} <- mods do
+      assert %{ext: [], bifs: []} = TinyLasers.Gate.dangerous_refs(bin), "module #{tag} not confined"
+    end
+
+    {:main, main, _} = List.keyfind(mods, :main, 0)
     Runtime.__init(%{caps: %{0 => %{fun: &Runtime.cap_print/2}, 1 => %{fun: &Runtime.host_rollup_bridge/2}}, tenant_root: "/t", fs: %{}})
-    try do apply(m, :run, []) catch :throw, _ -> :ok end
+    for {tag, m, _} <- mods, tag != :main, do: apply(m, :__gg_register, [])
+    try do apply(main, :run, []) catch :throw, _ -> :ok end
     out = Runtime.__output()
 
     ok_line = Enum.find(out, &String.starts_with?(&1, "BUNDLE_OK["))
