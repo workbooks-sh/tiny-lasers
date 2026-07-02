@@ -1193,7 +1193,9 @@ defmodule TinyLasers.Gate.Runtime do
 
   defp array_static("isArray", [x | _]), do: match?({:arr, _}, x)
   defp array_static("from", [x | rest]) do
-    items = iter_any(x)
+    # any iterable — Map yields [k,v] pairs, Set its members (rollup's getResolveStaticDependencyPromises is
+    # Array.from(sourcesWithAttributes, async ([source, attributes]) => …) — a MAP with a mapper).
+    items = iter(x)
     case rest do
       [{:fn, _} = f | _] -> avec(Enum.with_index(items) |> Enum.map(fn {v, i} -> call(f, [v, i * 1.0]) end))
       _ -> avec(items)
@@ -1202,9 +1204,6 @@ defmodule TinyLasers.Gate.Runtime do
   defp array_static("of", args), do: avec(args)
   defp array_static(_, _), do: :undefined
 
-  defp iter_any({:arr, _} = a), do: al(a)
-  defp iter_any(s) when is_binary(s), do: for(<<c::utf8 <- s>>, do: <<c::utf8>>)
-  defp iter_any(_), do: []
 
   defp math_static("floor", [x | _]), do: Float.floor(x / 1)
   defp math_static("ceil", [x | _]), do: Float.ceil(x / 1)
@@ -1700,9 +1699,11 @@ defmodule TinyLasers.Gate.Runtime do
     end
   end
   def construct({:global, "Object"}, _), do: cell_new([])
+  # `new Set(iterable)` — ANY iterable (rollup does `new Set(this.includedImports)`, a Set-from-Set copy;
+  # accepting only arrays silently produced an empty set and dropped every cross-module chunk dependency).
   def construct({:global, s}, args) when s in ["Set", "WeakSet"] do
     id = __id()
-    init = case args do [{:arr, _} = av | _] -> Enum.uniq(al(av)); _ -> [] end
+    init = case args do [x | _] -> Enum.uniq(iter(x)); _ -> [] end
     Process.put({:gg_set, id}, init)
     {:set, id}
   end
@@ -1722,9 +1723,25 @@ defmodule TinyLasers.Gate.Runtime do
     p
   end
 
+  # `new Map(iterable-of-pairs)` — any iterable of [k, v] entries (including another Map, whose iteration
+  # yields [k, v] arrays).
   def construct({:global, m}, args) when m in ["Map", "WeakMap"] do
     id = __id()
-    init = case args do [{:arr, _} = av | _] -> Enum.map(al(av), fn e -> case (if match?({:arr,_},e), do: al(e), else: []) do [k, v | _] -> {k, v}; _ -> {:undefined, :undefined} end end); _ -> [] end
+
+    init =
+      case args do
+        [x | _] ->
+          Enum.map(iter(x), fn e ->
+            case (if match?({:arr, _}, e), do: al(e), else: []) do
+              [k, v | _] -> {k, v}
+              _ -> {:undefined, :undefined}
+            end
+          end)
+
+        _ ->
+          []
+      end
+
     Process.put({:gg_map, id}, init)
     {:map, id}
   end
@@ -2061,6 +2078,42 @@ defmodule TinyLasers.Gate.Runtime do
   def iter({:map, _} = mp), do: Enum.map(map_pairs(mp), fn {k, v} -> avec([k, v]) end)
   def iter(s) when is_binary(s), do: for <<c::utf8 <- s>>, do: <<c::utf8>>
   def iter(_), do: []
+
+  # ── LIVE iteration cursors (for-of) ──────────────────────────────────────────────────────────────────────
+  # JS iterators over Set/Map/Array observe entries APPENDED during the loop — rollup grows a Set while
+  # iterating it in four places (`for (const m of staticDependencies) { staticDependencies.add(dep) }` is how
+  # the chunk graph closes over dependencies). A snapshot iterator silently truncates the walk, so for-of in
+  # both lanes steps through these cursors, re-reading the collection each step. Other iterables (strings,
+  # typed arrays) keep snapshot semantics.
+  def iter_start({:arr, _} = a), do: {:gg_acur, a, 0}
+  def iter_start({:set, id}), do: {:gg_scur, id, 0}
+  def iter_start({:map, id}), do: {:gg_mcur, id, 0}
+  def iter_start(other), do: {:gg_lcur, iter(other)}
+
+  def iter_next({:gg_acur, a, i}) do
+    l = al(a)
+    if i < length(l), do: {Enum.at(l, i), {:gg_acur, a, i + 1}}, else: :done
+  end
+
+  def iter_next({:gg_scur, id, i}) do
+    l = set_list({:set, id})
+    if i < length(l), do: {Enum.at(l, i), {:gg_scur, id, i + 1}}, else: :done
+  end
+
+  def iter_next({:gg_mcur, id, i}) do
+    l = map_pairs({:map, id})
+
+    case Enum.at(l, i) do
+      nil -> :done
+      {k, v} -> {avec([k, v]), {:gg_mcur, id, i + 1}}
+    end
+  end
+
+  def iter_next({:gg_lcur, []}), do: :done
+  def iter_next({:gg_lcur, [h | t]}), do: {h, {:gg_lcur, t}}
+
+  @doc "for-in cursor: snapshot of enumerable keys (JS for-in does not guarantee live additions)."
+  def keys_cursor(o), do: {:gg_lcur, enum_keys(o)}
 
   @doc "for-in enumeration keys: object own-keys, array index strings, or none."
   def enum_keys({keys, map}) when is_map(map), do: keys

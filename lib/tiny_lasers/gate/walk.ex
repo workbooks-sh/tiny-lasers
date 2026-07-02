@@ -572,14 +572,32 @@ defmodule TinyLasers.Gate.Walk do
 
   defp for_each(%{"left" => left, "right" => right, "body" => body}, kind, env, lbl) do
     coll = eval(right, env)
-    items = if kind == :of, do: Runtime.iter(coll), else: Runtime.enum_keys(coll)
+    # for-of steps a LIVE cursor: JS iterators see entries appended during the loop (rollup grows Sets/arrays
+    # mid-iteration to close over dependency graphs). for-in keeps snapshot keys.
     catch_break(lbl, fn ->
-      Enum.each(items, fn item ->
+      if kind == :of do
+        for_cursor(Runtime.iter_start(coll), left, body, env, lbl)
+      else
+        Enum.each(Runtime.enum_keys(coll), fn item ->
+          e2 = push(env)
+          bind_for_target(left, item, e2)
+          catch_continue(lbl, fn -> exec(body, e2) end)
+        end)
+      end
+    end)
+  end
+
+  defp for_cursor(cur, left, body, env, lbl) do
+    case Runtime.iter_next(cur) do
+      :done ->
+        :ok
+
+      {item, cur2} ->
         e2 = push(env)
         bind_for_target(left, item, e2)
         catch_continue(lbl, fn -> exec(body, e2) end)
-      end)
-    end)
+        for_cursor(cur2, left, body, env, lbl)
+    end
   end
 
   defp bind_for_target(%{"type" => "VariableDeclaration", "declarations" => [%{"id" => id} | _]}, item, env),

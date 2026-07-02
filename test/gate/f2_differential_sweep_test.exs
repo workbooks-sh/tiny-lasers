@@ -101,7 +101,15 @@ defmodule TinyLasers.Gate.F2DifferentialSweepTest do
     {"forof-objpattern", ~S'var xs = [{ alias: "x", modules: [1] }, { alias: "y", modules: [1, 2] }]; var s = ""; for (const { alias, modules } of xs) s += alias + modules.length; print(s);'},
 
     # typed arrays
-    {"u8-loop-write", ~S'var t = new Uint8Array(4); for (var i = 0; i < 4; i++) t[i] = i + 1; print("len=" + t.length + " t=" + t[0] + "," + t[1] + "," + t[2] + "," + t[3]);'}
+    {"u8-loop-write", ~S'var t = new Uint8Array(4); for (var i = 0; i < 4; i++) t[i] = i + 1; print("len=" + t.length + " t=" + t[0] + "," + t[1] + "," + t[2] + "," + t[3]);'},
+
+    # LIVE iteration + iterable constructors (rollup's chunk-graph closure: grow-while-iterate, Set-from-Set)
+    {"live-set-grow", ~S'var seen = new Set(["a"]); var deps = { a: ["b", "c"], b: ["d"], c: [], d: [] }; var order = []; for (var m of seen) { order.push(m); for (var d of deps[m]) seen.add(d); } print(order.join(","));'},
+    {"live-array-grow", ~S'var xs = [1]; var out = ""; for (var x of xs) { out += x; if (x < 4) xs.push(x + 1); } print(out);'},
+    {"live-set-break", ~S'var s = new Set([1]); var n = 0; for (var v of s) { n++; if (v < 5) s.add(v + 1); if (v === 3) break; } print(n + "," + s.size);'},
+    {"set-from-set", ~S'var a = new Set([1, 2, 2, 3]); var b = new Set(a); b.add(4); print(a.size + "," + b.size);'},
+    {"map-from-map", ~S'var m = new Map([["k", 1]]); var m2 = new Map(m); m2.set("j", 2); print(m.size + "," + m2.size + "," + m2.get("k"));'},
+    {"array-from-map-mapper", ~S'var m = new Map([["a", 1], ["b", 2]]); print(Array.from(m, function(kv) { return kv[0] + "=" + kv[1]; }).join(","));'}
   ]
 
   test "every construct case prints identically through Walk and Lower" do

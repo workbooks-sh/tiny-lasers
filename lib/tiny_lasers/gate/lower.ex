@@ -812,8 +812,11 @@ defmodule TinyLasers.Gate.Lower do
     base = Map.put(scope, :pending_label, nil)
     patnames = if pat, do: pattern_names(pat), else: []
     s1 = %{base | locals: Enum.reduce([vn | patnames], base.locals, &MapSet.put(&2, &1))}
-    itemsfn = if kind == :of, do: :iter, else: :enum_keys
-    itemsq = quote(do: unquote(@runtime).unquote(itemsfn)(unquote(expr(n["right"], base))))
+    # for-of steps a LIVE cursor (iter_start/iter_next): JS iterators see entries appended during the loop —
+    # rollup grows Sets/arrays mid-iteration to close over dependency graphs, and a snapshot silently
+    # truncates the walk. for-in keeps snapshot keys (keys_cursor).
+    cursorfn = if kind == :of, do: :iter_start, else: :keys_cursor
+    cursorq = quote(do: unquote(@runtime).unquote(cursorfn)(unquote(expr(n["right"], base))))
     loop = Macro.var(:gg_feach, __MODULE__)
 
     destrq = if pat, do: destr_targets(pat, quote(do: unquote(lvar(vn))), s1), else: []
@@ -825,25 +828,27 @@ defmodule TinyLasers.Gate.Lower do
 
       q =
         quote do
-          unquote(loop) = fn
-            me, [__ggitem | __ggrest] ->
-              unquote(lvar(vn)) = __ggitem
-              unquote_splicing(destrq)
+          unquote(loop) = fn me, __ggcur ->
+            case unquote(@runtime).iter_next(__ggcur) do
+              :done ->
+                :ok
 
-              try do
-                unquote(bodyq)
-              catch
-                :throw, {:gg_continue, unquote(tag)} -> :ok
-              end
+              {__ggitem, __ggcur2} ->
+                unquote(lvar(vn)) = __ggitem
+                unquote_splicing(destrq)
 
-              me.(me, __ggrest)
+                try do
+                  unquote(bodyq)
+                catch
+                  :throw, {:gg_continue, unquote(tag)} -> :ok
+                end
 
-            _me, [] ->
-              :ok
+                me.(me, __ggcur2)
+            end
           end
 
           try do
-            unquote(loop).(unquote(loop), unquote(itemsq))
+            unquote(loop).(unquote(loop), unquote(cursorq))
           catch
             :throw, {:gg_break, unquote(tag)} -> :ok
           end
@@ -860,18 +865,20 @@ defmodule TinyLasers.Gate.Lower do
         quote do
           unquote_splicing(inits)
 
-          unquote(loop) = fn
-            me, [__ggitem | __ggrest], unquote(state) ->
-              unquote(lvar(vn)) = __ggitem
-              unquote_splicing(destrq)
-              unquote(bodyq)
-              me.(me, __ggrest, unquote(state))
+          unquote(loop) = fn me, __ggcur, unquote(state) ->
+            case unquote(@runtime).iter_next(__ggcur) do
+              :done ->
+                unquote(state)
 
-            _me, [], unquote(state) ->
-              unquote(state)
+              {__ggitem, __ggcur2} ->
+                unquote(lvar(vn)) = __ggitem
+                unquote_splicing(destrq)
+                unquote(bodyq)
+                me.(me, __ggcur2, unquote(state))
+            end
           end
 
-          unquote(state) = unquote(loop).(unquote(loop), unquote(itemsq), unquote(state))
+          unquote(state) = unquote(loop).(unquote(loop), unquote(cursorq), unquote(state))
         end
 
       {q, scope}
